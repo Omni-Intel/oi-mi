@@ -29,6 +29,7 @@ from utils.markers import (
 )
 from utils.online_labels import ManualLabelHttpServer, ManualOnlineLabelSource
 from utils.preprocessing import filter_and_transform
+from utils.unity_runtime import ensure_unity_game_running
 from web_command_server import start_web_command_server
 
 LOGGER = logging.getLogger(__name__)
@@ -105,7 +106,11 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
             "host": "127.0.0.1",
             "port": 5005,
             "timeout_sec": 1.0,
-            "reverse_enabled": True,
+            "auto_launch": True,
+            "executable_path": ".runtime/unity/ARPrototype3D-windows-x64/ARPrototype3D.exe",
+            "startup_timeout_sec": 15.0,
+            "close_on_stop": False,
+            "reverse_enabled": False,
             "reverse_listen_ip": "0.0.0.0",
             "reverse_listen_port": 5006,
         },
@@ -419,9 +424,12 @@ def _interactive_menu(ctx: click.Context, app: AppContext) -> None:
                 CONSOLE.print(f"16) AR游戏主机: [green]{ar_game_cfg.get('host', '127.0.0.1')}[/green]")
                 CONSOLE.print(f"17) AR游戏端口: [green]{ar_game_cfg.get('port', 5005)}[/green]")
                 CONSOLE.print(f"18) AR游戏超时: [green]{ar_game_cfg.get('timeout_sec', 1.0)}[/green]")
+                CONSOLE.print(f"19) AR game auto_launch: [green]{ar_game_cfg.get('auto_launch', False)}[/green]")
+                CONSOLE.print(f"20) AR game executable_path: [green]{ar_game_cfg.get('executable_path', '')}[/green]")
+                CONSOLE.print(f"21) AR game startup_timeout_sec: [green]{ar_game_cfg.get('startup_timeout_sec', 15.0)}[/green]")
                 CONSOLE.print("0) 返回上级菜单")
 
-                sub_choice = click.prompt("选择要修改的项", type=click.Choice([str(i) for i in range(19)]), default="0")
+                sub_choice = click.prompt("选择要修改的项", type=click.Choice([str(i) for i in range(22)]), default="0")
                 if sub_choice == "0":
                     break
                 elif sub_choice == "1":
@@ -478,6 +486,23 @@ def _interactive_menu(ctx: click.Context, app: AppContext) -> None:
                 elif sub_choice == "18":
                     val = click.prompt("输入 AR 游戏 TCP 超时(秒)", type=float, default=float(ar_game_cfg.get("timeout_sec", 1.0)))
                     ar_game_cfg["timeout_sec"] = val
+                elif sub_choice == "19":
+                    val = click.confirm("Enable local Unity exe auto-launch", default=bool(ar_game_cfg.get("auto_launch", False)))
+                    ar_game_cfg["auto_launch"] = val
+                elif sub_choice == "20":
+                    val = click.prompt(
+                        "Unity executable path",
+                        type=str,
+                        default=str(ar_game_cfg.get("executable_path", ".runtime/unity/ARPrototype3D-windows-x64/ARPrototype3D.exe")),
+                    )
+                    ar_game_cfg["executable_path"] = val
+                elif sub_choice == "21":
+                    val = click.prompt(
+                        "Unity startup timeout seconds",
+                        type=float,
+                        default=float(ar_game_cfg.get("startup_timeout_sec", 15.0)),
+                    )
+                    ar_game_cfg["startup_timeout_sec"] = val
                     
                 with app.config_path.open("w", encoding="utf-8") as f:
                     yaml.safe_dump(app.config, f, allow_unicode=True, sort_keys=False)
@@ -676,6 +701,7 @@ def build_game_command_outlet(config: dict[str, Any]) -> Any:
     game_output_cfg = config.get("output", {}).get("ar_game", {})
     if not bool(game_output_cfg.get("enabled", False)):
         return None
+    ensure_unity_game_running(config, console=CONSOLE)
     return get_shared_game_command_router(config).build_proxy(source="decoder")
 
 
@@ -685,6 +711,7 @@ def build_raw_game_transport(config: dict[str, Any]) -> Any:
     game_output_cfg = config.get("output", {}).get("ar_game", {})
     if not bool(game_output_cfg.get("enabled", False)):
         return None
+    ensure_unity_game_running(config, console=CONSOLE)
     return get_shared_game_command_router(config).raw_transport()
 
 
