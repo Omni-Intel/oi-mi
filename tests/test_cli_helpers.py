@@ -1,0 +1,773 @@
+"""Lightweight smoke tests for CLI helper behavior."""
+
+from __future__ import annotations
+
+import asyncio
+import importlib
+import random
+import sys
+import tempfile
+import threading
+import unittest
+from unittest import mock
+from pathlib import Path
+
+import numpy as np
+import yaml
+
+from acquisition.base import AcquirerMetadata, ElectrodeImpedance, classify_impedance_kohm
+from acquisition.brainco_acquirer import BrainCoAcquirer
+from adaptation.calibrator import Calibrator
+from adaptation.mi_protocol import ProtocolConfig, generate_block_sequence
+from cli import (
+    build_acquirer,
+    build_game_command_outlet,
+    build_model_path,
+    default_config,
+    iter_test_mode_chunks,
+    load_calibration_windows,
+    load_config,
+    parse_subject_number,
+    replay_test_mode,
+    resolve_records_dir,
+)
+from decoder.real_time_decoder import PredictionResult, RealTimeDecoder
+from game_command_router import SharedGameCommandRouter
+from models.factory import ModelFactory
+from utils.online_labels import ManualOnlineLabelSource, coerce_label
+
+
+class CliHelperTests(unittest.TestCase):
+    """Validate config loading and helper utilities."""
+
+    def test_parse_subject_number(self) -> None:
+        self.assertEqual(parse_subject_number("S001"), 1)
+        self.assertEqual(parse_subject_number("subject-17"), 17)
+        self.assertEqual(parse_subject_number("demo"), 1)
+
+    def test_build_model_path_extension(self) -> None:
+        config = {"storage": {"models_dir": "models_storage"}, "device_type": "brainco"}
+        self.assertEqual(
+            build_model_path(config, "S001", "riemann-mdm"),
+            Path("models_storage") / "S001" / "brainco" / "riemann-mdm.pkl",
+        )
+        self.assertEqual(
+            build_model_path(config, "S001", "eegnet"),
+            Path("models_storage") / "S001" / "brainco" / "eegnet.pt",
+        )
+        self.assertEqual(
+            build_model_path(config, "S001", "eegnet", device_name="neuracle"),
+            Path("models_storage") / "S001" / "neuracle" / "eegnet.pt",
+        )
+
+    def test_resolve_records_dir_defaults_and_reads_config(self) -> None:
+        self.assertEqual(resolve_records_dir({}), Path("records_storage"))
+        self.assertEqual(
+            resolve_records_dir({"storage": {"records_dir": "/tmp/records"}}),
+            Path("/tmp/records"),
+        )
+
+    def test_load_config_requires_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "config.yaml"
+            config_path.write_text("{}", encoding="utf-8")
+            with self.assertRaises(Exception):
+                load_config(config_path)
+
+    def test_load_config_success(self) -> None:
+        payload = {
+            "subject_id": "S001",
+            "model_name": "riemann-mdm",
+            "device_type": "neuracle",
+            "sfreq": 250,
+            "n_channels": 64,
+            "n_classes": 3,
+            "window_sec": 4.0,
+            "step_sec": 0.5,
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "config.yaml"
+            config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+            config = load_config(config_path)
+            self.assertEqual(config["subject_id"], "S001")
+
+    def test_load_config_creates_default_when_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "generated" / "config.yaml"
+            config = load_config(config_path)
+            expected = default_config()
+            self.assertTrue(config_path.exists())
+            self.assertEqual(config["subject_id"], expected["subject_id"])
+            self.assertEqual(config["storage"]["models_dir"], expected["storage"]["models_dir"])
+
+    def test_default_config_matches_project_config_file(self) -> None:
+        project_config = yaml.safe_load((Path(__file__).resolve().parents[1] / "config.yaml").read_text(encoding="utf-8"))
+        self.assertEqual(default_config(), project_config)
+
+    def test_protocol_block_randomizer_respects_constraints(self) -> None:
+        sequence = generate_block_sequence({"left": 8, "right": 8, "idle": 8}, rng=random.Random(17))
+
+        self.assertEqual(len(sequence), 24)
+        self.assertEqual(sequence.count("left"), 8)
+        self.assertEqual(sequence.count("right"), 8)
+        self.assertEqual(sequence.count("idle"), 8)
+        self.assertGreaterEqual(len(set(sequence[:3])), 2)
+        for idx in range(2, len(sequence)):
+            self.assertFalse(sequence[idx] == sequence[idx - 1] == sequence[idx - 2])
+
+    def test_model_registry_names(self) -> None:
+        self.assertEqual(
+            ModelFactory.list_models(),
+            [
+                "conformer-lite",
+                "deepconvnet",
+                "eegnet",
+                "hybrid-net",
+                "riemann-mdm",
+                "s4d",
+                "shallowconvnet",
+            ],
+        )
+
+    def test_default_acquirer_does_not_support_impedance_check(self) -> None:
+        from acquisition.base import AbstractAcquirer
+
+        class DummyAcquirer(AbstractAcquirer):
+            metadata = AcquirerMetadata(name="dummy", sfreq=250.0, n_channels=2)
+
+            def start_stream(self) -> None:
+                return
+
+            def stop_stream(self) -> None:
+                return
+
+            def get_chunk(self, window_sec: float):
+                return np.empty((2, 0), dtype=np.float32), np.empty((0,), dtype=np.float64)
+
+            def get_new_samples(self):
+                return np.empty((2, 0), dtype=np.float32), np.empty((0,), dtype=np.float64)
+
+        acquirer = DummyAcquirer()
+        self.assertFalse(acquirer.supports_impedance_check())
+        with self.assertRaises(NotImplementedError):
+            acquirer.check_impedance()
+
+    def test_impedance_threshold_mapping(self) -> None:
+        self.assertEqual(classify_impedance_kohm(None), "unknown")
+        self.assertEqual(classify_impedance_kohm(4.99), "good")
+        self.assertEqual(classify_impedance_kohm(5.0), "ok")
+        self.assertEqual(classify_impedance_kohm(10.0), "ok")
+        self.assertEqual(classify_impedance_kohm(10.01), "poor")
+
+    def test_build_brainco_acquirer(self) -> None:
+        config = {
+            "sfreq": 250,
+            "buffer_sec": 60,
+            "device": {
+                "brainco_addr": "",
+                "brainco_port": 0,
+                "brainco_auto_discover": True,
+                "brainco_scan_timeout_sec": 6.0,
+                "brainco_ready_timeout_sec": 10.0,
+                "brainco_gain": 6,
+                "brainco_signal_source": "NORMAL",
+                "brainco_device_id": "eeg-cap",
+            },
+        }
+        acquirer = build_acquirer(device_name="brainco", config=config)
+        self.assertEqual(acquirer.metadata.name, "brainco")
+        self.assertEqual(acquirer.metadata.n_channels, 32)
+
+    def test_brainco_discovery_uses_configured_port_when_sdk_returns_only_ip(self) -> None:
+        acquirer = BrainCoAcquirer(brainco_port=9527, auto_discover=True)
+        self.assertEqual(acquirer._coerce_discovered_target("192.168.3.9"), ("192.168.3.9", 9527))
+
+    def test_brainco_discovery_parses_host_port_text(self) -> None:
+        acquirer = BrainCoAcquirer(auto_discover=True)
+        self.assertEqual(acquirer._coerce_discovered_target("192.168.3.9:9527"), ("192.168.3.9", 9527))
+
+    def test_brainco_resolve_addr_port_caches_discovery_target(self) -> None:
+        acquirer = BrainCoAcquirer(auto_discover=True)
+
+        with mock.patch.object(acquirer, "_discover_device", return_value=("192.168.3.9", 53129)) as discover:
+            self.assertEqual(acquirer._resolve_addr_port(), ("192.168.3.9", 53129))
+            self.assertEqual(acquirer._resolve_addr_port(), ("192.168.3.9", 53129))
+
+        self.assertEqual(discover.call_count, 1)
+
+    def test_brainco_missing_port_prefers_zeroconf_before_callback_rescan(self) -> None:
+        class FakeSdk:
+            async def mdns_start_scan(self):
+                return "192.168.3.9"
+
+            def mdns_stop_scan(self):
+                return None
+
+        acquirer = BrainCoAcquirer(auto_discover=True)
+        acquirer._sdk = FakeSdk()
+
+        async def run_case() -> tuple[str, int]:
+            with (
+                mock.patch.object(
+                    acquirer,
+                    "_discover_device_via_zeroconf_async",
+                    new=mock.AsyncMock(return_value=("192.168.3.9", 53129)),
+                ) as zeroconf,
+                mock.patch.object(
+                    acquirer,
+                    "_discover_device_via_callback_async",
+                    new=mock.AsyncMock(return_value=("192.168.3.9", 9527)),
+                ) as callback_scan,
+            ):
+                result = await acquirer._discover_device_async()
+                zeroconf.assert_awaited_once()
+                callback_scan.assert_not_awaited()
+                return result
+
+        self.assertEqual(asyncio.run(run_case()), ("192.168.3.9", 53129))
+
+    def test_brainco_timeout_stops_sdk_scan_before_fallback(self) -> None:
+        class FakeSdk:
+            def __init__(self) -> None:
+                self.stop_calls = 0
+
+            async def mdns_start_scan(self):
+                await asyncio.sleep(0.02)
+                return None
+
+            def mdns_stop_scan(self):
+                self.stop_calls += 1
+                return None
+
+        acquirer = BrainCoAcquirer(auto_discover=True, scan_timeout_sec=0.001)
+        acquirer._sdk = FakeSdk()
+
+        async def run_case() -> tuple[str, int]:
+            with (
+                mock.patch.object(
+                    acquirer,
+                    "_discover_device_via_zeroconf_async",
+                    new=mock.AsyncMock(return_value=("192.168.3.9", 53129)),
+                ) as zeroconf,
+                mock.patch.object(
+                    acquirer,
+                    "_discover_device_via_callback_async",
+                    new=mock.AsyncMock(return_value=None),
+                ) as callback_scan,
+            ):
+                result = await acquirer._discover_device_async()
+                zeroconf.assert_awaited_once()
+                callback_scan.assert_not_awaited()
+                return result
+
+        self.assertEqual(asyncio.run(run_case()), ("192.168.3.9", 53129))
+        self.assertEqual(acquirer._sdk.stop_calls, 1)
+
+    def test_brainco_extracts_msg_id_from_callback_payloads(self) -> None:
+        acquirer = BrainCoAcquirer(auto_discover=True)
+        dummy = type("Resp", (), {"msgId": 17})()
+
+        self.assertEqual(acquirer._extract_message_id(23), 23)
+        self.assertEqual(acquirer._extract_message_id({"msgId": 11}), 11)
+        self.assertEqual(acquirer._extract_message_id(("ignore", dummy)), 17)
+        self.assertEqual(acquirer._extract_message_id('{"msgId": 5, "status": "ok"}'), 5)
+        self.assertIsNone(acquirer._extract_message_id("no-id"))
+
+    def test_brainco_wait_for_command_response_can_continue_when_missing_is_allowed(self) -> None:
+        acquirer = BrainCoAcquirer(auto_discover=True)
+        acquirer._ready_timeout_sec = 0.0
+        acquirer._response_event = threading.Event()
+        acquirer._msg_resp_lock = threading.Lock()
+        acquirer._pending_msg_responses = {}
+
+        acquirer._wait_for_command_response(1, "set_eeg_config", allow_missing=True)
+
+    def test_brainco_buffer_ingest_updates_cache(self) -> None:
+        acquirer = BrainCoAcquirer(n_channels=4)
+
+        acquirer._append_eeg_samples(np.arange(8, dtype=np.float32).reshape(4, 2), from_callback=False)
+
+        self.assertTrue(acquirer._first_sample_event.is_set())
+        self.assertEqual(acquirer._eeg_cache.shape, (4, 2))
+        self.assertEqual(acquirer._callback_sample_count, 0)
+        np.testing.assert_array_equal(acquirer._eeg_cache[:, 0], np.asarray([0, 2, 4, 6], dtype=np.float32))
+        self.assertEqual(acquirer._total_samples_seen, 2)
+
+    def test_brainco_callback_ingest_marks_callback_samples(self) -> None:
+        acquirer = BrainCoAcquirer(n_channels=4)
+
+        acquirer._append_eeg_samples(np.arange(8, dtype=np.float32).reshape(4, 2), from_callback=True)
+
+        self.assertEqual(acquirer._callback_sample_count, 2)
+
+    def test_brainco_get_chunk_waits_for_fresh_samples(self) -> None:
+        acquirer = BrainCoAcquirer(sfreq=250, n_channels=2, buffer_sec=10.0)
+        acquirer.metadata = AcquirerMetadata(name="brainco", sfreq=2.0, n_channels=2)
+        acquirer._client = object()
+        acquirer._sdk = object()
+
+        batches = [
+            np.asarray([[1.0, 2.0], [10.0, 20.0]], dtype=np.float32),
+            np.empty((2, 0), dtype=np.float32),
+            np.asarray([[3.0], [30.0]], dtype=np.float32),
+        ]
+
+        def fake_drain() -> np.ndarray:
+            if not batches:
+                return np.empty((2, 0), dtype=np.float32)
+            data = batches.pop(0)
+            if data.shape[1] > 0:
+                acquirer._append_eeg_samples(data, from_callback=False)
+            return data
+
+        with mock.patch.object(acquirer, "_drain_eeg_buffer", side_effect=fake_drain):
+            first, _ = acquirer.get_chunk(1.0)
+            second, _ = acquirer.get_chunk(1.0)
+
+        np.testing.assert_array_equal(first, np.asarray([[1.0, 2.0], [10.0, 20.0]], dtype=np.float32))
+        np.testing.assert_array_equal(second, np.asarray([[2.0, 3.0], [20.0, 30.0]], dtype=np.float32))
+
+    def test_brainco_wait_for_command_response_accepts_generic_callback(self) -> None:
+        acquirer = BrainCoAcquirer(n_channels=4, ready_timeout_sec=0.01)
+        acquirer._generic_msg_responses.append(("ok",))
+
+        acquirer._wait_for_command_response(7, "set_eeg_config")
+
+    def test_brainco_wait_for_command_response_allows_missing_when_requested(self) -> None:
+        acquirer = BrainCoAcquirer(n_channels=4, ready_timeout_sec=0.01)
+
+        acquirer._wait_for_command_response(7, "set_eeg_config", allow_missing=True)
+
+    def test_brainco_normalizes_numeric_impedance_series(self) -> None:
+        acquirer = BrainCoAcquirer(n_channels=4)
+
+        results = acquirer._normalize_impedance_payloads([([1.2, 5.0, 12.0, 3.4],)])
+
+        self.assertEqual([result.channel for result in results], [1, 2, 3, 4])
+        self.assertEqual([result.status for result in results], ["good", "ok", "poor", "good"])
+        self.assertEqual(results[2].impedance_kohm, 12.0)
+
+    def test_brainco_normalizes_sdk_quality_mapping(self) -> None:
+        acquirer = BrainCoAcquirer(n_channels=2)
+
+        results = acquirer._normalize_impedance_payloads(
+            [
+                ({"channel": 0, "quality": "good", "message": "stable"},),
+                ({"channel": 1, "quality": "lead_off"},),
+            ]
+        )
+
+        self.assertEqual([result.channel for result in results], [1, 2])
+        self.assertEqual(results[0].status, "good")
+        self.assertEqual(results[0].message, "stable")
+        self.assertEqual(results[1].status, "poor")
+        self.assertIsNone(results[1].impedance_kohm)
+
+    def test_gui_impedance_helpers_are_hardware_free(self) -> None:
+        sys.modules.pop("gui", None)
+        gui = importlib.import_module("gui")
+
+        results = [
+            ElectrodeImpedance(channel=1, name="Fp1", impedance_kohm=3.2, status="good", message=None),
+            ElectrodeImpedance(channel=2, name="Fp2", impedance_kohm=None, status="unknown", message="sdk quality only"),
+            ElectrodeImpedance(channel=3, name=None, impedance_kohm=11.8, status="poor", message="lead off"),
+        ]
+
+        self.assertEqual(gui._format_impedance_value(None), "-")
+        self.assertEqual(gui._format_impedance_value(3.2), "3.20")
+        self.assertEqual(
+            gui._summarize_impedance_results(results),
+            {"good": 1, "ok": 0, "poor": 1, "unknown": 1},
+        )
+
+        table_html = gui._build_impedance_table_html(results)
+        self.assertIn("Fp1", table_html)
+        self.assertIn("阻抗 (kΩ)", table_html)
+        self.assertIn("sdk quality only", table_html)
+        self.assertIn("#15803D", table_html)
+        self.assertIn("#6B7280", table_html)
+
+    def test_build_game_command_outlet_disabled_by_default(self) -> None:
+        self.assertIsNone(build_game_command_outlet({"output": {}}))
+
+    def test_build_game_command_outlet_enabled(self) -> None:
+        class FakeRouter:
+            def build_proxy(self, *, source: str):
+                return {"source": source}
+
+        with mock.patch("cli.get_shared_game_command_router", return_value=FakeRouter()):
+            outlet = build_game_command_outlet(
+                {
+                    "output": {
+                        "ar_game": {
+                            "enabled": True,
+                            "host": "127.0.0.1",
+                            "port": 5005,
+                            "timeout_sec": 0.5,
+                        }
+                    }
+                }
+            )
+        self.assertEqual(outlet, {"source": "decoder"})
+
+    def test_realtime_decoder_maps_predictions_to_game_commands(self) -> None:
+        self.assertEqual(
+            RealTimeDecoder._to_game_command(PredictionResult("左手", 0.9, 0.1, 0)),
+            "LEFT",
+        )
+        self.assertEqual(
+            RealTimeDecoder._to_game_command(PredictionResult("右手", 0.9, 0.1, 1)),
+            "RIGHT",
+        )
+        self.assertEqual(
+            RealTimeDecoder._to_game_command(PredictionResult("静息", 0.9, 0.1, 2)),
+            None,
+        )
+        self.assertEqual(
+            RealTimeDecoder._to_game_command(PredictionResult("静息", 0.4, 0.6, None)),
+            None,
+        )
+
+    def test_realtime_decoder_post_process_suppresses_low_confidence_predictions(self) -> None:
+        decoder = RealTimeDecoder.__new__(RealTimeDecoder)
+        decoder._confidence_threshold = 0.99
+
+        result = decoder._post_process(np.asarray([0.20, 0.35, 0.45], dtype=np.float32))
+
+        self.assertIsNone(result.class_id)
+        self.assertEqual(result.label, "静息")
+        self.assertAlmostEqual(result.confidence, 0.45, places=6)
+
+        lateral_result = decoder._post_process(np.asarray([0.41, 0.39, 0.20], dtype=np.float32))
+
+        self.assertIsNone(lateral_result.class_id)
+        self.assertEqual(lateral_result.label, "静息")
+        self.assertAlmostEqual(lateral_result.confidence, 0.41, places=6)
+
+    def test_realtime_decoder_post_process_keeps_high_confidence_idle_as_real_class(self) -> None:
+        decoder = RealTimeDecoder.__new__(RealTimeDecoder)
+        decoder._confidence_threshold = 0.7
+
+        result = decoder._post_process(np.asarray([0.05, 0.10, 0.85], dtype=np.float32))
+
+        self.assertEqual(result.class_id, 2)
+        self.assertEqual(result.label, "静息")
+        self.assertAlmostEqual(result.confidence, 0.85, places=6)
+
+    def test_realtime_decoder_repeats_keepalive_and_emits_stop(self) -> None:
+        class FakeSender:
+            def __init__(self) -> None:
+                self.commands: list[str] = []
+
+            def push(self, command: str) -> None:
+                self.commands.append(command)
+
+        decoder = RealTimeDecoder.__new__(RealTimeDecoder)
+        decoder._game_command_outlet = FakeSender()
+        decoder._game_session_started = True
+        decoder._last_game_command = None
+        decoder._last_game_transport_command = None
+        decoder._last_game_transport_sent_at = 0.0
+        decoder._game_command_keepalive_sec = 0.0
+
+        decoder._push_game_command("LEFT")
+        decoder._push_game_command("LEFT")
+        decoder._push_game_command(None)
+        decoder._push_game_command("RIGHT")
+
+        self.assertEqual(decoder._game_command_outlet.commands, ["LEFT", "LEFT", "STOP", "RIGHT"])
+
+    def test_realtime_decoder_updates_from_labeled_window_when_enabled(self) -> None:
+        class FakeModel:
+            def __init__(self) -> None:
+                self.calls: list[tuple[tuple[int, ...], list[int], float]] = []
+
+            def update(self, X, y, *, learning_rate: float, epochs: int = 1):
+                del epochs
+                self.calls.append((tuple(X.shape), y.tolist(), learning_rate))
+                return {"updated": float(X.shape[0]), "loss": 0.25}
+
+        model = FakeModel()
+        decoder = RealTimeDecoder.__new__(RealTimeDecoder)
+        decoder._model = model
+        decoder._online_update_enabled = True
+        decoder._online_update_learning_rate = 0.001
+        decoder._online_update_every = 1
+        decoder._online_update_count = 0
+        decoder._online_seen_labeled_windows = 0
+
+        metrics = decoder._maybe_update_model(
+            processed=np.zeros((2, 500), dtype=np.float32),
+            true_label=1,
+        )
+
+        self.assertEqual(metrics, {"updated": 1.0, "loss": 0.25})
+        self.assertEqual(decoder._online_update_count, 1)
+        self.assertEqual(model.calls, [((1, 2, 500), [1], 0.001)])
+
+    def test_manual_online_label_source_overlaps_decode_window(self) -> None:
+        source = ManualOnlineLabelSource(default_ttl_sec=1.0)
+        event = source.set_label("right", timestamp_monotonic=10.0, payload={"target_lane": 1})
+
+        self.assertEqual(event.label_id, 1)
+        self.assertEqual(event.payload, {"target_lane": 1})
+        self.assertIsNotNone(source.get_label(window_start=9.5, window_end=10.2))
+        self.assertIsNone(source.get_label(window_start=11.2, window_end=11.5))
+
+    def test_online_label_aliases(self) -> None:
+        self.assertEqual(coerce_label("left"), (0, "left"))
+        self.assertEqual(coerce_label("右"), (1, "right"))
+        self.assertEqual(coerce_label("stop"), (2, "idle"))
+
+    def test_calibrator_saves_calibration_windows(self) -> None:
+        class FakeAcquirer:
+            metadata = AcquirerMetadata(name="fake", sfreq=250.0, n_channels=2)
+
+            def __init__(self) -> None:
+                self._calls = 0
+                self._sample_cursor = 0
+
+            def start_stream(self) -> None:
+                return
+
+            def stop_stream(self) -> None:
+                return
+
+            def get_chunk(self, window_sec: float):
+                self._calls += 1
+                samples = int(window_sec * self.metadata.sfreq)
+                window = np.full((self.metadata.n_channels, samples), float(self._calls), dtype=np.float32)
+                timestamps = np.arange(samples, dtype=np.float64) / self.metadata.sfreq
+                return window, timestamps
+
+            def get_new_samples(self):
+                samples = 25
+                start = self._sample_cursor
+                stop = start + samples
+                self._sample_cursor = stop
+                window = np.tile(
+                    np.arange(start, stop, dtype=np.float32)[None, :],
+                    (self.metadata.n_channels, 1),
+                )
+                timestamps = np.arange(start, stop, dtype=np.float64) / self.metadata.sfreq
+                return window, timestamps
+
+        class FakeModel:
+            def fit(self, X, y, **kwargs):
+                return {"val_acc": float(len(y) > 0), "val_loss": 0.0}
+
+            def save(self, path: Path) -> None:
+                path.write_text("fake-model", encoding="utf-8")
+
+            def load(self, path: Path) -> None:
+                return
+
+        class FakeMarkerBackend:
+            def send(self, label: int, timestamp: float | None = None) -> None:
+                return
+
+            def send_event(self, event_name: str, timestamp: float | None = None) -> None:
+                return
+
+        class FakeConsole:
+            def print(self, *args, **kwargs) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model_path = Path(tmp_dir) / "models" / "fake.pkl"
+            records_dir = Path(tmp_dir) / "records"
+            calibrator = Calibrator(
+                acquirer=FakeAcquirer(),
+                model=FakeModel(),
+                marker_backend=FakeMarkerBackend(),
+                console=FakeConsole(),
+                sfreq=250.0,
+                window_sec=1.0,
+                step_sec=100.0,
+                model_path=model_path,
+                calibration_records_dir=records_dir,
+                protocol_config=ProtocolConfig.from_config(
+                    {
+                        "window_sec": 1.0,
+                        "step_sec": 0.5,
+                        "protocol": {
+                            "control_start_offset_sec": 0.0,
+                            "control_stop_offset_sec": 1.0,
+                            "export_window_sec": None,
+                            "baseline_segments": [
+                                {
+                                    "name": "idle_baseline",
+                                    "duration_sec": 0.0,
+                                    "instruction": "test",
+                                }
+                            ],
+                            "practice_labels": [],
+                            "new_subject_blocks": 1,
+                            "new_subject_trials_per_class_per_block": 1,
+                            "rest_between_blocks_sec": 0.0,
+                            "trial_timing": {
+                                "fixation_sec": 0.0,
+                                "cue_sec": 0.0,
+                                "control_sec": 1.0,
+                                "iti_sec": 0.0,
+                            },
+                        },
+                    }
+                ),
+            )
+
+            with (
+                mock.patch(
+                    "adaptation.calibrator.filter_and_transform",
+                    lambda data, sfreq: data.astype(np.float32) + 10.0,
+                ),
+            ):
+                result = calibrator.calibrate(
+                    duration_sec=30,
+                    epochs=1,
+                    batch_size=1,
+                    learning_rate=0.001,
+                    patience=1,
+                    head_only=False,
+                )
+
+            assert result.calibration_data_path is not None
+            self.assertTrue(result.calibration_data_path.exists())
+            with np.load(result.calibration_data_path) as payload:
+                self.assertEqual(payload["raw_windows"].shape[0], result.windows_collected)
+                self.assertEqual(payload["processed_windows"].shape[0], result.windows_collected)
+                self.assertEqual(payload["labels"].shape[0], result.windows_collected)
+                self.assertTrue(np.all(payload["processed_windows"] == payload["raw_windows"] + 10.0))
+
+    def test_load_calibration_windows_concatenates_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            records_dir = Path(tmp_dir) / "records"
+            session_a = records_dir / "S001" / "calibration" / "20260413_100000"
+            session_b = records_dir / "S001" / "calibration" / "20260413_110000"
+            session_a.mkdir(parents=True)
+            session_b.mkdir(parents=True)
+
+            np.savez_compressed(
+                session_a / "training_windows_main.npz",
+                raw_windows=np.ones((2, 3, 4), dtype=np.float32),
+                processed_windows=np.full((2, 3, 4), 10.0, dtype=np.float32),
+                labels=np.asarray([0, 1], dtype=np.int64),
+            )
+            np.savez_compressed(
+                session_b / "training_windows_main.npz",
+                raw_windows=np.ones((1, 3, 4), dtype=np.float32) * 2,
+                processed_windows=np.full((1, 3, 4), 20.0, dtype=np.float32),
+                labels=np.asarray([2], dtype=np.int64),
+            )
+
+            X, y, sessions = load_calibration_windows(records_dir, "S001")
+
+            self.assertEqual(X.shape, (3, 3, 4))
+            np.testing.assert_array_equal(y, np.asarray([0, 1, 2], dtype=np.int64))
+            self.assertEqual([session.name for session in sessions], ["20260413_100000", "20260413_110000"])
+            self.assertTrue(np.all(X[:2] == 10.0))
+            self.assertTrue(np.all(X[2:] == 20.0))
+
+    def test_replay_test_mode_runs_model_on_saved_chunks(self) -> None:
+        class FakeModel:
+            def predict_proba(self, X, mc_dropout_passes=1):
+                del mc_dropout_passes
+                outputs = []
+                for idx in range(X.shape[0]):
+                    if idx % 2 == 0:
+                        outputs.append([0.7, 0.2, 0.1])
+                    else:
+                        outputs.append([0.1, 0.8, 0.1])
+                return np.asarray(outputs, dtype=np.float32)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            test_mode_dir = Path(tmp_dir) / "test_mode"
+            chunks_dir = test_mode_dir / "chunks"
+            chunks_dir.mkdir(parents=True)
+            np.savez_compressed(
+                chunks_dir / "chunk_000000.npz",
+                eeg_windows=np.zeros((4, 2, 8), dtype=np.float32),
+                labels_true=np.asarray([0, 1, 0, 1], dtype=np.int64),
+                labels_pred=np.asarray([-1, -1, -1, -1], dtype=np.int64),
+                confidences=np.zeros(4, dtype=np.float32),
+            )
+
+            with mock.patch("cli.filter_and_transform", side_effect=lambda window, sfreq: window):
+                result = replay_test_mode(
+                    model=FakeModel(),
+                    test_mode_dir=test_mode_dir,
+                    sfreq=250.0,
+                    mc_dropout_passes=3,
+                )
+
+            self.assertEqual(result["windows"], 4)
+            self.assertAlmostEqual(result["accuracy"], 1.0, places=6)
+            self.assertAlmostEqual(result["mean_confidence"], 0.75, places=6)
+            np.testing.assert_array_equal(result["y_pred"], np.asarray([0, 1, 0, 1], dtype=np.int64))
+
+    def test_iter_test_mode_chunks_requires_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            test_mode_dir = Path(tmp_dir) / "test_mode"
+            (test_mode_dir / "chunks").mkdir(parents=True)
+            with self.assertRaises(Exception):
+                iter_test_mode_chunks(test_mode_dir)
+
+    def test_manual_web_override_blocks_decoder_temporarily(self) -> None:
+        class FakeTransport:
+            def __init__(self) -> None:
+                self.commands: list[str] = []
+
+            def push(self, command: str) -> None:
+                self.commands.append(command)
+
+        config = {
+            "output": {
+                "ar_game": {"enabled": True},
+                "web_control": {
+                    "manual_override_hold_sec": 10.0,
+                    "manual_override_release_sec": 0.25,
+                },
+            }
+        }
+
+        with mock.patch("game_command_router._build_transport", return_value=FakeTransport()):
+            router = SharedGameCommandRouter(config)
+            transport = router.raw_transport()
+
+            router.push("LEFT", source="decoder")
+            router.push("RIGHT", source="web")
+            router.push("LEFT", source="decoder")
+
+            self.assertEqual(transport.commands, ["LEFT", "RIGHT"])
+
+    def test_manual_stop_allows_decoder_to_resume_after_release_window(self) -> None:
+        class FakeTransport:
+            def __init__(self) -> None:
+                self.commands: list[str] = []
+
+            def push(self, command: str) -> None:
+                self.commands.append(command)
+
+        config = {
+            "output": {
+                "ar_game": {"enabled": True},
+                "web_control": {
+                    "manual_override_hold_sec": 0.8,
+                    "manual_override_release_sec": 0.0,
+                },
+            }
+        }
+
+        with mock.patch("game_command_router._build_transport", return_value=FakeTransport()):
+            router = SharedGameCommandRouter(config)
+            transport = router.raw_transport()
+
+            router.push("RIGHT", source="web")
+            router.push("STOP", source="web")
+            router.push("LEFT", source="decoder")
+
+            self.assertEqual(transport.commands, ["RIGHT", "STOP", "LEFT"])
+
+
+if __name__ == "__main__":
+    unittest.main()

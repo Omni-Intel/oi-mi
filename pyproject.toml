@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oi-mi"
+version = "0.1.0"
+description = "Open Imagination Motor Imagery CLI"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "MIT" }
+authors = [
+  { name = "oi-mi contributors" }
+]
+dependencies = [
+  "bc-ecap-sdk",
+  "brainflow",
+  "braindecode",
+  "click",
+  "mne",
+  "moabb",
+  "numpy",
+  "pyedflib",
+  "pylsl",
+  "pyriemann",
+  "pyserial",
+  "pyyaml",
+  "rich",
+  "scikit-learn",
+  "scipy",
+  "torch",
+  "streamlit>=1.30",
+  "zeroconf",
+]
+
+[project.scripts]
+oi-mi = "cli:cli"
+
+[tool.setuptools]
+py-modules = ["cli", "gui", "web_command_server", "game_command_router"]
+
+[tool.setuptools.packages.find]
+include = ["acquisition*", "adaptation*", "collect*", "decoder*", "models*", "ssvep*", "utils*"]

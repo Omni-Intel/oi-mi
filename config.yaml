@@ -1,0 +1,78 @@
+subject_id: S002
+model_name: eegnet
+device_type: brainco
+sfreq: 250
+n_classes: 3
+window_sec: 2.0
+step_sec: 0.5
+confidence_threshold: 0.7
+mc_dropout_passes: 8
+new_subject_duration_sec: 1800
+old_subject_duration_sec: 300
+new_subject_epochs: 50
+old_subject_epochs: 5
+batch_size: 32
+learning_rate: 0.001
+early_stopping_patience: 40
+collect_block_sec: 10
+buffer_sec: 60
+protocol:
+  control_start_offset_sec: 0.5
+  control_stop_offset_sec: 4.5
+  export_window_sec: 1.5
+  export_stride_sec: 0.5
+  practice_labels: []
+  practice_repetitions: 0
+  baseline_segments:
+  - name: eyes_open_fixation
+    duration_sec: 60.0
+    instruction: 睁眼注视中央十字，保持放松。
+  trial_timing:
+    fixation_sec: 2.0
+    cue_sec: 1.0
+    control_sec: 5.0
+    iti_sec: 2.0
+  new_subject_blocks: 6
+  new_subject_trials_per_class_per_block: 8
+  old_subject_baseline_sec: 60.0
+  old_subject_trials_per_class: 8
+  rest_between_blocks_sec: 35.0
+  extra_rest_sec: 60.0
+  dynamic_total_minutes_hint: 30.0
+  random_seed: 17
+device:
+  neuracle_host: 127.0.0.1
+  neuracle_port: 8712
+  brainco_addr: ''
+  brainco_port: 0
+  brainco_auto_discover: true
+  brainco_scan_timeout_sec: 6.0
+  brainco_ready_timeout_sec: 20.0
+  brainco_start_retries: 2
+  brainco_gain: 6
+  brainco_signal_source: NORMAL
+  brainco_device_id: eeg-cap
+  trigger_serial_port: ''
+output:
+  command_stream_name: oi_mi_commands
+  command_stream_type: Markers
+  ar_game:
+    enabled: false
+    host: 192.168.137.231
+    port: 5005
+    timeout_sec: 1.0
+  web_control:
+    enabled: true
+    host: 0.0.0.0
+    port: 8765
+    manual_override_hold_sec: 0.8
+    manual_override_release_sec: 0.25
+storage:
+  models_dir: models_storage
+  records_dir: records_storage
+ssvep_game:
+  rounds: 5
+  keeper_save_probability: 0.35
+  opponent_goal_probability: 0.7
+  stability_windows: 2
+  min_confidence: 0.35
