@@ -171,7 +171,8 @@ class Calibrator:
         recorder: SessionRecorder,
         heartbeat: Callable[[], None] | None,
     ) -> None:
-        self._console.print("[bold yellow]练习阶段，不计入正式训练数据[/bold yellow]")
+        self._console.print(f"[bold yellow]接下来是 {len(plan.practice_labels)} 个练习 trial，用于熟悉流程[/bold yellow]")
+        self._sleep_with_recording(3.0, recorder=recorder, heartbeat=heartbeat)
         for index, label in enumerate(plan.practice_labels, start=1):
             self._console.print(f"[bold yellow]练习 {index}/{len(plan.practice_labels)}[/bold yellow] {LABEL_DISPLAY[label]} {LABEL_DESCRIPTION[label]}")
             self._run_trial(
@@ -183,6 +184,8 @@ class Calibrator:
                 phase="practice",
                 collect_trial=False,
             )
+        self._console.print("[bold cyan]练习结束，接下来开始正式采集[/bold cyan]")
+        self._sleep_with_recording(3.0, recorder=recorder, heartbeat=heartbeat)
 
     def _run_baseline(
         self,
@@ -240,7 +243,7 @@ class Calibrator:
         collect_trial: bool,
     ) -> dict[str, Any] | None:
         trial_timing = self._protocol.trial_timing
-        self._console.print(f"[bold yellow]{LABEL_SYMBOL[label]} {LABEL_DISPLAY[label]}[/bold yellow] {LABEL_DESCRIPTION[label]}")
+        self._console.print("[bold yellow]PRACTICE_FIXATION[/bold yellow]" if phase == "practice" else "[bold yellow]FIXATION[/bold yellow]")
         self._emit_event(
             recorder,
             "fixation_on",
@@ -252,6 +255,8 @@ class Calibrator:
         self._sleep_with_recording(trial_timing.fixation_sec, recorder=recorder, heartbeat=heartbeat)
 
         cue_event = f"cue_{label}_on"
+        cue_message = f"PRACTICE {LABEL_SYMBOL[label]} {LABEL_DISPLAY[label]}" if phase == "practice" else f"{LABEL_SYMBOL[label]} {LABEL_DISPLAY[label]}"
+        self._console.print(f"[bold yellow]{cue_message}[/bold yellow]")
         self._emit_event(
             recorder,
             cue_event,
@@ -290,6 +295,7 @@ class Calibrator:
             trial_index=trial_index,
             label=label,
         )
+        self._console.print("[bold yellow]PRACTICE_ITI[/bold yellow]" if phase == "practice" else "[bold yellow]ITI[/bold yellow]")
         self._sleep_with_recording(trial_timing.iti_sec, recorder=recorder, heartbeat=heartbeat)
         if not collect_trial:
             return None

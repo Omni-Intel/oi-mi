@@ -60,7 +60,7 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
         "control_stop_offset_sec": 4.5,
         "export_window_sec": 1.5,
         "export_stride_sec": 0.5,
-        "practice_labels": ["left", "right", "idle", "left", "right"],
+        "practice_labels": ["left", "right", "idle", "left", "right", "idle"],
         "practice_repetitions": 1,
         "baseline_segments": [
             {

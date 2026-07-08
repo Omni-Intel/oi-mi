@@ -21,8 +21,14 @@ protocol:
   control_stop_offset_sec: 4.5
   export_window_sec: 1.5
   export_stride_sec: 0.5
-  practice_labels: []
-  practice_repetitions: 0
+  practice_labels:
+  - left
+  - right
+  - idle
+  - left
+  - right
+  - idle
+  practice_repetitions: 1
   baseline_segments:
   - name: eyes_open_fixation
     duration_sec: 60.0

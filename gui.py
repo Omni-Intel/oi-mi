@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import html
 import re
 import sys
@@ -73,9 +74,11 @@ _DISPLAY_SYMBOLS = {
     "LEFT": "←",
     "RIGHT": "→",
     "REST": "○",
+    "FIXATION": "+",
     "START": "◎",
     "PAUSE": "◌",
     "TRANSITION": "·",
+    "BLANK": "",
     "DONE": "✓",
     "ERROR": "✕",
 }
@@ -185,9 +188,40 @@ def render_ar_forwarding_panel(config: dict) -> None:
                 )
                 st.success(f"{command} 已发送。")
 
+_CUE_COLORS = {
+    "action": "#15803D",
+    "rest": "#2563EB",
+    "default": "#C2410C",
+}
+
+_CALIBRATION_GUIDANCE_STEPS = (
+    ("", "保持稳定", "请坐稳，双手自然放松，眼睛看向屏幕中央。"),
+    ("←", "左手想象", "看到这个图案时，只在脑海中想象左手重复握拳、松开，不要真的动。"),
+    ("→", "右手想象", "看到这个图案时，只在脑海中想象右手重复握拳、松开，不要真的动。"),
+    ("○", "静息放松", "看到这个图案时，请放松注视屏幕，不想象左右手动作。"),
+    ("+", "准备提示", "看到这个图案时，请注视中央，准备下一次提示。"),
+    ("·", "试次间隔", "看到这个图案时，只需等待下一次提示；它不是任务类别。"),
+    ("", "重新集中", "如果走神，请在下一次提示出现时重新集中即可。"),
+)
+
+
+def _resolve_display_color(symbol: str, message: str) -> str:
+    upper_message = message.upper()
+    if symbol in {"←", "→"} or "LEFT" in upper_message or "RIGHT" in upper_message:
+        return _CUE_COLORS["action"]
+    if symbol in {"○", "◌"} or "REST" in upper_message or "IDLE" in upper_message or "休息" in message:
+        return _CUE_COLORS["rest"]
+    return _CUE_COLORS["default"]
+
 
 def _resolve_cue_symbol(message: str, *, event_type: str) -> tuple[str, bool] | None:
     upper_message = message.upper()
+    if "接下来是" in message and "练习" in message:
+        return _DISPLAY_SYMBOLS["BLANK"], False
+    if "练习结束" in message or "开始正式采集" in message:
+        return _DISPLAY_SYMBOLS["BLANK"], False
+    if "FIXATION" in upper_message:
+        return _DISPLAY_SYMBOLS["FIXATION"], False
     if "LEFT" in upper_message:
         return _DISPLAY_SYMBOLS["LEFT"], event_type == "prediction"
     if "RIGHT" in upper_message:
@@ -202,9 +236,64 @@ def _resolve_cue_symbol(message: str, *, event_type: str) -> tuple[str, bool] | 
         return _DISPLAY_SYMBOLS["START"], False
     if "Baseline" in message or "休息" in message:
         return _DISPLAY_SYMBOLS["PAUSE"], False
+    if "ITI" in upper_message:
+        return _DISPLAY_SYMBOLS["TRANSITION"], False
     if "Block " in message or "练习阶段" in message or "实验指导语" in message:
         return _DISPLAY_SYMBOLS["TRANSITION"], False
     return None
+
+
+def _subject_facing_message(message: str, *, prediction: bool) -> str:
+    """Return concise text for the subject-facing fullscreen view."""
+
+    upper_message = message.upper()
+    if prediction:
+        return ""
+    if "执行失败" in message:
+        return "执行失败"
+    if "校准完成" in message:
+        return "采集完成"
+    if "BASELINE" in upper_message:
+        return "请放松注视中央"
+    if "休息" in message:
+        return "请休息，稍后继续"
+    if "开始按 MI GAME CONTROL PROTOCOL 采集".upper() in upper_message:
+        return "准备开始"
+    if "接下来是" in message and "练习" in message:
+        return "接下来是 6 个练习 trial"
+    if "练习结束" in message or "开始正式采集" in message:
+        return "接下来开始正式采集"
+    if "练习阶段" in message:
+        return "接下来是 6 个练习 trial"
+    if "练习" in message:
+        if "LEFT" in upper_message:
+            return "想象左手重复握拳、松开"
+        if "RIGHT" in upper_message:
+            return "想象右手重复握拳、松开"
+        if "REST" in upper_message or "IDLE" in upper_message:
+            return "放松注视，不想象动作"
+        return "练习"
+    if "PRACTICE_FIXATION" in upper_message:
+        return "注视中央，准备下一次提示"
+    if "PRACTICE_ITI" in upper_message:
+        return "短暂休息"
+    if "PRACTICE" in upper_message:
+        if "LEFT" in upper_message:
+            return "想象左手重复握拳、松开"
+        if "RIGHT" in upper_message:
+            return "想象右手重复握拳、松开"
+        if "REST" in upper_message or "IDLE" in upper_message:
+            return "放松注视，不想象动作"
+        return "练习"
+    if "FIXATION" in upper_message:
+        return ""
+    if "LEFT" in upper_message or "RIGHT" in upper_message or "REST" in upper_message or "IDLE" in upper_message:
+        return ""
+    if "ITI" in upper_message or "BLOCK " in upper_message:
+        return ""
+    if message.startswith("- "):
+        return ""
+    return ""
 
 SIDEBAR_NAV_PAGES = ("首页", "设置", "连通检测", "阻抗检查", "校准", "测试模式", "实时解码")
 _IMPEDANCE_STATUS_COLORS = {
@@ -218,6 +307,22 @@ _IMPEDANCE_STATUS_COLORS = {
 def _resolve_logo_svg_path() -> Path | None:
     """Resolve sidebar logo path."""
     return _resolve_asset_path(_LOGO_FILENAME)
+
+
+def render_sidebar_logo(path: Path) -> None:
+    """Render logo without Streamlit's image fullscreen control."""
+
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    st.markdown(
+        (
+            "<img "
+            f"src='data:image/svg+xml;base64,{encoded}' "
+            "alt='Omni-Intelligence' "
+            "style='width: 280px; max-width: 100%; height: auto; display: block;'"
+            ">"
+        ),
+        unsafe_allow_html=True,
+    )
 
 
 def load_config() -> dict:
@@ -238,9 +343,10 @@ def save_config(cfg: dict) -> None:
 class StreamlitConsole:
     """Minimal Rich Console substitute that writes into Streamlit placeholders."""
 
-    def __init__(self, cue_placeholder, log_placeholder) -> None:
+    def __init__(self, cue_placeholder, log_placeholder, *, fullscreen: bool = False) -> None:
         self.cue_placeholder = cue_placeholder
         self.log_placeholder = log_placeholder
+        self.fullscreen = fullscreen
         self.logs: list[str] = []
         self._lock = threading.Lock()
         self._pending_events: list[tuple[str, str]] = []
@@ -283,7 +389,7 @@ class StreamlitConsole:
                 self._append_log(msg)
                 log_updated = True
 
-        if log_updated:
+        if log_updated and not self.fullscreen:
             self.log_placeholder.code("\n".join(self.logs))
 
     def _append_log(self, msg: str) -> None:
@@ -296,7 +402,27 @@ class StreamlitConsole:
         symbol = resolved[0] if resolved is not None else "·"
         is_prediction = resolved[1] if resolved is not None else prediction
         bg = "#F0FFF4" if is_prediction else "#F8FAFC"
-        color = "#0F766E" if is_prediction else "#C2410C"
+        color = _resolve_display_color(symbol, msg)
+        if self.fullscreen:
+            subject_message = _subject_facing_message(msg, prediction=is_prediction)
+            symbol_html = ""
+            if symbol:
+                symbol_html = f"<div class='oi-experiment-symbol' style='color: {color};'>{symbol}</div>"
+            message_html = ""
+            if subject_message:
+                safe_msg = html.escape(subject_message)
+                message_class = "oi-experiment-message" if symbol else "oi-experiment-center-message"
+                message_html = f"<div class='{message_class}'>{safe_msg}</div>"
+            self.cue_placeholder.markdown(
+                (
+                    "<div class='oi-experiment-stage'>"
+                    f"{symbol_html}"
+                    f"{message_html}"
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+            return
         self.cue_placeholder.markdown(
             (
                 "<div style='padding: 1.25rem; min-height: 8rem; border-radius: 12px; "
@@ -309,12 +435,237 @@ class StreamlitConsole:
         )
 
 
-def init_live_view() -> tuple[StreamlitConsole, callable]:
+def enter_experiment_view() -> None:
+    """Switch Streamlit chrome into a subject-facing experiment view."""
+
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"],
+        [data-testid="stHeader"],
+        [data-testid="stToolbar"],
+        [data-testid="stDecoration"],
+        [data-testid="stStatusWidget"] {
+          display: none !important;
+        }
+        html,
+        body,
+        .stApp,
+        [data-testid="stAppViewContainer"],
+        [data-testid="stMain"],
+        [data-testid="stMainBlockContainer"],
+        .block-container {
+          height: 100dvh !important;
+          max-height: 100dvh !important;
+          overflow: hidden !important;
+        }
+        [data-testid="stAppViewContainer"],
+        [data-testid="stMain"],
+        .stApp {
+          background: #ffffff !important;
+        }
+        [data-testid="stMainBlockContainer"],
+        .block-container {
+          max-width: none !important;
+          padding: 0 !important;
+        }
+        .oi-experiment-stage {
+          width: 100vw;
+          height: 100dvh;
+          position: fixed;
+          inset: 0;
+          z-index: 9990;
+          background: #f8fafc;
+          border: none;
+          box-sizing: border-box;
+          overflow: hidden;
+        }
+        .oi-experiment-symbol {
+          position: fixed;
+          top: 45%;
+          left: 50%;
+          transform: translate(-50%, -50%);
+          font-size: clamp(8rem, 24vw, 22rem);
+          line-height: 1;
+          font-weight: 800;
+          text-align: center;
+        }
+        .oi-experiment-message {
+          position: fixed;
+          bottom: 16vh;
+          left: 8vw;
+          right: 8vw;
+          text-align: center;
+          font-size: clamp(1.3rem, 2.2vw, 2.6rem);
+          line-height: 1.35;
+          font-weight: 700;
+          color: #0f172a;
+        }
+        .oi-experiment-center-message {
+          position: fixed;
+          top: 50%;
+          left: 10vw;
+          right: 10vw;
+          transform: translateY(-50%);
+          text-align: center;
+          font-size: clamp(2.2rem, 5vw, 5rem);
+          line-height: 1.18;
+          font-weight: 800;
+          color: #0f172a;
+        }
+        .st-key-calibration_return_from_experiment {
+          position: fixed;
+          top: 1.15rem;
+          left: 1.35rem;
+          z-index: 10000;
+          width: auto !important;
+        }
+        .st-key-calibration_return_from_experiment > button,
+        .st-key-calibration_return_from_experiment .stButton > button {
+          width: auto !important;
+          min-width: 0 !important;
+          min-height: 0 !important;
+          padding: 0 !important;
+          border: none !important;
+          background: transparent !important;
+          color: #0f172a !important;
+          font-size: 1.85rem;
+          line-height: 1;
+          font-weight: 800;
+          box-shadow: none !important;
+          opacity: 1;
+        }
+        .st-key-calibration_return_from_experiment > button:hover,
+        .st-key-calibration_return_from_experiment .stButton > button:hover {
+          background: transparent !important;
+          color: #0f172a !important;
+          opacity: 1;
+        }
+        .oi-guidance-panel {
+          position: fixed;
+          inset: 0;
+          z-index: 9990;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          background: #f8fafc;
+          box-sizing: border-box;
+          padding: 8vh 10vw;
+        }
+        .oi-guidance-content {
+          width: min(1100px, 100%);
+          text-align: center;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+        }
+        .oi-guidance-kicker {
+          margin-bottom: 1.2rem;
+          font-size: clamp(1.4rem, 2vw, 2.2rem);
+          font-weight: 700;
+          color: #64748b;
+          text-align: center;
+        }
+        .oi-guidance-symbol {
+          margin: 0 auto 1.25rem;
+          font-size: clamp(9rem, 20vw, 18rem);
+          line-height: 1;
+          font-weight: 800;
+          color: #C2410C;
+          text-align: center;
+        }
+        .oi-guidance-title {
+          margin: 0 0 1.7rem;
+          font-size: clamp(4rem, 7vw, 7.5rem);
+          line-height: 1.12;
+          font-weight: 800;
+          color: #0f172a;
+          text-align: center;
+        }
+        .oi-guidance-body {
+          display: block;
+          width: min(980px, 78vw);
+          margin: 0 auto;
+          max-width: none;
+          font-size: clamp(2.3rem, 3.4vw, 3.9rem);
+          line-height: 1.35;
+          font-weight: 400;
+          color: #1e293b;
+          text-align: center !important;
+          text-wrap: balance;
+        }
+        .st-key-calibration_guidance_next {
+          position: fixed;
+          right: 4vw;
+          bottom: 4vh;
+          z-index: 10000;
+          width: min(16rem, 44vw) !important;
+        }
+        .st-key-calibration_guidance_next > button,
+        .st-key-calibration_guidance_next .stButton > button {
+          width: 100% !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_experiment_return_button() -> None:
+    """Render the operator return button in experiment view."""
+
+    if st.button("≪", key="calibration_return_from_experiment"):
+        st.session_state.pop("calibration_experiment_view", None)
+        st.session_state.pop("calibration_is_new", None)
+        st.session_state.pop("calibration_after_guidance", None)
+        st.session_state.pop("calibration_guidance_step", None)
+        st.session_state.gui_nav_mode = "校准"
+        st.rerun()
+
+
+def render_calibration_guidance() -> None:
+    """Render pre-collection subject instructions."""
+
+    step_index = int(st.session_state.get("calibration_guidance_step", 0))
+    step_index = max(0, min(step_index, len(_CALIBRATION_GUIDANCE_STEPS) - 1))
+    symbol, title, body = _CALIBRATION_GUIDANCE_STEPS[step_index]
+    symbol_html = ""
+    if symbol:
+        symbol_color = _resolve_display_color(symbol, body)
+        symbol_html = f"<div class='oi-guidance-symbol' style='color: {symbol_color};'>{html.escape(symbol)}</div>"
+    st.markdown(
+        (
+            "<div class='oi-guidance-panel'>"
+            "<div class='oi-guidance-content'>"
+            f"<div class='oi-guidance-kicker'>步骤 {step_index + 1} / {len(_CALIBRATION_GUIDANCE_STEPS)}</div>"
+            f"{symbol_html}"
+            f"<h1 class='oi-guidance-title'>{html.escape(title)}</h1>"
+            f"<div class='oi-guidance-body'>{html.escape(body)}</div>"
+            "</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+    is_last_step = step_index >= len(_CALIBRATION_GUIDANCE_STEPS) - 1
+    next_label = "开始" if is_last_step else "下一步"
+    if st.button(next_label, key="calibration_guidance_next", type="primary"):
+        if is_last_step:
+            next_view = str(st.session_state.get("calibration_after_guidance", "preview"))
+            st.session_state.calibration_experiment_view = next_view
+            st.session_state.pop("calibration_guidance_step", None)
+            st.session_state.pop("calibration_after_guidance", None)
+        else:
+            st.session_state.calibration_guidance_step = step_index + 1
+        st.rerun()
+
+
+def init_live_view(*, fullscreen: bool = False) -> tuple[StreamlitConsole, callable]:
     """Create cue/log placeholders for a running EEG page."""
 
     cue_box = st.empty()
     log_box = st.empty()
-    console = StreamlitConsole(cue_box, log_box)
+    console = StreamlitConsole(cue_box, log_box, fullscreen=fullscreen)
 
     def refresh() -> None:
         console.render_pending()
@@ -322,6 +673,123 @@ def init_live_view() -> tuple[StreamlitConsole, callable]:
 
     refresh()
     return console, refresh
+
+
+def run_calibration_ui_preview() -> None:
+    """Preview calibration cue/log UI without touching hardware."""
+
+    console, refresh = init_live_view(fullscreen=True)
+    preview_events = (
+        ("开始按 MI game control protocol 采集", 0.9),
+        ("接下来是 6 个练习 trial，用于熟悉流程", 1.6),
+        ("练习 1/6 LEFT 左手持续握拳/松拳想象", 1.0),
+        ("PRACTICE_FIXATION", 0.8),
+        ("PRACTICE ← LEFT", 1.3),
+        ("PRACTICE_ITI", 0.7),
+        ("练习 2/6 RIGHT 右手持续握拳/松拳想象", 1.0),
+        ("PRACTICE_FIXATION", 0.8),
+        ("PRACTICE → RIGHT", 1.3),
+        ("PRACTICE_ITI", 0.7),
+        ("练习 3/6 REST 放松注视，不发出控制指令", 1.0),
+        ("PRACTICE_FIXATION", 0.8),
+        ("PRACTICE ○ REST", 1.3),
+        ("PRACTICE_ITI", 0.7),
+        ("练习 4/6 LEFT 左手持续握拳/松拳想象", 1.0),
+        ("PRACTICE_FIXATION", 0.8),
+        ("PRACTICE ← LEFT", 1.3),
+        ("PRACTICE_ITI", 0.7),
+        ("练习 5/6 RIGHT 右手持续握拳/松拳想象", 1.0),
+        ("PRACTICE_FIXATION", 0.8),
+        ("PRACTICE → RIGHT", 1.3),
+        ("PRACTICE_ITI", 0.7),
+        ("练习 6/6 REST 放松注视，不发出控制指令", 1.0),
+        ("PRACTICE_FIXATION", 0.8),
+        ("PRACTICE ○ REST", 1.3),
+        ("PRACTICE_ITI", 0.7),
+        ("练习结束，接下来开始正式采集", 1.6),
+        ("Baseline 休息", 1.2),
+        ("FIXATION", 0.8),
+        ("LEFT", 1.4),
+        ("ITI", 0.8),
+        ("FIXATION", 0.8),
+        ("RIGHT", 1.4),
+        ("ITI", 0.8),
+        ("FIXATION", 0.8),
+        ("REST", 1.4),
+        ("休息 10 秒，请放松但不要大幅动作", 1.2),
+        ("校准完成", 0.8),
+    )
+
+    for message, delay_sec in preview_events:
+        console.print(message)
+        refresh()
+        time.sleep(delay_sec)
+
+
+def run_calibration_session(config: dict, protocol: ProtocolConfig, *, is_new_flag: bool) -> None:
+    """Run real calibration in the subject-facing experiment view."""
+
+    try:
+        subject_id = str(config["subject_id"])
+        model_name = str(config["model_name"])
+        acquirer = build_acquirer(
+            device_name=str(config["device_type"]),
+            config=config,
+        )
+        effective_n_channels = int(acquirer.metadata.n_channels)
+        console, refresh = init_live_view(fullscreen=True)
+        model = ModelFactory.get(
+            model_name,
+            n_chans=effective_n_channels,
+            sfreq=float(config["sfreq"]),
+            n_classes=int(config["n_classes"]),
+            n_times=int(float(config["sfreq"]) * float(config["window_sec"])),
+        )
+        model_path = build_model_path(
+            config,
+            subject_id,
+            model_name,
+            device_name=str(config["device_type"]),
+        )
+        calibrator = Calibrator(
+            acquirer=acquirer,
+            model=model,
+            marker_backend=build_marker_backend(config),
+            console=console,
+            sfreq=float(config["sfreq"]),
+            window_sec=float(config["window_sec"]),
+            step_sec=float(config["step_sec"]),
+            model_path=model_path,
+            calibration_records_dir=Path(str(config.get("storage", {}).get("records_dir", "records_storage")))
+            / subject_id
+            / "calibration",
+            protocol_config=protocol,
+        )
+
+        if not is_new_flag:
+            calibrator.load_existing_weights()
+
+        with st.spinner("校准进行中..."):
+            result = calibrator.calibrate(
+                duration_sec=None,
+                epochs=int(config["new_subject_epochs"] if is_new_flag else config["old_subject_epochs"]),
+                batch_size=int(config["batch_size"]),
+                learning_rate=float(config["learning_rate"]),
+                patience=int(config["early_stopping_patience"]),
+                head_only=not is_new_flag,
+                heartbeat=refresh,
+            )
+
+        refresh()
+        st.success("校准完成。")
+        st.write(f"- 采集窗口数: **{result.windows_collected}**")
+        st.write(f"- 模型保存位置: `{result.model_path}`")
+        if result.calibration_data_path is not None:
+            st.write(f"- 校准数据保存位置: `{result.calibration_data_path}`")
+        if result.session_dir is not None:
+            st.write(f"- session 保存位置: `{result.session_dir}`")
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"执行失败: {exc}")
 
 
 def _format_impedance_value(impedance_kohm: float | None) -> str:
@@ -652,8 +1120,29 @@ def render_impedance(config: dict) -> None:
 
 
 def render_calibration(config: dict) -> None:
-    st.title("被试校准")
     protocol = ProtocolConfig.from_config(config)
+
+    calibration_view = st.session_state.get("calibration_experiment_view")
+    if calibration_view is not None:
+        enter_experiment_view()
+        render_experiment_return_button()
+        if calibration_view == "guidance":
+            render_calibration_guidance()
+        elif calibration_view == "preview":
+            run_calibration_ui_preview()
+            st.session_state.pop("calibration_experiment_view", None)
+            st.session_state.gui_nav_mode = "校准"
+            st.rerun()
+        elif calibration_view == "run":
+            run_calibration_session(
+                config,
+                protocol,
+                is_new_flag=bool(st.session_state.pop("calibration_is_new", True)),
+            )
+            st.session_state.pop("calibration_experiment_view", None)
+        return
+
+    st.title("被试校准")
     st.markdown("开始采集后，页面会显示提示与日志。")
     st.caption(
         f"主训练窗 {protocol.window_sec:.1f}s / 刷新 {protocol.stride_sec:.1f}s。"
@@ -664,69 +1153,22 @@ def render_calibration(config: dict) -> None:
 
     is_new = st.radio("被试类型", ["新被试 (重新训练)", "老被试 (已有模型微调)"])
 
-    if st.button("开始校准", type="primary"):
-        try:
-            is_new_flag = is_new.startswith("新")
-            subject_id = str(config["subject_id"])
-            model_name = str(config["model_name"])
-            acquirer = build_acquirer(
-                device_name=str(config["device_type"]),
-                config=config,
-            )
-            effective_n_channels = int(acquirer.metadata.n_channels)
-            console, refresh = init_live_view()
-            model = ModelFactory.get(
-                model_name,
-                n_chans=effective_n_channels,
-                sfreq=float(config["sfreq"]),
-                n_classes=int(config["n_classes"]),
-                n_times=int(float(config["sfreq"]) * float(config["window_sec"])),
-            )
-            model_path = build_model_path(
-                config,
-                subject_id,
-                model_name,
-                device_name=str(config["device_type"]),
-            )
-            calibrator = Calibrator(
-                acquirer=acquirer,
-                model=model,
-                marker_backend=build_marker_backend(config),
-                console=console,
-                sfreq=float(config["sfreq"]),
-                window_sec=float(config["window_sec"]),
-                step_sec=float(config["step_sec"]),
-                model_path=model_path,
-                calibration_records_dir=Path(str(config.get("storage", {}).get("records_dir", "records_storage")))
-                / subject_id
-                / "calibration",
-                protocol_config=protocol,
-            )
+    preview_col, run_col = st.columns([1, 1])
+    preview_requested = preview_col.button("预览实时显示", type="secondary", use_container_width=True)
+    run_requested = run_col.button("开始校准", type="primary", use_container_width=True)
 
-            if not is_new_flag:
-                calibrator.load_existing_weights()
+    if preview_requested:
+        st.session_state.calibration_experiment_view = "guidance"
+        st.session_state.calibration_after_guidance = "preview"
+        st.session_state.calibration_guidance_step = 0
+        st.rerun()
 
-            with st.spinner("校准进行中..."):
-                result = calibrator.calibrate(
-                    duration_sec=None,
-                    epochs=int(config["new_subject_epochs"] if is_new_flag else config["old_subject_epochs"]),
-                    batch_size=int(config["batch_size"]),
-                    learning_rate=float(config["learning_rate"]),
-                    patience=int(config["early_stopping_patience"]),
-                    head_only=not is_new_flag,
-                    heartbeat=refresh,
-                )
-
-            refresh()
-            st.success("校准完成。")
-            st.write(f"- 采集窗口数: **{result.windows_collected}**")
-            st.write(f"- 模型保存位置: `{result.model_path}`")
-            if result.calibration_data_path is not None:
-                st.write(f"- 校准数据保存位置: `{result.calibration_data_path}`")
-            if result.session_dir is not None:
-                st.write(f"- session 保存位置: `{result.session_dir}`")
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"执行失败: {exc}")
+    if run_requested:
+        st.session_state.calibration_is_new = is_new.startswith("新")
+        st.session_state.calibration_experiment_view = "guidance"
+        st.session_state.calibration_after_guidance = "run"
+        st.session_state.calibration_guidance_step = 0
+        st.rerun()
 
 
 def render_test_mode(config: dict) -> None:
@@ -899,6 +1341,12 @@ def _inject_gui_nav_styles() -> None:
         section[data-testid="stSidebar"] * {
           color: #1e293b;
         }
+        .stButton > button {
+          color: #0f172a !important;
+        }
+        .stButton > button * {
+          color: inherit !important;
+        }
         section[data-testid="stSidebar"] .stButton > button {
           width: 100%;
           border-radius: 10px;
@@ -924,16 +1372,56 @@ def _inject_gui_nav_styles() -> None:
           color: rgb(15, 23, 42);
         }
         section[data-testid="stSidebar"] .stButton > button[kind="primary"],
-        section[data-testid="stSidebar"] .stButton > button[kind="primary"]:hover,
+        section[data-testid="stSidebar"] .stButton > button[kind="primary"]:hover {
+          background-color: #ff4b4b !important;
+          border-color: #ff4b4b !important;
+          color: #ffffff !important;
+        }
         section[data-testid="stSidebar"] .stButton > button[kind="primary"] *,
         section[data-testid="stSidebar"] .stButton > button[kind="primary"]:hover * {
           color: #ffffff !important;
         }
         section[data-testid="stSidebar"] .stButton > button[data-testid="stBaseButton-primary"],
-        section[data-testid="stSidebar"] .stButton > button[data-testid="stBaseButton-primary"]:hover,
+        section[data-testid="stSidebar"] .stButton > button[data-testid="stBaseButton-primary"]:hover {
+          background-color: #ff4b4b !important;
+          border-color: #ff4b4b !important;
+          color: #ffffff !important;
+        }
         section[data-testid="stSidebar"] .stButton > button[data-testid="stBaseButton-primary"] *,
         section[data-testid="stSidebar"] .stButton > button[data-testid="stBaseButton-primary"]:hover * {
           color: #ffffff !important;
+        }
+        [data-testid="stMain"] .stButton > button[kind="primary"],
+        [data-testid="stMain"] .stButton > button[data-testid="stBaseButton-primary"] {
+          background-color: #ff4b4b !important;
+          border-color: #ff4b4b !important;
+          color: #ffffff !important;
+        }
+        [data-testid="stMain"] .stButton > button[kind="primary"] *,
+        [data-testid="stMain"] .stButton > button[data-testid="stBaseButton-primary"] * {
+          color: #ffffff !important;
+        }
+        [data-testid="stMain"] .stButton > button[kind="primary"]:hover,
+        [data-testid="stMain"] .stButton > button[data-testid="stBaseButton-primary"]:hover {
+          background-color: #e53e3e !important;
+          border-color: #e53e3e !important;
+          color: #ffffff !important;
+        }
+        [data-testid="stMain"] .stButton > button[kind="secondary"],
+        [data-testid="stMain"] .stButton > button[data-testid="stBaseButton-secondary"] {
+          background-color: #ffffff !important;
+          border-color: rgba(15, 23, 42, 0.18) !important;
+          color: #0f172a !important;
+        }
+        [data-testid="stMain"] .stButton > button[kind="secondary"] *,
+        [data-testid="stMain"] .stButton > button[data-testid="stBaseButton-secondary"] * {
+          color: #0f172a !important;
+        }
+        [data-testid="stMain"] .stButton > button[kind="secondary"]:hover,
+        [data-testid="stMain"] .stButton > button[data-testid="stBaseButton-secondary"]:hover {
+          border-color: rgba(255, 90, 1, 0.45) !important;
+          background-color: rgba(255, 90, 1, 0.06) !important;
+          color: #0f172a !important;
         }
         .oi-sidebar-spacer {
           flex: 1 1 auto;
@@ -975,7 +1463,7 @@ def main() -> None:
     with st.sidebar:
         logo_path = _resolve_logo_svg_path()
         if logo_path is not None:
-            st.image(str(logo_path), width=280)
+            render_sidebar_logo(logo_path)
         st.title("oi-mi 工作台")
         for page in SIDEBAR_NAV_PAGES:
             is_active = st.session_state.gui_nav_mode == page
