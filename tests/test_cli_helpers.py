@@ -477,6 +477,22 @@ class CliHelperTests(unittest.TestCase):
 
         self.assertEqual(decoder._game_command_outlet.commands, ["LEFT", "LEFT", "STOP", "RIGHT"])
 
+    def test_realtime_decoder_status_callback_reports_command_state(self) -> None:
+        payloads: list[dict] = []
+
+        decoder = RealTimeDecoder.__new__(RealTimeDecoder)
+        decoder._status_callback = payloads.append
+        decoder._last_game_transport_command = "LEFT"
+        decoder._last_game_transport_error = None
+        decoder._last_game_transport_sent_at = 1.0
+
+        decoder._emit_status(PredictionResult("左手", 0.88, 0.12, 0), "LEFT")
+
+        self.assertEqual(payloads[-1]["prediction"], "左手")
+        self.assertEqual(payloads[-1]["mapped_command"], "LEFT")
+        self.assertEqual(payloads[-1]["last_transport_command"], "LEFT")
+        self.assertTrue(payloads[-1]["last_send_success"])
+
     def test_realtime_decoder_updates_from_labeled_window_when_enabled(self) -> None:
         class FakeModel:
             def __init__(self) -> None:

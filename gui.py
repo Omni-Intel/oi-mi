@@ -26,6 +26,7 @@ from cli import (
     write_config,
 )
 from decoder.real_time_decoder import RealTimeDecoder, TEST_MODE_PROMPTS
+from game_command_router import get_shared_game_command_router
 from models.factory import ModelFactory
 from utils.markers import LSLCommandOutlet
 
@@ -78,6 +79,111 @@ _DISPLAY_SYMBOLS = {
     "DONE": "✓",
     "ERROR": "✕",
 }
+
+_AR_TEST_COMMANDS = ("START", "LEFT", "RIGHT", "STOP")
+
+
+def _ar_game_mode(ar_game_cfg: dict) -> str:
+    return "reverse relay" if bool(ar_game_cfg.get("reverse_enabled", False)) else "direct TCP"
+
+
+def _ar_game_target(ar_game_cfg: dict) -> str:
+    if bool(ar_game_cfg.get("reverse_enabled", False)):
+        listen_ip = str(ar_game_cfg.get("reverse_listen_ip", "0.0.0.0"))
+        listen_port = int(ar_game_cfg.get("reverse_listen_port", 5006))
+        return f"listen {listen_ip}:{listen_port}"
+    host = str(ar_game_cfg.get("host", "127.0.0.1"))
+    port = int(ar_game_cfg.get("port", 5005))
+    return f"{host}:{port}"
+
+
+def _get_ar_forward_status() -> dict:
+    return dict(st.session_state.get("ar_forward_status", {}))
+
+
+def _set_ar_forward_status(**updates: object) -> None:
+    status = _get_ar_forward_status()
+    status.update(updates)
+    status["updated_at"] = time.time()
+    st.session_state.ar_forward_status = status
+
+
+def _update_ar_decoder_status(payload: dict) -> None:
+    _set_ar_forward_status(
+        last_prediction=payload.get("prediction", "-"),
+        confidence=payload.get("confidence"),
+        mapped_command=payload.get("mapped_command", "-"),
+        last_transport_command=payload.get("last_transport_command"),
+        last_send_success=payload.get("last_send_success"),
+        last_send_error=payload.get("last_send_error"),
+    )
+
+
+def _format_send_state(status: dict) -> str:
+    success = status.get("last_send_success")
+    if success is True:
+        return "success"
+    if success is False:
+        return "failed"
+    return "-"
+
+
+def render_ar_forwarding_panel(config: dict) -> None:
+    output_cfg = config.get("output", {})
+    ar_game_cfg = output_cfg.get("ar_game", {})
+    enabled = bool(ar_game_cfg.get("enabled", False))
+    status = _get_ar_forward_status()
+
+    st.markdown("### AR 转发状态")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("AR output", "enabled" if enabled else "disabled")
+    col2.metric("Mode", _ar_game_mode(ar_game_cfg))
+    col3.metric("Target", _ar_game_target(ar_game_cfg))
+    col4.metric("Last send", _format_send_state(status))
+
+    pred_col, command_col, transport_col = st.columns(3)
+    confidence = status.get("confidence")
+    confidence_text = "-" if confidence is None else f"{float(confidence):.2f}"
+    pred_col.metric("Last prediction", str(status.get("last_prediction", "-")), confidence_text)
+    command_col.metric("Mapped command", str(status.get("mapped_command", "-")))
+    transport_col.metric("Transport command", str(status.get("last_transport_command", "-")))
+
+    error = status.get("last_send_error")
+    if error:
+        st.warning(f"最近一次 AR 转发失败: {error}")
+
+    st.markdown("### 小车连接测试")
+    st.caption("这些按钮只测试 AR/Unity 转发链路，不依赖 EEG、模型或实时解码。")
+    cols = st.columns(len(_AR_TEST_COMMANDS))
+    for column, command in zip(cols, _AR_TEST_COMMANDS, strict=True):
+        if column.button(f"Send {command}", key=f"ar_test_{command}"):
+            if not enabled:
+                _set_ar_forward_status(
+                    mapped_command=command,
+                    last_transport_command=None,
+                    last_send_success=False,
+                    last_send_error="output.ar_game.enabled is false.",
+                )
+                st.error("AR 游戏 TCP 控制未启用。请先在配置页启用后保存。")
+                continue
+            try:
+                get_shared_game_command_router(config).push(command, source="web")
+            except Exception as exc:  # noqa: BLE001
+                _set_ar_forward_status(
+                    mapped_command=command,
+                    last_transport_command=command,
+                    last_send_success=False,
+                    last_send_error=str(exc),
+                )
+                st.error(f"{command} 发送失败: {exc}")
+            else:
+                _set_ar_forward_status(
+                    mapped_command=command,
+                    last_transport_command=command,
+                    last_send_success=True,
+                    last_send_error=None,
+                )
+                st.success(f"{command} 已发送。")
 
 
 def _resolve_cue_symbol(message: str, *, event_type: str) -> tuple[str, bool] | None:
@@ -466,12 +572,15 @@ def render_settings(config: dict) -> None:
                 "rest_between_blocks_sec": rest_between_blocks_sec,
             }
         )
-        output_cfg["ar_game"] = {
-            "enabled": ar_game_enabled,
-            "host": ar_game_host,
-            "port": ar_game_port,
-            "timeout_sec": ar_game_timeout_sec,
-        }
+        ar_game_cfg.update(
+            {
+                "enabled": ar_game_enabled,
+                "host": ar_game_host,
+                "port": ar_game_port,
+                "timeout_sec": ar_game_timeout_sec,
+            }
+        )
+        output_cfg["ar_game"] = ar_game_cfg
         save_config(config)
         st.success("配置已保存。")
 
@@ -667,6 +776,7 @@ def render_test_mode(config: dict) -> None:
                 step_sec=float(config["step_sec"]),
                 confidence_threshold=float(config["confidence_threshold"]),
                 mc_dropout_passes=int(config["mc_dropout_passes"]),
+                status_callback=_update_ar_decoder_status,
             )
 
             with st.spinner("测试模式采集中..."):
@@ -693,6 +803,7 @@ def render_test_mode(config: dict) -> None:
 def render_realtime(config: dict) -> None:
     st.title("实时解码")
     st.markdown("开始后会持续显示模型输出。")
+    render_ar_forwarding_panel(config)
     record = st.checkbox("保存实时脑波数据至本地记录")
 
     if st.button("开始实时解码", type="primary"):
@@ -737,6 +848,7 @@ def render_realtime(config: dict) -> None:
                 step_sec=float(config["step_sec"]),
                 confidence_threshold=float(config["confidence_threshold"]),
                 mc_dropout_passes=int(config["mc_dropout_passes"]),
+                status_callback=_update_ar_decoder_status,
             )
 
             with st.spinner("实时解码运行中..."):
