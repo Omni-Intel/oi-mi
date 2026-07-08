@@ -9,7 +9,7 @@ from typing import Any
 LABEL_TO_ID = {"left": 0, "right": 1, "idle": 2}
 ID_TO_LABEL = {value: key for key, value in LABEL_TO_ID.items()}
 LABEL_DISPLAY = {"left": "LEFT", "right": "RIGHT", "idle": "REST"}
-LABEL_SYMBOL = {"left": "←", "right": "→", "idle": "-"}
+LABEL_SYMBOL = {"left": "←", "right": "→", "idle": "○"}
 LABEL_DESCRIPTION = {
     "left": "左手持续握拳/松拳想象",
     "right": "右手持续握拳/松拳想象",
@@ -102,7 +102,7 @@ class ProtocolConfig:
                 control_sec=float(timing.get("control_sec", 5.0)),
                 iti_sec=float(timing.get("iti_sec", 2.0)),
             ),
-            practice_labels=[str(label) for label in protocol.get("practice_labels", ["left", "right", "idle", "left", "right"])],
+            practice_labels=[str(label) for label in protocol.get("practice_labels", ["left", "right", "idle", "left", "right", "idle"])],
             practice_repetitions=int(protocol.get("practice_repetitions", 1)),
             baseline_segments=baseline_segments,
             new_subject_blocks=int(protocol.get("new_subject_blocks", 6)),
@@ -136,6 +136,7 @@ class SessionPlan:
 
 def build_session_plan(protocol: ProtocolConfig, *, is_new_subject: bool) -> SessionPlan:
     rng = random.Random(protocol.random_seed + (0 if is_new_subject else 1000))
+    practice_labels = list(protocol.practice_labels) * max(protocol.practice_repetitions, 0)
     if is_new_subject:
         blocks = [
             generate_block_sequence(
@@ -145,7 +146,6 @@ def build_session_plan(protocol: ProtocolConfig, *, is_new_subject: bool) -> Ses
             for _ in range(protocol.new_subject_blocks)
         ]
         baseline_segments = list(protocol.baseline_segments)
-        practice_labels = list(protocol.practice_labels)[: max(len(protocol.practice_labels), 3)]
         subject_mode = "new"
     else:
         blocks = [
@@ -161,7 +161,6 @@ def build_session_plan(protocol: ProtocolConfig, *, is_new_subject: bool) -> Ses
                 instruction="睁眼注视固定点或游戏界面，不发指令，不做动作想象。",
             )
         ]
-        practice_labels = []
         subject_mode = "old"
     return SessionPlan(
         subject_mode=subject_mode,
