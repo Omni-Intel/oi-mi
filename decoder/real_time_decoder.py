@@ -58,6 +58,7 @@ class RealTimeDecoder:
         online_update_every: int = 1,
         model_save_path: Path | None = None,
         online_label_source: OnlineLabelSource | None = None,
+        status_callback: Callable[[dict[str, Any]], None] | None = None,
         thread_context: Any | None = None,
     ) -> None:
         self._acquirer = acquirer
@@ -75,12 +76,14 @@ class RealTimeDecoder:
         self._online_update_every = max(int(online_update_every), 1)
         self._model_save_path = model_save_path
         self._online_label_source = online_label_source
+        self._status_callback = status_callback
         self._online_update_count = 0
         self._online_seen_labeled_windows = 0
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_game_command: str | None = None
         self._last_game_transport_command: str | None = None
+        self._last_game_transport_error: str | None = None
         self._last_game_transport_sent_at = 0.0
         self._game_command_keepalive_sec = max(0.2, min(0.5, step_sec * 1.1))
         self._game_session_started = False
@@ -120,6 +123,7 @@ class RealTimeDecoder:
         self._subject_id = subject_id
         self._last_game_command = None
         self._last_game_transport_command = None
+        self._last_game_transport_error = None
         self._last_game_transport_sent_at = 0.0
         self._game_session_started = False
         if record and subject_id:
@@ -228,7 +232,9 @@ class RealTimeDecoder:
                         f"(confidence: {result.confidence:.2f}, uncertainty: {result.uncertainty:.2f})"
                     )
                     self._command_outlet.push(result.label)
-                    self._push_game_command(self._to_game_command(result))
+                    game_command = self._to_game_command(result)
+                    self._push_game_command(game_command)
+                    self._emit_status(result, game_command)
                     
                     pred_class = -1 if result.class_id is None else int(result.class_id)
                     writer.put(
@@ -309,7 +315,9 @@ class RealTimeDecoder:
                     f"(confidence: {result.confidence:.2f}, uncertainty: {result.uncertainty:.2f})"
                 )
                 self._command_outlet.push(result.label)
-                self._push_game_command(self._to_game_command(result))
+                game_command = self._to_game_command(result)
+                self._push_game_command(game_command)
+                self._emit_status(result, game_command)
 
                 online_label = self._get_online_label(
                     window_start=window_start,
@@ -452,8 +460,30 @@ class RealTimeDecoder:
         try:
             self._game_command_outlet.push(command)
             self._last_game_transport_command = command
+            self._last_game_transport_error = None
             self._last_game_transport_sent_at = time.monotonic()
             return True
         except Exception as exc:  # noqa: BLE001
+            self._last_game_transport_error = str(exc)
             LOGGER.warning("Failed to push AR game command '%s': %s", command, exc)
             return False
+
+    def _emit_status(self, result: PredictionResult, game_command: str | None) -> None:
+        if self._status_callback is None:
+            return
+
+        payload = {
+            "prediction": result.label,
+            "confidence": result.confidence,
+            "uncertainty": result.uncertainty,
+            "class_id": result.class_id,
+            "mapped_command": game_command or "STOP",
+            "last_transport_command": self._last_game_transport_command,
+            "last_send_success": self._last_game_transport_error is None and self._last_game_transport_sent_at > 0.0,
+            "last_send_error": self._last_game_transport_error,
+            "updated_at": time.time(),
+        }
+        try:
+            self._status_callback(payload)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("Failed to publish realtime decoder status: %s", exc)
