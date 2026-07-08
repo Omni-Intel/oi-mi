@@ -57,10 +57,14 @@ output:
   command_stream_name: oi_mi_commands
   command_stream_type: Markers
   ar_game:
-    enabled: false
-    host: 192.168.137.231
+    enabled: true
+    host: 127.0.0.1
     port: 5005
     timeout_sec: 1.0
+    auto_launch: true
+    executable_path: .runtime/unity/ARPrototype3D-windows-x64/ARPrototype3D.exe
+    startup_timeout_sec: 15.0
+    close_on_stop: false
   web_control:
     enabled: true
     host: 0.0.0.0

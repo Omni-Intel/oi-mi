@@ -572,7 +572,8 @@ def render_settings(config: dict) -> None:
                 "rest_between_blocks_sec": rest_between_blocks_sec,
             }
         )
-        ar_game_cfg.update(
+        next_ar_game_cfg = dict(ar_game_cfg)
+        next_ar_game_cfg.update(
             {
                 "enabled": ar_game_enabled,
                 "host": ar_game_host,
@@ -580,7 +581,7 @@ def render_settings(config: dict) -> None:
                 "timeout_sec": ar_game_timeout_sec,
             }
         )
-        output_cfg["ar_game"] = ar_game_cfg
+        output_cfg["ar_game"] = next_ar_game_cfg
         save_config(config)
         st.success("配置已保存。")
 

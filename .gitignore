@@ -20,6 +20,11 @@ data/
 models_storage/
 records_storage/
 
+# Local Unity runtime/build artifacts
+.runtime/
+unity_builds/
+ARPrototype3D-windows-x64.zip
+
 # IDE / editor
 .vscode/
 .idea/
