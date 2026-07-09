@@ -86,12 +86,14 @@ class Calibrator:
         learning_rate: float,
         patience: int,
         head_only: bool,
+        include_practice: bool = True,
         heartbeat: Callable[[], None] | None = None,
     ) -> CalibrationResult:
         del duration_sec
         plan = build_session_plan(self._protocol, is_new_subject=not head_only)
         session_dir, raw_windows, processed_windows, labels, session_metadata = self._collect_training_data(
             plan=plan,
+            include_practice=include_practice,
             heartbeat=heartbeat,
         )
         metrics = self._model.fit(
@@ -124,6 +126,7 @@ class Calibrator:
         self,
         *,
         plan: SessionPlan,
+        include_practice: bool = True,
         heartbeat: Callable[[], None] | None = None,
     ) -> tuple[Path | None, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
         self._console.print("[bold cyan]开始按 MI game control protocol 采集[/bold cyan]")
@@ -139,7 +142,7 @@ class Calibrator:
         trials: list[dict[str, Any]] = []
         try:
             self._emit_event(recorder, "session_start", phase="session", subject_mode=plan.subject_mode)
-            if plan.practice_labels:
+            if include_practice and plan.practice_labels:
                 self._run_practice(plan, recorder=recorder, heartbeat=heartbeat)
             self._run_baseline(plan, recorder=recorder, heartbeat=heartbeat)
             self._run_formal_blocks(plan, recorder=recorder, heartbeat=heartbeat, trials=trials)

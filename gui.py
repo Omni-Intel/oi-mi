@@ -262,7 +262,9 @@ def _subject_facing_message(message: str, *, prediction: bool) -> str:
         return "准备开始"
     if "接下来是" in message and "练习" in message:
         return "接下来是 6 个练习 trial"
-    if "练习结束" in message or "开始正式采集" in message:
+    if "练习结束" in message:
+        return "练习结束"
+    if "开始正式采集" in message:
         return "接下来开始正式采集"
     if "练习阶段" in message:
         return "接下来是 6 个练习 trial"
@@ -652,10 +654,14 @@ def render_calibration_guidance() -> None:
     next_label = "开始" if is_last_step else "下一步"
     if st.button(next_label, key="calibration_guidance_next", type="primary"):
         if is_last_step:
-            next_view = str(st.session_state.get("calibration_after_guidance", "preview"))
-            st.session_state.calibration_experiment_view = next_view
+            next_view = str(st.session_state.get("calibration_after_guidance", "return"))
             st.session_state.pop("calibration_guidance_step", None)
             st.session_state.pop("calibration_after_guidance", None)
+            if next_view == "return":
+                st.session_state.pop("calibration_experiment_view", None)
+                st.session_state.gui_nav_mode = "校准"
+            else:
+                st.session_state.calibration_experiment_view = next_view
         else:
             st.session_state.calibration_guidance_step = step_index + 1
         st.rerun()
@@ -676,12 +682,11 @@ def init_live_view(*, fullscreen: bool = False) -> tuple[StreamlitConsole, calla
     return console, refresh
 
 
-def run_calibration_ui_preview() -> None:
-    """Preview calibration cue/log UI without touching hardware."""
+def run_calibration_practice_preview() -> None:
+    """Run repeatable practice trials without touching hardware."""
 
     console, refresh = init_live_view(fullscreen=True)
     preview_events = (
-        ("开始按 MI game control protocol 采集", 0.9),
         ("接下来是 6 个练习 trial，用于熟悉流程", 1.6),
         ("练习 1/6 LEFT 左手持续握拳/松拳想象", 1.0),
         ("PRACTICE_FIXATION", 0.8),
@@ -707,18 +712,7 @@ def run_calibration_ui_preview() -> None:
         ("PRACTICE_FIXATION", 0.8),
         ("PRACTICE ○ REST", 1.3),
         ("PRACTICE_ITI", 0.7),
-        ("练习结束，接下来开始正式采集", 1.6),
-        ("Baseline 休息", 1.2),
-        ("FIXATION", 0.8),
-        ("LEFT", 1.4),
-        ("ITI", 0.8),
-        ("FIXATION", 0.8),
-        ("RIGHT", 1.4),
-        ("ITI", 0.8),
-        ("FIXATION", 0.8),
-        ("REST", 1.4),
-        ("休息 10 秒，请放松但不要大幅动作", 1.2),
-        ("校准完成", 0.8),
+        ("练习结束", 1.2),
     )
 
     for message, delay_sec in preview_events:
@@ -795,6 +789,7 @@ def run_calibration_session(config: dict, protocol: ProtocolConfig, *, is_new_fl
                 learning_rate=float(config["learning_rate"]),
                 patience=int(config["early_stopping_patience"]),
                 head_only=not is_new_flag,
+                include_practice=False,
                 heartbeat=refresh,
             )
 
@@ -1146,8 +1141,8 @@ def render_calibration(config: dict) -> None:
         render_experiment_return_button()
         if calibration_view == "guidance":
             render_calibration_guidance()
-        elif calibration_view == "preview":
-            run_calibration_ui_preview()
+        elif calibration_view == "practice":
+            run_calibration_practice_preview()
             st.session_state.pop("calibration_experiment_view", None)
             st.session_state.gui_nav_mode = "校准"
             st.rerun()
@@ -1171,21 +1166,24 @@ def render_calibration(config: dict) -> None:
 
     is_new = st.radio("被试类型", ["新被试 (重新训练)", "老被试 (已有模型微调)"])
 
-    preview_col, run_col = st.columns([1, 1])
-    preview_requested = preview_col.button("预览实时显示", type="secondary", use_container_width=True)
-    run_requested = run_col.button("开始校准", type="primary", use_container_width=True)
+    tutorial_col, practice_col, run_col = st.columns([1, 1, 1])
+    tutorial_requested = tutorial_col.button("教程", type="secondary", use_container_width=True)
+    practice_requested = practice_col.button("练习", type="secondary", use_container_width=True)
+    run_requested = run_col.button("正式实验", type="primary", use_container_width=True)
 
-    if preview_requested:
+    if tutorial_requested:
         st.session_state.calibration_experiment_view = "guidance"
-        st.session_state.calibration_after_guidance = "preview"
+        st.session_state.calibration_after_guidance = "return"
         st.session_state.calibration_guidance_step = 0
+        st.rerun()
+
+    if practice_requested:
+        st.session_state.calibration_experiment_view = "practice"
         st.rerun()
 
     if run_requested:
         st.session_state.calibration_is_new = is_new.startswith("新")
-        st.session_state.calibration_experiment_view = "guidance"
-        st.session_state.calibration_after_guidance = "run"
-        st.session_state.calibration_guidance_step = 0
+        st.session_state.calibration_experiment_view = "run"
         st.rerun()
 
 
