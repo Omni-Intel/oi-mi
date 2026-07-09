@@ -68,7 +68,7 @@ output:
     port: 5005
     timeout_sec: 1.0
     auto_launch: true
-    executable_path: .runtime/unity/ARPrototype3D-windows-x64/ARPrototype3D.exe
+    executable_path: unity相关/ARPrototype3D-windows-x64/ARPrototype3D.exe
     startup_timeout_sec: 15.0
     close_on_stop: false
   web_control:

@@ -13,7 +13,7 @@ from typing import Any
 LOGGER = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_BUILD_DIR = Path(".runtime") / "unity" / "ARPrototype3D-windows-x64"
+DEFAULT_BUILD_DIR = Path("unity相关") / "ARPrototype3D-windows-x64"
 DEFAULT_EXECUTABLE = DEFAULT_BUILD_DIR / "ARPrototype3D.exe"
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
 
@@ -130,4 +130,3 @@ def _notify(console: Any | None, message: str) -> None:
     LOGGER.info(message)
     if console is not None and hasattr(console, "print"):
         console.print(f"[bold cyan]{message}[/bold cyan]")
-

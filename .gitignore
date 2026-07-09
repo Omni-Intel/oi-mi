@@ -22,6 +22,8 @@ records_storage/
 
 # Local Unity runtime/build artifacts
 .runtime/
+runtime/
+unity相关/
 unity_builds/
 ARPrototype3D-windows-x64.zip
 

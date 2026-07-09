@@ -3,7 +3,7 @@
 This project does not commit Unity build outputs to Git history. The Windows build is installed into a local ignored runtime directory:
 
 ```text
-.runtime/unity/ARPrototype3D-windows-x64/ARPrototype3D.exe
+unity相关/ARPrototype3D-windows-x64/ARPrototype3D.exe
 ```
 
 ## Fresh Windows Setup
@@ -16,7 +16,7 @@ source .venv/Scripts/activate
 streamlit run gui.py
 ```
 
-`setup_local.py` creates `.venv`, installs the Python package, downloads the Unity build zip, extracts it into `.runtime/`, and runs the environment check.
+`setup_local.py` creates `.venv`, installs the Python package, downloads the Unity build zip, extracts it into `unity相关/`, and runs the environment check.
 
 ## GitHub Release Asset
 

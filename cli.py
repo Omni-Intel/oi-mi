@@ -107,7 +107,7 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
             "port": 5005,
             "timeout_sec": 1.0,
             "auto_launch": True,
-            "executable_path": ".runtime/unity/ARPrototype3D-windows-x64/ARPrototype3D.exe",
+            "executable_path": "unity相关/ARPrototype3D-windows-x64/ARPrototype3D.exe",
             "startup_timeout_sec": 15.0,
             "close_on_stop": False,
             "reverse_enabled": False,
@@ -493,7 +493,7 @@ def _interactive_menu(ctx: click.Context, app: AppContext) -> None:
                     val = click.prompt(
                         "Unity executable path",
                         type=str,
-                        default=str(ar_game_cfg.get("executable_path", ".runtime/unity/ARPrototype3D-windows-x64/ARPrototype3D.exe")),
+                        default=str(ar_game_cfg.get("executable_path", "unity相关/ARPrototype3D-windows-x64/ARPrototype3D.exe")),
                     )
                     ar_game_cfg["executable_path"] = val
                 elif sub_choice == "21":

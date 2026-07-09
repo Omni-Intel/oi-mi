@@ -14,7 +14,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_URL = "https://github.com/Omni-Intel/oi-mi/releases/latest/download/ARPrototype3D-windows-x64.zip"
 DEFAULT_BUILD_NAME = "ARPrototype3D-windows-x64"
-DEFAULT_DEST = PROJECT_ROOT / ".runtime" / "unity" / DEFAULT_BUILD_NAME
+DEFAULT_DEST = PROJECT_ROOT / "unity相关" / DEFAULT_BUILD_NAME
 DEFAULT_CACHE = PROJECT_ROOT / ".runtime" / "downloads" / f"{DEFAULT_BUILD_NAME}.zip"
 EXPECTED_EXE = "ARPrototype3D.exe"
 
@@ -126,7 +126,7 @@ def _resolve_under_project(path: Path) -> Path:
 
 def _remove_directory(path: Path) -> None:
     resolved = _resolve_under_project(path)
-    runtime_root = (PROJECT_ROOT / ".runtime").resolve()
+    runtime_root = (PROJECT_ROOT / "unity相关").resolve()
     try:
         resolved.relative_to(runtime_root)
     except ValueError as exc:
@@ -136,4 +136,3 @@ def _remove_directory(path: Path) -> None:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
-

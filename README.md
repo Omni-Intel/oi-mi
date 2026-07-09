@@ -1,5 +1,23 @@
 # oi-mi
 
+## 新用户快速开始
+
+Windows Git Bash:
+
+```bash
+py -3.12 setup_local.py
+source .venv/Scripts/activate
+streamlit run gui.py
+```
+
+`setup_local.py` 会创建 `.venv`、安装 Python 依赖、下载 Unity Windows build，并把 Unity exe 安装到本地忽略目录：
+
+```text
+unity相关/ARPrototype3D-windows-x64/ARPrototype3D.exe
+```
+
+点击网页左侧的“实时解码”时，如果 Unity 没有打开，程序会自动启动这个 exe，并等待 `127.0.0.1:5005` 可连接后再继续。
+
 `oi-mi` 是一个面向 Motor Imagery 的生产级 Python CLI 工程骨架，目标是支持真实 EEG 采集、个体校准与在线解码。
 
 数据集使用说明见 [DATASET_GUIDE.md](./DATASET_GUIDE.md)。
