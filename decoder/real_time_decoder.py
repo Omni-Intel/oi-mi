@@ -60,6 +60,7 @@ class RealTimeDecoder:
         online_label_source: OnlineLabelSource | None = None,
         status_callback: Callable[[dict[str, Any]], None] | None = None,
         thread_context: Any | None = None,
+        stop_on_game_disconnect: bool = True,
     ) -> None:
         self._acquirer = acquirer
         self._model = model
@@ -87,6 +88,8 @@ class RealTimeDecoder:
         self._last_game_transport_sent_at = 0.0
         self._game_command_keepalive_sec = max(0.2, min(0.5, step_sec * 1.1))
         self._game_session_started = False
+        self._game_disconnect_message: str | None = None
+        self._stop_on_game_disconnect = bool(stop_on_game_disconnect)
         self._thread_context = thread_context
 
     def start(self) -> None:
@@ -126,6 +129,7 @@ class RealTimeDecoder:
         self._last_game_transport_error = None
         self._last_game_transport_sent_at = 0.0
         self._game_session_started = False
+        self._game_disconnect_message = None
         if record and subject_id:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self._save_dir = save_dir or Path("records_storage") / subject_id / "realtime" / timestamp
@@ -143,10 +147,12 @@ class RealTimeDecoder:
         self._push_game_session_command("START")
         self.start()
         try:
-            while True:
+            while not self._stop_event.is_set():
                 self._sleep_with_heartbeat(min(0.1, max(self._step_sec, 0.1)), heartbeat)
                 if heartbeat is not None:
                     heartbeat()
+            if self._game_disconnect_message:
+                raise RuntimeError(self._game_disconnect_message)
         except KeyboardInterrupt:
             self._console.print("\n[bold red]停止实时解码[/bold red]")
         finally:
@@ -432,6 +438,7 @@ class RealTimeDecoder:
 
         if command is None:
             if self._last_game_command is None:
+                self._push_game_keepalive()
                 return
             self._push_game_transport_command("STOP")
             self._last_game_command = None
@@ -454,6 +461,14 @@ class RealTimeDecoder:
         if self._push_game_transport_command(command):
             self._game_session_started = True
 
+    def _push_game_keepalive(self) -> None:
+        if not self._game_session_started:
+            return
+        now = time.monotonic()
+        if now - self._last_game_transport_sent_at < self._game_command_keepalive_sec:
+            return
+        self._push_game_transport_command("STOP")
+
     def _push_game_transport_command(self, command: str) -> bool:
         if self._game_command_outlet is None:
             return False
@@ -466,6 +481,9 @@ class RealTimeDecoder:
         except Exception as exc:  # noqa: BLE001
             self._last_game_transport_error = str(exc)
             LOGGER.warning("Failed to push AR game command '%s': %s", command, exc)
+            if self._stop_on_game_disconnect:
+                self._game_disconnect_message = f"Unity game connection lost: {exc}"
+                self._stop_event.set()
             return False
 
     def _emit_status(self, result: PredictionResult, game_command: str | None) -> None:

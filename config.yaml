@@ -70,6 +70,9 @@ output:
     auto_launch: true
     executable_path: unity相关/ARPrototype3D-windows-x64/ARPrototype3D.exe
     startup_timeout_sec: 15.0
+    windowed: true
+    window_width: 1280
+    window_height: 720
     close_on_stop: false
   web_control:
     enabled: true

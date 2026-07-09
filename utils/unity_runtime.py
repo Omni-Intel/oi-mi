@@ -73,7 +73,7 @@ def ensure_unity_game_running(
         )
 
     _notify(console, f"Launching Unity game: {executable}")
-    process = _launch_process(executable)
+    process = _launch_process(executable, ar_game_cfg)
     if timeout_sec <= 0:
         return process
 
@@ -94,13 +94,26 @@ def ensure_unity_game_running(
     )
 
 
-def _launch_process(executable: Path) -> subprocess.Popen[Any]:
+def _launch_process(executable: Path, ar_game_cfg: dict[str, Any]) -> subprocess.Popen[Any]:
     creationflags = 0
     if os.name == "nt":
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
 
+    args = [str(executable)]
+    if bool(ar_game_cfg.get("windowed", True)):
+        width = int(ar_game_cfg.get("window_width", 1280))
+        height = int(ar_game_cfg.get("window_height", 720))
+        args.extend([
+            "-screen-fullscreen",
+            "0",
+            "-screen-width",
+            str(max(width, 320)),
+            "-screen-height",
+            str(max(height, 240)),
+        ])
+
     return subprocess.Popen(
-        [str(executable)],
+        args,
         cwd=str(executable.parent),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
