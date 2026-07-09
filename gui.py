@@ -22,6 +22,7 @@ from cli import (
     build_game_command_outlet,
     build_marker_backend,
     build_model_path,
+    resolve_model_path,
     load_config as load_app_config,
     resolve_config_path,
     write_config,
@@ -767,7 +768,24 @@ def run_calibration_session(config: dict, protocol: ProtocolConfig, *, is_new_fl
         )
 
         if not is_new_flag:
-            calibrator.load_existing_weights()
+            load_path = resolve_model_path(
+                config,
+                subject_id,
+                model_name,
+                device_name=str(config["device_type"]),
+                n_chans=effective_n_channels,
+                n_times=int(float(config["sfreq"]) * float(config["window_sec"])),
+            )
+            if not load_path.exists():
+                st.error(
+                    f"未找到模型权重文件: "
+                    f"{build_model_path(config, subject_id, model_name, device_name=str(config['device_type']))}。"
+                    "请先执行校准。"
+                )
+                return
+            if load_path.parent.name == "dummy_decoders":
+                st.info(f"使用内置 dummy 测试权重: `{load_path}`")
+            model.load(load_path)
 
         with st.spinner("校准进行中..."):
             result = calibrator.calibrate(
@@ -1193,15 +1211,23 @@ def render_test_mode(config: dict) -> None:
                 n_classes=int(config["n_classes"]),
                 n_times=int(float(config["sfreq"]) * float(config["window_sec"])),
             )
-            model_path = build_model_path(
+            model_path = resolve_model_path(
                 config,
                 subject_id,
                 model_name,
                 device_name=str(config["device_type"]),
+                n_chans=effective_n_channels,
+                n_times=int(float(config["sfreq"]) * float(config["window_sec"])),
             )
             if not model_path.exists():
-                st.error(f"未找到模型权重文件: {model_path}。请先执行校准。")
+                st.error(
+                    f"未找到模型权重文件: "
+                    f"{build_model_path(config, subject_id, model_name, device_name=str(config['device_type']))}。"
+                    "请先执行校准，或运行 `oi-mi seed-dummy-decoders` 生成 dummy 测试权重。"
+                )
                 return
+            if model_path.parent.name == "dummy_decoders":
+                st.info(f"使用内置 dummy 测试权重: `{model_path}`")
             model.load(model_path)
 
             command_outlet = LSLCommandOutlet(
@@ -1266,15 +1292,23 @@ def render_realtime(config: dict) -> None:
                 n_classes=int(config["n_classes"]),
                 n_times=int(float(config["sfreq"]) * float(config["window_sec"])),
             )
-            model_path = build_model_path(
+            model_path = resolve_model_path(
                 config,
                 subject_id,
                 model_name,
                 device_name=str(config["device_type"]),
+                n_chans=effective_n_channels,
+                n_times=int(float(config["sfreq"]) * float(config["window_sec"])),
             )
             if not model_path.exists():
-                st.error(f"未找到模型权重文件: {model_path}。请先执行校准。")
+                st.error(
+                    f"未找到模型权重文件: "
+                    f"{build_model_path(config, subject_id, model_name, device_name=str(config['device_type']))}。"
+                    "请先执行校准，或运行 `oi-mi seed-dummy-decoders` 生成 dummy 测试权重。"
+                )
                 return
+            if model_path.parent.name == "dummy_decoders":
+                st.info(f"使用内置 dummy 测试权重: `{model_path}`")
             model.load(model_path)
 
             decoder = RealTimeDecoder(

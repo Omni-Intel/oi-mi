@@ -1,6 +1,7 @@
-subject_id: S002
-model_name: eegnet
-device_type: brainco
+subject_id: test
+model_name: shallowconvnet
+device_type: dummy
+hardware_dummy_mode: true
 sfreq: 250
 n_classes: 3
 window_sec: 2.0
@@ -63,7 +64,7 @@ output:
   command_stream_name: oi_mi_commands
   command_stream_type: Markers
   ar_game:
-    enabled: true
+    enabled: false
     host: 127.0.0.1
     port: 5005
     timeout_sec: 1.0

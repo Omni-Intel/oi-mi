@@ -8,6 +8,7 @@ import random
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -24,11 +25,14 @@ from cli import (
     build_game_command_outlet,
     build_model_path,
     default_config,
+    dummy_decoder_asset_path,
+    effective_device_name,
     iter_test_mode_chunks,
     load_calibration_windows,
     load_config,
     parse_subject_number,
     replay_test_mode,
+    resolve_model_path,
     resolve_records_dir,
 )
 from decoder.real_time_decoder import PredictionResult, RealTimeDecoder
@@ -59,6 +63,44 @@ class CliHelperTests(unittest.TestCase):
             build_model_path(config, "S001", "eegnet", device_name="neuracle"),
             Path("models_storage") / "S001" / "neuracle" / "eegnet.pt",
         )
+
+    def test_effective_device_name_uses_dummy_when_hardware_mode_enabled(self) -> None:
+        config = {"device_type": "brainco", "hardware_dummy_mode": True}
+        self.assertEqual(effective_device_name(config), "dummy")
+        self.assertEqual(effective_device_name(config, "neuracle"), "dummy")
+
+    def test_build_model_path_uses_dummy_namespace_in_hardware_mode(self) -> None:
+        config = {
+            "storage": {"models_dir": "models_storage"},
+            "device_type": "brainco",
+            "hardware_dummy_mode": True,
+        }
+        self.assertEqual(
+            build_model_path(config, "S002", "eegnet"),
+            Path("models_storage") / "S002" / "dummy" / "eegnet.pt",
+        )
+
+    def test_resolve_model_path_falls_back_to_bundled_dummy_asset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            asset_dir = Path(tmp_dir) / "dummy_decoders"
+            asset_dir.mkdir(parents=True)
+            asset_path = asset_dir / "eegnet_64x500.pt"
+            asset_path.write_text("placeholder", encoding="utf-8")
+            config = {
+                "storage": {"models_dir": Path(tmp_dir) / "models"},
+                "device_type": "dummy",
+                "sfreq": 250,
+                "window_sec": 2.0,
+            }
+            with mock.patch("cli.DUMMY_DECODER_ASSET_DIR", asset_dir):
+                resolved = resolve_model_path(
+                    config,
+                    "S002",
+                    "eegnet",
+                    n_chans=64,
+                    n_times=500,
+                )
+            self.assertEqual(resolved, asset_path)
 
     def test_resolve_records_dir_defaults_and_reads_config(self) -> None:
         self.assertEqual(resolve_records_dir({}), Path("records_storage"))
@@ -177,6 +219,38 @@ class CliHelperTests(unittest.TestCase):
         acquirer = build_acquirer(device_name="brainco", config=config)
         self.assertEqual(acquirer.metadata.name, "brainco")
         self.assertEqual(acquirer.metadata.n_channels, 32)
+
+    def test_build_acquirer_uses_dummy_when_hardware_dummy_mode_enabled(self) -> None:
+        config = {
+            "sfreq": 250,
+            "buffer_sec": 60,
+            "hardware_dummy_mode": True,
+            "device": {},
+        }
+        acquirer = build_acquirer(device_name="brainco", config=config)
+        self.assertEqual(acquirer.metadata.name, "dummy")
+        self.assertEqual(acquirer.metadata.n_channels, 64)
+
+    def test_dummy_acquirer_streams_chunk_after_buffer_fill(self) -> None:
+        from acquisition.dummy_acquirer import DummyAcquirer
+
+        acquirer = DummyAcquirer(sfreq=250.0, n_channels=4, buffer_sec=2.0, startup_delay_sec=0.0, chunk_ms=20.0)
+        acquirer.start_stream()
+        try:
+            deadline = time.monotonic() + 2.0
+            window = None
+            while time.monotonic() < deadline:
+                try:
+                    window, timestamps = acquirer.get_chunk(0.5)
+                    break
+                except RuntimeError:
+                    time.sleep(0.05)
+            self.assertIsNotNone(window)
+            assert window is not None
+            self.assertEqual(window.shape, (4, 125))
+            self.assertEqual(timestamps.shape, (125,))
+        finally:
+            acquirer.stop_stream()
 
     def test_brainco_discovery_uses_configured_port_when_sdk_returns_only_ip(self) -> None:
         acquirer = BrainCoAcquirer(brainco_port=9527, auto_discover=True)

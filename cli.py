@@ -40,6 +40,7 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
     "subject_id": "S001",
     "model_name": "riemann-mdm",
     "device_type": "neuracle",
+    "hardware_dummy_mode": False,
     "sfreq": 250,
     "n_classes": 3,
     "window_sec": 2.0,
@@ -534,8 +535,58 @@ def build_model_path(
 
     extension = ".pkl" if model_name == "riemann-mdm" else ".pt"
     models_dir = Path(config["storage"]["models_dir"])
-    resolved_device = str(device_name or config.get("device_type", "unknown"))
+    resolved_device = effective_device_name(config, device_name)
     return models_dir / subject_id / resolved_device / f"{model_name}{extension}"
+
+
+DUMMY_DECODER_ASSET_DIR = Path(__file__).resolve().parent / "assets" / "dummy_decoders"
+
+
+def effective_device_name(config: dict[str, Any], device_name: str | None = None) -> str:
+    """Return the device namespace used for model storage and acquisition."""
+
+    if bool(config.get("hardware_dummy_mode", False)):
+        return "dummy"
+    return str(device_name or config.get("device_type", "unknown"))
+
+
+def dummy_decoder_asset_path(
+    model_name: str,
+    *,
+    n_chans: int,
+    n_times: int,
+) -> Path:
+    """Return the bundled decoder asset path for a dummy EEG profile."""
+
+    extension = ".pkl" if model_name == "riemann-mdm" else ".pt"
+    return DUMMY_DECODER_ASSET_DIR / f"{model_name}_{n_chans}x{n_times}{extension}"
+
+
+def resolve_model_path(
+    config: dict[str, Any],
+    subject_id: str,
+    model_name: str,
+    *,
+    device_name: str | None = None,
+    n_chans: int,
+    n_times: int,
+) -> Path:
+    """Resolve subject weights, falling back to bundled dummy decoder assets."""
+
+    primary = build_model_path(
+        config,
+        subject_id,
+        model_name,
+        device_name=device_name,
+    )
+    if primary.exists():
+        return primary
+    if effective_device_name(config, device_name) != "dummy":
+        return primary
+    asset = dummy_decoder_asset_path(model_name, n_chans=n_chans, n_times=n_times)
+    if asset.exists():
+        return asset
+    return primary
 
 
 def resolve_records_dir(config: dict[str, Any]) -> Path:
@@ -667,6 +718,7 @@ def build_acquirer(
 
     register_default_acquirers()
     device_cfg = config.get("device", {})
+    device_name = "dummy" if bool(config.get("hardware_dummy_mode", False)) else device_name
     resolved_channels = default_device_channels(device_name)
     kwargs: dict[str, Any] = {
         "sfreq": float(config["sfreq"]),
@@ -1148,22 +1200,30 @@ def run(
     selected_device = device_name or str(config["device_type"])
     acquirer = build_acquirer(device_name=selected_device, config=config)
     effective_n_channels = int(acquirer.metadata.n_channels)
-    model_path = build_model_path(
+    n_times = int(float(config["sfreq"]) * float(config["window_sec"]))
+    model_path = resolve_model_path(
         config,
         subject_id,
         selected_model,
         device_name=selected_device,
+        n_chans=effective_n_channels,
+        n_times=n_times,
     )
     if not model_path.exists():
-        raise click.ClickException(f"Model not found: {model_path}. Run calibrate first.")
+        raise click.ClickException(
+            f"Model not found: {build_model_path(config, subject_id, selected_model, device_name=selected_device)}. "
+            "Run calibrate first or generate bundled dummy weights via `oi-mi seed-dummy-decoders`."
+        )
     model_factory = get_model_factory()
     model = model_factory.get(
         selected_model,
         n_chans=effective_n_channels,
         sfreq=float(config["sfreq"]),
         n_classes=int(config["n_classes"]),
-        n_times=int(float(config["sfreq"]) * float(config["window_sec"])),
+        n_times=n_times,
     )
+    if model_path.parent == DUMMY_DECODER_ASSET_DIR:
+        app.console.print(f"[bold yellow]使用内置 dummy 测试权重[/bold yellow] {model_path}")
     model.load(model_path)
     online_label_source = None
     online_label_server = None
@@ -1205,7 +1265,12 @@ def run(
         online_update_enabled=online_update,
         online_update_learning_rate=float(online_update_lr),
         online_update_every=int(online_update_every),
-        model_save_path=model_path,
+        model_save_path=build_model_path(
+            config,
+            subject_id,
+            selected_model,
+            device_name=selected_device,
+        ),
         online_label_source=online_label_source,
     )
     if test_mode:
@@ -1234,8 +1299,15 @@ def run(
         )
     finally:
         if online_update and not test_mode:
-            model.save(model_path)
-            app.console.print(f"[bold green]在线更新后的模型已保存[/bold green] {model_path}")
+            save_path = build_model_path(
+                config,
+                subject_id,
+                selected_model,
+                device_name=selected_device,
+            )
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            model.save(save_path)
+            app.console.print(f"[bold green]在线更新后的模型已保存[/bold green] {save_path}")
         if online_label_server is not None:
             online_label_server.close()
 
@@ -1303,9 +1375,17 @@ def train_from_records(
         n_times=int(X.shape[2]),
     )
     if head_only:
-        if not model_path.exists():
-            raise click.ClickException(f"Model not found for head-only adaptation: {model_path}")
-        model.load(model_path)
+        load_path = resolve_model_path(
+            config,
+            subject_id,
+            selected_model,
+            device_name=selected_device,
+            n_chans=int(X.shape[1]),
+            n_times=int(X.shape[2]),
+        )
+        if not load_path.exists():
+            raise click.ClickException(f"Model not found for head-only adaptation: {load_path}")
+        model.load(load_path)
 
     metrics = model.fit(
         X,
@@ -1361,14 +1441,19 @@ def replay_test_mode_command(
         n_chans = int(sample_windows.shape[1])
         n_times = int(sample_windows.shape[2])
 
-    model_path = build_model_path(
+    model_path = resolve_model_path(
         config,
         subject_id,
         selected_model,
         device_name=selected_device,
+        n_chans=n_chans,
+        n_times=n_times,
     )
     if not model_path.exists():
-        raise click.ClickException(f"Model not found: {model_path}. Train or calibrate first.")
+        raise click.ClickException(
+            f"Model not found: {build_model_path(config, subject_id, selected_model, device_name=selected_device)}. "
+            "Train, calibrate, or run `oi-mi seed-dummy-decoders` for dummy mode."
+        )
 
     model = get_model_factory().get(
         selected_model,
@@ -1398,6 +1483,57 @@ def replay_test_mode_command(
         f"accuracy={result['accuracy']:.3f} mean_confidence={result['mean_confidence']:.3f} "
         f"class_acc=[{', '.join(class_summary)}]"
     )
+
+
+@cli.command("seed-dummy-decoders")
+@click.option("--output-dir", type=click.Path(path_type=Path), default=None, help="Asset output directory.")
+@click.option("--models", multiple=True, type=str, help="Model registry names to export.")
+@click.option("--n-chans", type=int, default=64, show_default=True)
+@click.option("--sfreq", type=float, default=250.0, show_default=True)
+@click.option("--window-sec", type=float, default=2.0, show_default=True)
+@click.pass_obj
+def seed_dummy_decoders_cmd(
+    app: AppContext,
+    output_dir: Path | None,
+    models: tuple[str, ...],
+    n_chans: int,
+    sfreq: float,
+    window_sec: float,
+) -> None:
+    """Train bundled decoder weights for hardware-free dummy EEG testing."""
+
+    del app
+    from tools.seed_dummy_decoders import DEFAULT_PROFILE, seed_profile, write_manifest
+
+    target_dir = output_dir or DUMMY_DECODER_ASSET_DIR
+    model_names = list(models) if models else ["eegnet", "riemann-mdm"]
+    profile = dict(DEFAULT_PROFILE)
+    profile.update(
+        {
+            "n_chans": n_chans,
+            "sfreq": sfreq,
+            "window_sec": window_sec,
+        }
+    )
+    n_times = int(round(sfreq * window_sec))
+    saved = seed_profile(output_dir=target_dir, model_names=model_names, profile=profile)
+    manifest_path = write_manifest(
+        output_dir=target_dir,
+        profiles=[
+            {
+                "n_chans": n_chans,
+                "sfreq": sfreq,
+                "window_sec": window_sec,
+                "n_times": n_times,
+                "n_classes": int(profile["n_classes"]),
+                "models": saved,
+            }
+        ],
+    )
+    CONSOLE.print(f"[bold green]Dummy 测试解码器已生成[/bold green] {target_dir}")
+    CONSOLE.print(f"[bold cyan]Manifest[/bold cyan] {manifest_path}")
+    for item in saved:
+        CONSOLE.print(f"- {item['model_name']}: {item['asset_path']} metrics={item['metrics']}")
 
 
 if __name__ == "__main__":

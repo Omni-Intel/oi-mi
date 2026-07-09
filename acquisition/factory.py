@@ -42,7 +42,9 @@ def register_default_acquirers() -> None:
         return
 
     from acquisition.brainco_acquirer import BrainCoAcquirer
+    from acquisition.dummy_acquirer import DummyAcquirer
     from acquisition.neuracle_acquirer import NeuracleAcquirer
 
     AcquirerFactory.register("brainco", BrainCoAcquirer)
+    AcquirerFactory.register("dummy", DummyAcquirer)
     AcquirerFactory.register("neuracle", NeuracleAcquirer)
