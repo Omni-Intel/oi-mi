@@ -22,21 +22,19 @@ python tools/check_environment.py
 
 ## Windows Git Bash
 
-先安装 Python 3.12，然后执行：
+直接执行 setup 脚本。脚本会查找 Python 3.12；Windows 上如果没有 3.12 且 `winget` 可用，会自动安装 Python 3.12：
 
 ```bash
 cd /e/Omni/oi-mi
-py -3.12 -m venv .venv
+python setup_local.py
 source .venv/Scripts/activate
-python -m pip install -U pip setuptools wheel
-pip install -e .
-python tools/check_environment.py
+streamlit run gui.py
 ```
 
-如果 `py -3.12` 不可用，先查看本机解释器：
+如果 `python` 命令不可用，可以尝试：
 
 ```bash
-py -0p
+py setup_local.py
 ```
 
 ## macOS / Linux
@@ -45,11 +43,9 @@ py -0p
 
 ```bash
 cd /path/to/oi-mi
-python3.12 -m venv .venv
+python3.12 setup_local.py
 source .venv/bin/activate
-python -m pip install -U pip setuptools wheel
-pip install -e .
-python tools/check_environment.py
+streamlit run gui.py
 ```
 
 ## 依赖策略

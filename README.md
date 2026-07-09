@@ -5,12 +5,12 @@
 Windows Git Bash:
 
 ```bash
-py -3.12 setup_local.py
+python setup_local.py
 source .venv/Scripts/activate
 streamlit run gui.py
 ```
 
-`setup_local.py` 会创建 `.venv`、安装 Python 依赖、下载 Unity Windows build，并把 Unity exe 安装到本地忽略目录：
+`setup_local.py` 会查找 Python 3.12；Windows 上如果没有 3.12 且 `winget` 可用，会自动安装 Python 3.12。随后脚本会创建 `.venv`、安装 Python 依赖、下载 Unity Windows build，并把 Unity exe 安装到本地忽略目录：
 
 ```text
 unity相关/ARPrototype3D-windows-x64/ARPrototype3D.exe
@@ -64,21 +64,15 @@ oi-mi/
 Windows Git Bash：
 
 ```bash
-py -3.12 -m venv .venv
+python setup_local.py
 source .venv/Scripts/activate
-python -m pip install -U pip setuptools wheel
-pip install -e .
-python tools/check_environment.py
 ```
 
 macOS / Linux：
 
 ```bash
-python3.12 -m venv .venv
+python3.12 setup_local.py
 source .venv/bin/activate
-python -m pip install -U pip setuptools wheel
-pip install -e .
-python tools/check_environment.py
 ```
 
 安装后可直接使用：
