@@ -11,12 +11,12 @@ unity相关/ARPrototype3D-windows-x64/ARPrototype3D.exe
 After cloning or pulling the repository, run:
 
 ```bash
-py -3.12 setup_local.py
+python setup_local.py
 source .venv/Scripts/activate
 streamlit run gui.py
 ```
 
-`setup_local.py` creates `.venv`, installs the Python package, downloads the Unity build zip, extracts it into `unity相关/`, and runs the environment check.
+`setup_local.py` locates Python 3.12, installs it with `winget` on Windows when possible, creates `.venv`, installs the Python package, downloads the Unity build zip, extracts it into `unity相关/`, and runs the environment check.
 
 ## GitHub Release Asset
 
