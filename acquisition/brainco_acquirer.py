@@ -77,6 +77,7 @@ class BrainCoAcquirer(AbstractAcquirer):
 
         self.metadata = AcquirerMetadata(name="brainco", sfreq=float(sfreq), n_channels=n_channels)
         self._buffer_sec = float(buffer_sec)
+        self._drain_samples_per_read = max(int(round(self.metadata.sfreq * 0.25)), 1)
         self._brainco_addr = brainco_addr.strip()
         self._brainco_port = int(brainco_port)
         self._auto_discover = bool(auto_discover)
@@ -667,7 +668,7 @@ class BrainCoAcquirer(AbstractAcquirer):
         """Fetch any newly available BrainCo samples into the local rolling cache."""
 
         assert self._sdk is not None
-        take = max(int(self.metadata.sfreq * min(self._buffer_sec, 60.0)), 256)
+        take = self._drain_samples_per_read
         data = self._normalize_buffer(self._sdk.get_eeg_buffer(take, True), allow_empty=True)
         if data.shape[1] == 0:
             return data

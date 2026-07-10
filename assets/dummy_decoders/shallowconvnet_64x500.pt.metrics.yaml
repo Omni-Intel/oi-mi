@@ -1,0 +1,16 @@
+model_name: shallowconvnet
+profile:
+  n_chans: 64
+  sfreq: 250.0
+  window_sec: 2.0
+  n_classes: 3
+  n_samples: 240
+  epochs: 12
+  batch_size: 32
+  learning_rate: 0.001
+  patience: 6
+  seed: 17
+metrics:
+  val_loss: 0.7258378863334656
+  val_acc: 0.6041666865348816
+asset_path: assets/dummy_decoders/shallowconvnet_64x500.pt

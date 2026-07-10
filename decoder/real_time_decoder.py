@@ -171,8 +171,10 @@ class RealTimeDecoder:
         marker_backend: MarkerBackend,
         duration_sec: int,
         block_sec: float = 10.0,
+        initial_rest_sec: float = 0.0,
         save_dir: Path | None = None,
         heartbeat: Callable[[], None] | None = None,
+        stage_progress: Callable[[str, float, float], None] | None = None,
     ) -> dict[str, float | int | str]:
         """Run cue-based testing, save captured EEG/labels, and report accuracy."""
 
@@ -191,9 +193,22 @@ class RealTimeDecoder:
             "channels": self._acquirer.metadata.n_channels,
         })
         
+        def update_stage(stage_name: str, elapsed_sec: float, total_sec: float) -> None:
+            if stage_progress is not None:
+                stage_progress(stage_name, elapsed_sec, total_sec)
+
         self._acquirer.start_stream()
         if heartbeat is not None:
             heartbeat()
+        if initial_rest_sec > 0:
+            self._console.print(f"[bold yellow]Baseline 测试静息注视 ({initial_rest_sec:.0f}s)[/bold yellow]")
+            update_stage("测试静息注视", 0.0, initial_rest_sec)
+            self._sleep_with_stage_progress(
+                initial_rest_sec,
+                heartbeat=heartbeat,
+                stage_name="测试静息注视",
+                stage_progress=stage_progress,
+            )
         started = time.monotonic()
         cue_index = 0
         labels = [0, 1, 2]
@@ -214,11 +229,20 @@ class RealTimeDecoder:
                 # IMPORTANT: Delay for window_sec before starting to evaluate this cue.
                 # If window is 4s, the immediate chunk returned still mostly contains data PROR to the cue.
                 # We need to give the subject time to react and the ring buffer time to fill with the new intent.
-                self._sleep_with_heartbeat(self._window_sec, heartbeat)
+                update_stage(f"测试 {cue_index}: cue {TEST_MODE_PROMPTS[label]}", 0.0, self._window_sec)
+                self._sleep_with_stage_progress(
+                    self._window_sec,
+                    heartbeat=heartbeat,
+                    stage_name=f"测试 {cue_index}: cue {TEST_MODE_PROMPTS[label]}",
+                    stage_progress=stage_progress,
+                )
                 
                 # Now we predict on the new block length
                 # Since we already waited window_sec, we subtract this from the block duration to keep blocks same length
-                block_end = time.monotonic() + max(0.1, block_sec - self._window_sec)
+                control_sec = max(0.1, block_sec - self._window_sec)
+                control_started = time.monotonic()
+                block_end = control_started + control_sec
+                update_stage(f"测试 {cue_index}: 预测控制", 0.0, control_sec)
                 
                 while time.monotonic() < block_end and time.monotonic() - started < duration_sec:
                     loop_started = time.perf_counter()
@@ -264,6 +288,11 @@ class RealTimeDecoder:
                     confidences.append(float(result.confidence))
                     if heartbeat is not None:
                         heartbeat()
+                    update_stage(
+                        f"测试 {cue_index}: 预测控制",
+                        min(time.monotonic() - control_started, control_sec),
+                        control_sec,
+                    )
                     elapsed = time.perf_counter() - loop_started
                     self._sleep_with_heartbeat(max(0.0, self._step_sec - elapsed), heartbeat)
         except KeyboardInterrupt:
@@ -403,6 +432,27 @@ class RealTimeDecoder:
             chunk = min(0.1, remaining)
             time.sleep(chunk)
             remaining -= chunk
+            if heartbeat is not None:
+                heartbeat()
+
+    def _sleep_with_stage_progress(
+        self,
+        duration_sec: float,
+        *,
+        heartbeat: Callable[[], None] | None,
+        stage_name: str,
+        stage_progress: Callable[[str, float, float], None] | None,
+    ) -> None:
+        total = max(float(duration_sec), 0.0)
+        started_at = time.monotonic()
+        remaining = total
+        while remaining > 0:
+            chunk = min(0.1, remaining)
+            time.sleep(chunk)
+            remaining -= chunk
+            elapsed = min(time.monotonic() - started_at, total)
+            if stage_progress is not None:
+                stage_progress(stage_name, elapsed, total)
             if heartbeat is not None:
                 heartbeat()
 

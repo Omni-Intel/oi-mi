@@ -1,0 +1,21 @@
+{
+  "profiles": [
+    {
+      "n_chans": 64,
+      "sfreq": 250.0,
+      "window_sec": 2.0,
+      "n_times": 500,
+      "n_classes": 3,
+      "models": [
+        {
+          "model_name": "shallowconvnet",
+          "asset_path": "assets/dummy_decoders/shallowconvnet_64x500.pt",
+          "metrics": {
+            "val_loss": 0.7258378863334656,
+            "val_acc": 0.6041666865348816
+          }
+        }
+      ]
+    }
+  ]
+}

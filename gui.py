@@ -16,7 +16,7 @@ import streamlit as st
 from acquisition.base import ElectrodeImpedance
 from acquisition.factory import AcquirerFactory, register_default_acquirers
 from adaptation.calibrator import Calibrator
-from adaptation.mi_protocol import LABEL_DISPLAY, ProtocolConfig
+from adaptation.mi_protocol import LABEL_DESCRIPTION, LABEL_DISPLAY, LABEL_SYMBOL, ProtocolConfig
 from cli import (
     build_acquirer,
     build_game_command_outlet,
@@ -208,9 +208,9 @@ _CALIBRATION_GUIDANCE_STEPS = (
 
 def _resolve_display_color(symbol: str, message: str) -> str:
     upper_message = message.upper()
-    if symbol in {"←", "→"} or "LEFT" in upper_message or "RIGHT" in upper_message:
+    if symbol in {"←", "→"} or "LEFT" in upper_message or "RIGHT" in upper_message or "左手" in message or "右手" in message:
         return _CUE_COLORS["action"]
-    if symbol in {"○", "◌"} or "REST" in upper_message or "IDLE" in upper_message or "休息" in message:
+    if symbol in {"○", "◌"} or "REST" in upper_message or "IDLE" in upper_message or "休息" in message or "静息" in message:
         return _CUE_COLORS["rest"]
     return _CUE_COLORS["default"]
 
@@ -223,14 +223,16 @@ def _resolve_cue_symbol(message: str, *, event_type: str) -> tuple[str, bool] | 
         return _DISPLAY_SYMBOLS["BLANK"], False
     if "FIXATION" in upper_message:
         return _DISPLAY_SYMBOLS["FIXATION"], False
-    if "LEFT" in upper_message:
+    if "LEFT" in upper_message or "左手" in message:
         return _DISPLAY_SYMBOLS["LEFT"], event_type == "prediction"
-    if "RIGHT" in upper_message:
+    if "RIGHT" in upper_message or "右手" in message:
         return _DISPLAY_SYMBOLS["RIGHT"], event_type == "prediction"
-    if "REST" in upper_message or "IDLE" in upper_message:
+    if "REST" in upper_message or "IDLE" in upper_message or "静息" in message:
         return _DISPLAY_SYMBOLS["REST"], event_type == "prediction"
-    if "校准完成" in message:
+    if "校准完成" in message or "测试结束" in message:
         return _DISPLAY_SYMBOLS["DONE"], False
+    if "采集完成" in message:
+        return _DISPLAY_SYMBOLS["TRANSITION"], False
     if "执行失败" in message:
         return _DISPLAY_SYMBOLS["ERROR"], False
     if "开始按 MI game control protocol 采集" in message:
@@ -252,13 +254,17 @@ def _subject_facing_message(message: str, *, prediction: bool) -> str:
         return ""
     if "执行失败" in message:
         return "执行失败"
-    if "校准完成" in message:
-        return "采集完成"
+    if "校准完成" in message or "测试结束" in message:
+        return "实验结束，请等待工作人员"
+    if "采集完成" in message:
+        return "采集完成，正在保存和训练，请等待工作人员"
     if "BASELINE" in upper_message:
         return "请放松注视中央"
     if "休息" in message:
         return "请休息，稍后继续"
     if "开始按 MI GAME CONTROL PROTOCOL 采集".upper() in upper_message:
+        return "准备开始"
+    if "测试模式启动" in message:
         return "准备开始"
     if "接下来是" in message and "练习" in message:
         return "接下来是 6 个练习 trial"
@@ -290,7 +296,15 @@ def _subject_facing_message(message: str, *, prediction: bool) -> str:
         return "练习"
     if "FIXATION" in upper_message:
         return ""
-    if "LEFT" in upper_message or "RIGHT" in upper_message or "REST" in upper_message or "IDLE" in upper_message:
+    if (
+        "LEFT" in upper_message
+        or "RIGHT" in upper_message
+        or "REST" in upper_message
+        or "IDLE" in upper_message
+        or "左手" in message
+        or "右手" in message
+        or "静息" in message
+    ):
         return ""
     if "ITI" in upper_message or "BLOCK " in upper_message:
         return ""
@@ -354,6 +368,14 @@ class StreamlitConsole:
         self._lock = threading.Lock()
         self._pending_events: list[tuple[str, str]] = []
         self._ui_thread_id = threading.get_ident()
+        self._last_stage_label = ""
+        self._fullscreen_symbol_html = ""
+        self._fullscreen_message_html = ""
+        self._progress_label = "等待阶段"
+        self._progress_elapsed = 0.0
+        self._progress_duration = 0.0
+        self._progress_started_at = time.monotonic()
+        self._last_progress_render_at = 0.0
 
     def print(self, message, *args, **kwargs) -> None:
         raw_message = str(message)
@@ -384,6 +406,10 @@ class StreamlitConsole:
 
         log_updated = False
         for event_type, msg in pending:
+            if self.fullscreen and event_type == "prediction":
+                self._append_log(msg)
+                log_updated = True
+                continue
             if event_type in {"cue", "prediction"}:
                 self._render_cue(msg, prediction=(event_type == "prediction"))
                 self._append_log(msg)
@@ -400,6 +426,23 @@ class StreamlitConsole:
         if len(self.logs) > 18:
             self.logs.pop(0)
 
+    def set_stage_progress(self, *, stage_name: str, elapsed_sec: float, duration_sec: float) -> None:
+        if not self.fullscreen:
+            return
+        total = max(float(duration_sec), 0.0)
+        elapsed = min(max(float(elapsed_sec), 0.0), total) if total > 0 else 0.0
+        label = stage_name.strip() or self._last_stage_label or "阶段"
+        self._last_stage_label = label
+        self._progress_label = label
+        self._progress_elapsed = elapsed
+        self._progress_duration = total
+        if elapsed <= 0.0:
+            self._progress_started_at = time.monotonic()
+        now = time.monotonic()
+        if elapsed >= total or now - self._last_progress_render_at >= 0.25:
+            self._render_fullscreen_surface()
+            self._last_progress_render_at = now
+
     def _render_cue(self, msg: str, *, prediction: bool) -> None:
         resolved = _resolve_cue_symbol(msg, event_type="prediction" if prediction else "cue")
         symbol = resolved[0] if resolved is not None else "·"
@@ -408,23 +451,15 @@ class StreamlitConsole:
         color = _resolve_display_color(symbol, msg)
         if self.fullscreen:
             subject_message = _subject_facing_message(msg, prediction=is_prediction)
-            symbol_html = ""
+            self._fullscreen_symbol_html = ""
             if symbol:
-                symbol_html = f"<div class='oi-experiment-symbol' style='color: {color};'>{symbol}</div>"
-            message_html = ""
+                self._fullscreen_symbol_html = f"<div class='oi-experiment-symbol' style='color: {color};'>{symbol}</div>"
+            self._fullscreen_message_html = ""
             if subject_message:
                 safe_msg = html.escape(subject_message)
                 message_class = "oi-experiment-message" if symbol else "oi-experiment-center-message"
-                message_html = f"<div class='{message_class}'>{safe_msg}</div>"
-            self.cue_placeholder.markdown(
-                (
-                    "<div class='oi-experiment-stage'>"
-                    f"{symbol_html}"
-                    f"{message_html}"
-                    "</div>"
-                ),
-                unsafe_allow_html=True,
-            )
+                self._fullscreen_message_html = f"<div class='{message_class}'>{safe_msg}</div>"
+            self._render_fullscreen_surface()
             return
         self.cue_placeholder.markdown(
             (
@@ -432,6 +467,41 @@ class StreamlitConsole:
                 "display: flex; align-items: center; justify-content: center; "
                 f"background-color: {bg}; border: 1px solid #E2E8F0;'>"
                 f"<div style='font-size: 4.5rem; line-height: 1; font-weight: 700; color: {color};'>{symbol}</div>"
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+
+    def _render_fullscreen_surface(self) -> None:
+        total = max(float(self._progress_duration), 0.0)
+        if total > 0:
+            elapsed = min(max(time.monotonic() - self._progress_started_at, float(self._progress_elapsed)), total)
+            self._progress_elapsed = elapsed
+        else:
+            elapsed = max(float(self._progress_elapsed), 0.0)
+        ratio = 1.0 if total == 0 else elapsed / total
+        progress_html = (
+            "<div class='oi-debug-progress-card'>"
+            "<div class='oi-debug-progress-title'>调试进度</div>"
+            "<div class='oi-debug-progress-row'>"
+            f"<span>{html.escape(self._progress_label)}</span>"
+            f"<span>{elapsed:.1f}s / {total:.1f}s</span>"
+            "</div>"
+            "<div class='oi-debug-progress-track'>"
+            f"<div class='oi-debug-progress-fill' style='width: {ratio * 100:.1f}%;'></div>"
+            "</div>"
+            "</div>"
+        )
+        self.cue_placeholder.markdown(
+            (
+                "<div class='oi-experiment-scroll-shell'>"
+                "<section class='oi-experiment-stage'>"
+                f"{self._fullscreen_symbol_html}"
+                f"{self._fullscreen_message_html}"
+                "</section>"
+                "<section class='oi-debug-progress-section'>"
+                f"{progress_html}"
+                "</section>"
                 "</div>"
             ),
             unsafe_allow_html=True,
@@ -472,19 +542,32 @@ def enter_experiment_view() -> None:
           max-width: none !important;
           padding: 0 !important;
         }
-        .oi-experiment-stage {
+        .oi-experiment-scroll-shell {
           width: 100vw;
           height: 100dvh;
           position: fixed;
           inset: 0;
           z-index: 9990;
           background: #f8fafc;
+          overflow-x: hidden;
+          overflow-y: scroll;
+          overscroll-behavior: contain;
+          scroll-behavior: auto;
+          pointer-events: auto;
+          touch-action: pan-y;
+          scrollbar-width: thin;
+        }
+        .oi-experiment-stage {
+          width: 100vw;
+          height: 100dvh;
+          position: relative;
+          background: #f8fafc;
           border: none;
           box-sizing: border-box;
           overflow: hidden;
         }
         .oi-experiment-symbol {
-          position: fixed;
+          position: absolute;
           top: 45%;
           left: 50%;
           transform: translate(-50%, -50%);
@@ -494,7 +577,7 @@ def enter_experiment_view() -> None:
           text-align: center;
         }
         .oi-experiment-message {
-          position: fixed;
+          position: absolute;
           bottom: 16vh;
           left: 8vw;
           right: 8vw;
@@ -505,7 +588,7 @@ def enter_experiment_view() -> None:
           color: #0f172a;
         }
         .oi-experiment-center-message {
-          position: fixed;
+          position: absolute;
           top: 50%;
           left: 10vw;
           right: 10vw;
@@ -515,6 +598,54 @@ def enter_experiment_view() -> None:
           line-height: 1.18;
           font-weight: 800;
           color: #0f172a;
+        }
+        .oi-debug-progress-section {
+          width: 100vw;
+          min-height: 28dvh;
+          box-sizing: border-box;
+          display: flex;
+          align-items: flex-start;
+          justify-content: center;
+          padding: 2rem 2rem 4rem;
+          background: #f8fafc;
+        }
+        .oi-debug-progress-card {
+          width: min(760px, calc(100vw - 4rem));
+          margin: 0 auto;
+          padding: 0.55rem 0.7rem;
+          border: 1px solid #cbd5e1;
+          border-radius: 8px;
+          background: rgba(255, 255, 255, 0.96);
+          color: #0f172a;
+          box-shadow: 0 8px 20px rgba(15, 23, 42, 0.08);
+        }
+        .oi-debug-progress-title {
+          margin-bottom: 0.3rem;
+          font-size: 0.72rem;
+          line-height: 1.2;
+          font-weight: 800;
+          color: #334155;
+        }
+        .oi-debug-progress-row {
+          display: flex;
+          justify-content: space-between;
+          gap: 1rem;
+          margin-bottom: 0.3rem;
+          font-size: 0.72rem;
+          line-height: 1.2;
+          font-weight: 600;
+        }
+        .oi-debug-progress-track {
+          height: 0.32rem;
+          overflow: hidden;
+          border-radius: 999px;
+          background: #e2e8f0;
+        }
+        .oi-debug-progress-fill {
+          height: 100%;
+          border-radius: inherit;
+          background: #2563eb;
+          transition: width 120ms linear;
         }
         .st-key-calibration_return_from_experiment {
           position: fixed;
@@ -622,7 +753,9 @@ def render_experiment_return_button() -> None:
         st.session_state.pop("calibration_is_new", None)
         st.session_state.pop("calibration_after_guidance", None)
         st.session_state.pop("calibration_guidance_step", None)
-        st.session_state.gui_nav_mode = "校准"
+        st.session_state.pop("test_mode_experiment_view", None)
+        st.session_state.pop("test_mode_duration", None)
+        st.session_state.gui_nav_mode = "测试模式" if st.session_state.get("gui_nav_mode") == "测试模式" else "校准"
         st.rerun()
 
 
@@ -682,43 +815,132 @@ def init_live_view(*, fullscreen: bool = False) -> tuple[StreamlitConsole, calla
     return console, refresh
 
 
-def run_calibration_practice_preview() -> None:
+def run_calibration_practice_preview(protocol: ProtocolConfig) -> None:
     """Run repeatable practice trials without touching hardware."""
 
     console, refresh = init_live_view(fullscreen=True)
-    preview_events = (
-        ("接下来是 6 个练习 trial，用于熟悉流程", 1.6),
-        ("练习 1/6 LEFT 左手持续握拳/松拳想象", 1.0),
-        ("PRACTICE_FIXATION", 0.8),
-        ("PRACTICE ← LEFT", 1.3),
-        ("PRACTICE_ITI", 0.7),
-        ("练习 2/6 RIGHT 右手持续握拳/松拳想象", 1.0),
-        ("PRACTICE_FIXATION", 0.8),
-        ("PRACTICE → RIGHT", 1.3),
-        ("PRACTICE_ITI", 0.7),
-        ("练习 3/6 REST 放松注视，不发出控制指令", 1.0),
-        ("PRACTICE_FIXATION", 0.8),
-        ("PRACTICE ○ REST", 1.3),
-        ("PRACTICE_ITI", 0.7),
-        ("练习 4/6 LEFT 左手持续握拳/松拳想象", 1.0),
-        ("PRACTICE_FIXATION", 0.8),
-        ("PRACTICE ← LEFT", 1.3),
-        ("PRACTICE_ITI", 0.7),
-        ("练习 5/6 RIGHT 右手持续握拳/松拳想象", 1.0),
-        ("PRACTICE_FIXATION", 0.8),
-        ("PRACTICE → RIGHT", 1.3),
-        ("PRACTICE_ITI", 0.7),
-        ("练习 6/6 REST 放松注视，不发出控制指令", 1.0),
-        ("PRACTICE_FIXATION", 0.8),
-        ("PRACTICE ○ REST", 1.3),
-        ("PRACTICE_ITI", 0.7),
-        ("练习结束", 1.2),
+    practice_labels = list(protocol.practice_labels) * max(protocol.practice_repetitions, 0)
+    total_trials = len(practice_labels)
+    timing = protocol.trial_timing
+    practice_baseline_sec = 10.0
+    if protocol.baseline_segments:
+        practice_baseline_sec = min(practice_baseline_sec, max(float(protocol.baseline_segments[0].duration_sec), 0.0))
+
+    _run_preview_event(
+        console,
+        refresh,
+        message=f"接下来是 {total_trials} 个练习 trial，用于熟悉流程",
+        stage_name="练习说明",
+        duration_sec=3.0,
+    )
+    _run_preview_event(
+        console,
+        refresh,
+        message=f"Baseline 练习静息注视 ({practice_baseline_sec:.0f}s)",
+        stage_name="练习静息注视",
+        duration_sec=practice_baseline_sec,
+    )
+    for index, label in enumerate(practice_labels, start=1):
+        _run_preview_event(
+            console,
+            refresh,
+            message=f"练习 {index}/{total_trials} {LABEL_DISPLAY[label]} {LABEL_DESCRIPTION[label]}",
+            stage_name=f"练习 {index}/{total_trials}: 准备",
+            duration_sec=0.5,
+        )
+        _run_preview_event(
+            console,
+            refresh,
+            message="PRACTICE_FIXATION",
+            stage_name=f"练习 {index}/{total_trials}: fixation",
+            duration_sec=timing.fixation_sec,
+        )
+        cue_message = f"PRACTICE {LABEL_SYMBOL[label]} {LABEL_DISPLAY[label]}"
+        _run_preview_event(
+            console,
+            refresh,
+            message=cue_message,
+            stage_name=f"练习 {index}/{total_trials}: cue {label}",
+            duration_sec=timing.cue_sec,
+        )
+        _run_preview_event(
+            console,
+            refresh,
+            message=cue_message,
+            stage_name=f"练习 {index}/{total_trials}: control {label}",
+            duration_sec=timing.control_sec,
+            redraw_cue=False,
+        )
+        _run_preview_event(
+            console,
+            refresh,
+            message="PRACTICE_ITI",
+            stage_name=f"练习 {index}/{total_trials}: iti",
+            duration_sec=timing.iti_sec,
+        )
+    _run_preview_event(
+        console,
+        refresh,
+        message="练习结束",
+        stage_name="练习结束",
+        duration_sec=3.0,
     )
 
-    for message, delay_sec in preview_events:
+
+def _run_preview_event(
+    console: StreamlitConsole,
+    refresh: callable,
+    *,
+    message: str,
+    stage_name: str,
+    duration_sec: float,
+    redraw_cue: bool = True,
+) -> None:
+    _start_preview_stage(console, stage_name=stage_name, duration_sec=duration_sec)
+    if redraw_cue:
         console.print(message)
+    refresh()
+    _sleep_preview_stage(console, refresh, duration_sec=duration_sec)
+
+
+def _preview_stage_name(message: str) -> str:
+    upper_message = message.upper()
+    if "PRACTICE_FIXATION" in upper_message:
+        return "练习: fixation"
+    if "PRACTICE_ITI" in upper_message:
+        return "练习: iti"
+    if "LEFT" in upper_message:
+        return "练习: cue left"
+    if "RIGHT" in upper_message:
+        return "练习: cue right"
+    if "REST" in upper_message or "IDLE" in upper_message:
+        return "练习: cue rest"
+    if "接下来是" in message:
+        return "练习说明"
+    if "练习结束" in message:
+        return "练习结束"
+    return "练习预览"
+
+
+def _start_preview_stage(console: StreamlitConsole, *, stage_name: str, duration_sec: float) -> None:
+    console.set_stage_progress(stage_name=stage_name, elapsed_sec=0.0, duration_sec=duration_sec)
+
+
+def _sleep_preview_stage(
+    console: StreamlitConsole,
+    refresh: callable,
+    *,
+    duration_sec: float,
+) -> None:
+    total = max(float(duration_sec), 0.0)
+    started_at = time.monotonic()
+    deadline = started_at + total
+    while time.monotonic() < deadline:
         refresh()
-        time.sleep(delay_sec)
+        elapsed = min(time.monotonic() - started_at, total)
+        console.set_stage_progress(stage_name="", elapsed_sec=elapsed, duration_sec=total)
+        time.sleep(min(0.05, max(deadline - time.monotonic(), 0.0)))
+    console.set_stage_progress(stage_name="", elapsed_sec=total, duration_sec=total)
 
 
 def run_calibration_session(config: dict, protocol: ProtocolConfig, *, is_new_flag: bool) -> None:
@@ -781,6 +1003,8 @@ def run_calibration_session(config: dict, protocol: ProtocolConfig, *, is_new_fl
                 st.info(f"使用内置 dummy 测试权重: `{load_path}`")
             model.load(load_path)
 
+        console.set_stage_progress(stage_name="启动 EEG 采集", elapsed_sec=0.0, duration_sec=10.0)
+        refresh()
         with st.spinner("校准进行中..."):
             result = calibrator.calibrate(
                 duration_sec=None,
@@ -1142,7 +1366,7 @@ def render_calibration(config: dict) -> None:
         if calibration_view == "guidance":
             render_calibration_guidance()
         elif calibration_view == "practice":
-            run_calibration_practice_preview()
+            run_calibration_practice_preview(protocol)
             st.session_state.pop("calibration_experiment_view", None)
             st.session_state.gui_nav_mode = "校准"
             st.rerun()
@@ -1188,12 +1412,26 @@ def render_calibration(config: dict) -> None:
 
 
 def render_test_mode(config: dict) -> None:
+    test_view = st.session_state.get("test_mode_experiment_view")
+    if test_view == "run":
+        enter_experiment_view()
+        render_experiment_return_button()
+        run_test_mode_session(config, duration=int(st.session_state.pop("test_mode_duration", 120)))
+        st.session_state.pop("test_mode_experiment_view", None)
+        return
+
     st.title("Cue 测试模式")
     st.markdown("运行过程中会展示 cue 和模型输出日志。")
     duration = st.number_input("测试总时长 (秒)", min_value=30, value=120, step=30)
 
     if st.button("开始测试", type="primary"):
-        try:
+        st.session_state.test_mode_duration = int(duration)
+        st.session_state.test_mode_experiment_view = "run"
+        st.rerun()
+
+
+def run_test_mode_session(config: dict, *, duration: int) -> None:
+    try:
             subject_id = str(config["subject_id"])
             model_name = str(config["model_name"])
             acquirer = build_acquirer(
@@ -1201,7 +1439,7 @@ def render_test_mode(config: dict) -> None:
                 config=config,
             )
             effective_n_channels = int(acquirer.metadata.n_channels)
-            console, refresh = init_live_view()
+            console, refresh = init_live_view(fullscreen=True)
             model = ModelFactory.get(
                 model_name,
                 n_chans=effective_n_channels,
@@ -1246,25 +1484,44 @@ def render_test_mode(config: dict) -> None:
                 status_callback=_update_ar_decoder_status,
             )
 
+            block_sec = float(config.get("test_mode", {}).get("block_sec", config.get("collect_block_sec", 10.0)))
+            protocol = ProtocolConfig.from_config(config)
+            test_mode_cfg = config.get("test_mode", {})
+            if "initial_rest_sec" in test_mode_cfg:
+                initial_rest_sec = max(float(test_mode_cfg.get("initial_rest_sec", 0.0)), 0.0)
+            elif protocol.baseline_segments:
+                initial_rest_sec = min(max(float(protocol.baseline_segments[0].duration_sec), 0.0), 10.0)
+            else:
+                initial_rest_sec = 10.0
+
+            def update_test_progress(stage_name: str, elapsed_sec: float, total_sec: float) -> None:
+                console.set_stage_progress(stage_name=stage_name, elapsed_sec=elapsed_sec, duration_sec=total_sec)
+
+            console.set_stage_progress(stage_name="启动测试模式", elapsed_sec=0.0, duration_sec=10.0)
+            refresh()
             with st.spinner("测试模式采集中..."):
                 result = decoder.run_test_mode(
                     subject_id=subject_id,
                     marker_backend=build_marker_backend(config),
                     duration_sec=int(duration),
-                    block_sec=float(config.get("collect_block_sec", 10.0)),
+                    block_sec=block_sec,
+                    initial_rest_sec=initial_rest_sec,
                     save_dir=Path(str(config.get("storage", {}).get("records_dir", "records_storage")))
                     / subject_id
                     / "test_mode",
                     heartbeat=refresh,
+                    stage_progress=update_test_progress,
                 )
 
+            refresh()
+            console.print("[bold green]测试结束[/bold green]")
             refresh()
             st.success("测试结束。")
             st.write(f"- 记录的窗口数: **{result['windows']}**")
             st.write(f"- 准确率: **{result['accuracy']:.3f}**")
             st.write(f"- 有效准确率: **{result['valid_accuracy']:.3f}**")
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"执行失败: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"执行失败: {exc}")
 
 
 def render_realtime(config: dict) -> None:

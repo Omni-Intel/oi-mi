@@ -96,6 +96,9 @@ class Calibrator:
             include_practice=include_practice,
             heartbeat=heartbeat,
         )
+        self._console.print("[bold cyan]采集完成，正在保存和训练，请等待工作人员[/bold cyan]")
+        if heartbeat is not None:
+            heartbeat()
         metrics = self._model.fit(
             processed_windows,
             labels,
@@ -109,6 +112,9 @@ class Calibrator:
         self._model.save(self._model_path)
         self._save_metadata(metrics=metrics, windows_collected=int(processed_windows.shape[0]), head_only=head_only)
         self._write_session_summary(session_dir, metrics=metrics, windows_collected=int(processed_windows.shape[0]), session_metadata=session_metadata)
+        self._console.print("[bold green]校准完成，请等待工作人员[/bold green]")
+        if heartbeat is not None:
+            heartbeat()
         return CalibrationResult(
             model_path=self._model_path,
             metrics=metrics,
@@ -175,7 +181,7 @@ class Calibrator:
         heartbeat: Callable[[], None] | None,
     ) -> None:
         self._console.print(f"[bold yellow]接下来是 {len(plan.practice_labels)} 个练习 trial，用于熟悉流程[/bold yellow]")
-        self._sleep_with_recording(3.0, recorder=recorder, heartbeat=heartbeat)
+        self._sleep_with_recording(3.0, recorder=recorder, heartbeat=heartbeat, stage_name="练习说明")
         for index, label in enumerate(plan.practice_labels, start=1):
             self._console.print(f"[bold yellow]练习 {index}/{len(plan.practice_labels)}[/bold yellow] {LABEL_DISPLAY[label]} {LABEL_DESCRIPTION[label]}")
             self._run_trial(
@@ -188,7 +194,7 @@ class Calibrator:
                 collect_trial=False,
             )
         self._console.print("[bold cyan]练习结束，接下来开始正式采集[/bold cyan]")
-        self._sleep_with_recording(3.0, recorder=recorder, heartbeat=heartbeat)
+        self._sleep_with_recording(3.0, recorder=recorder, heartbeat=heartbeat, stage_name="练习结束")
 
     def _run_baseline(
         self,
@@ -200,7 +206,12 @@ class Calibrator:
         for segment in plan.baseline_segments:
             self._console.print(f"[bold yellow]Baseline[/bold yellow] {segment.instruction} ({segment.duration_sec:.0f}s)")
             self._emit_event(recorder, "baseline_start", phase="baseline", segment_name=segment.name)
-            self._sleep_with_recording(segment.duration_sec, recorder=recorder, heartbeat=heartbeat)
+            self._sleep_with_recording(
+                segment.duration_sec,
+                recorder=recorder,
+                heartbeat=heartbeat,
+                stage_name=f"Baseline: {segment.name}",
+            )
             self._emit_event(recorder, "baseline_end", phase="baseline", segment_name=segment.name)
 
     def _run_formal_blocks(
@@ -232,7 +243,12 @@ class Calibrator:
                 self._console.print(
                     f"[bold yellow]休息 {plan.rest_between_blocks_sec:.0f} 秒，请放松但不要大幅动作[/bold yellow]"
                 )
-                self._sleep_with_recording(plan.rest_between_blocks_sec, recorder=recorder, heartbeat=heartbeat)
+                self._sleep_with_recording(
+                    plan.rest_between_blocks_sec,
+                    recorder=recorder,
+                    heartbeat=heartbeat,
+                    stage_name=f"Block {block_index + 1} 休息",
+                )
 
     def _run_trial(
         self,
@@ -255,7 +271,13 @@ class Calibrator:
             trial_index=trial_index,
             label=label,
         )
-        self._sleep_with_recording(trial_timing.fixation_sec, recorder=recorder, heartbeat=heartbeat)
+        stage_prefix = "练习" if phase == "practice" else f"Block {block_index + 1} / Trial {trial_index + 1}"
+        self._sleep_with_recording(
+            trial_timing.fixation_sec,
+            recorder=recorder,
+            heartbeat=heartbeat,
+            stage_name=f"{stage_prefix}: fixation",
+        )
 
         cue_event = f"cue_{label}_on"
         cue_message = f"PRACTICE {LABEL_SYMBOL[label]} {LABEL_DISPLAY[label]}" if phase == "practice" else f"{LABEL_SYMBOL[label]} {LABEL_DISPLAY[label]}"
@@ -268,7 +290,12 @@ class Calibrator:
             trial_index=trial_index,
             label=label,
         )
-        self._sleep_with_recording(trial_timing.cue_sec, recorder=recorder, heartbeat=heartbeat)
+        self._sleep_with_recording(
+            trial_timing.cue_sec,
+            recorder=recorder,
+            heartbeat=heartbeat,
+            stage_name=f"{stage_prefix}: cue {label}",
+        )
 
         control_on_sample = recorder.sample_count
         self._emit_event(
@@ -279,7 +306,12 @@ class Calibrator:
             trial_index=trial_index,
             label=label,
         )
-        self._sleep_with_recording(trial_timing.control_sec, recorder=recorder, heartbeat=heartbeat)
+        self._sleep_with_recording(
+            trial_timing.control_sec,
+            recorder=recorder,
+            heartbeat=heartbeat,
+            stage_name=f"{stage_prefix}: control {label}",
+        )
         control_off_sample = recorder.sample_count
         self._emit_event(
             recorder,
@@ -299,7 +331,12 @@ class Calibrator:
             label=label,
         )
         self._console.print("[bold yellow]PRACTICE_ITI[/bold yellow]" if phase == "practice" else "[bold yellow]ITI[/bold yellow]")
-        self._sleep_with_recording(trial_timing.iti_sec, recorder=recorder, heartbeat=heartbeat)
+        self._sleep_with_recording(
+            trial_timing.iti_sec,
+            recorder=recorder,
+            heartbeat=heartbeat,
+            stage_name=f"{stage_prefix}: iti",
+        )
         if not collect_trial:
             return None
         return {
@@ -510,16 +547,28 @@ class Calibrator:
         *,
         recorder: SessionRecorder,
         heartbeat: Callable[[], None] | None,
+        stage_name: str = "",
     ) -> None:
-        deadline = time.monotonic() + max(float(duration_sec), 0.0)
+        total = max(float(duration_sec), 0.0)
+        started_at = time.monotonic()
+        deadline = started_at + total
+        self._update_stage_progress(stage_name=stage_name, elapsed_sec=0.0, duration_sec=total)
         while time.monotonic() < deadline:
             self._flush_recorder(recorder)
             if heartbeat is not None:
                 heartbeat()
+            elapsed = min(time.monotonic() - started_at, total)
+            self._update_stage_progress(stage_name=stage_name, elapsed_sec=elapsed, duration_sec=total)
             time.sleep(min(0.05, max(deadline - time.monotonic(), 0.0)))
         self._flush_recorder(recorder)
+        self._update_stage_progress(stage_name=stage_name, elapsed_sec=total, duration_sec=total)
         if heartbeat is not None:
             heartbeat()
+
+    def _update_stage_progress(self, *, stage_name: str, elapsed_sec: float, duration_sec: float) -> None:
+        progress = getattr(self._console, "set_stage_progress", None)
+        if callable(progress):
+            progress(stage_name=stage_name, elapsed_sec=elapsed_sec, duration_sec=duration_sec)
 
     def _flush_recorder(self, recorder: SessionRecorder) -> None:
         try:
