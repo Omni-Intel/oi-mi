@@ -74,6 +74,7 @@ output:
     windowed: true
     window_width: 1280
     window_height: 720
+    resizable_window: true
     close_on_stop: false
   web_control:
     enabled: true
