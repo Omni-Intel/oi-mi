@@ -16,7 +16,7 @@ streamlit run gui.py
 unity相关/ARPrototype3D-windows-x64/ARPrototype3D.exe
 ```
 
-点击网页左侧的“实时解码”时，如果 Unity 没有打开，程序会自动以窗口模式启动这个 exe，并等待 `127.0.0.1:5005` 可连接后再继续。实时解码运行期间关闭 Unity 窗口会让 AR TCP 连接断开，网页端实时解码也会停止。
+点击网页左侧的“实时解码”或启动 dummy 测试时，如果 Unity 没有打开，程序会自动以窗口模式启动这个 exe，并等待 `127.0.0.1:5005` 可连接后再继续；TCP 探活连接释放后，会执行 `output.ar_game.startup_sequence`：先回到 Hub，再进入小车场景并选择 Fixed Speed 驾驶模式。这个确定性序列保证 Unity 无论原来停在哪个页面，每次实验都从同一状态开始。实时解码运行期间关闭 Unity 窗口会让 AR TCP 连接断开，网页端实时解码也会停止。
 
 `oi-mi` 是一个面向 Motor Imagery 的生产级 Python CLI 工程骨架，目标是支持真实 EEG 采集、个体校准与在线解码。
 
@@ -127,6 +127,18 @@ python download_datasets.py --dataset BNCI2014_001 --subject 1 --data-dir ./data
 - 个体适配：`adaptation/calibrator.py`
 - 在线解码：`decoder/real_time_decoder.py`
 - 命令输出：LSL command stream
+
+### NeuroOnline 论文复现模式
+
+`config.yaml` 中将 `online_adaptation.strategy` 设为 `neuroonline` 后，实时解码采用论文发布代码的运动想象配置：先预测当前窗口，再接收真值标签；累计 320 个有标签窗口后，每 64 个样本使用最近 320 个窗口更新一次。每个样本在进入缓冲区时生成固定的时间遮挡和频率遮挡视图，更新目标为三个视图的分类损失加两项表示一致性损失，并联合更新 backbone、CRM 和分类头。
+
+该模式仅支持 PyTorch 模型，不支持 `riemann-mdm`。CRM 以恒等门控初始化；更新后的 backbone 保存到原模型文件，CRM 状态保存到同目录的 `<model>.neuroonline.pt` sidecar 文件。将策略改回 `periodic_head` 可继续使用原有的十分钟候选分类头更新流程。
+
+实时解码页面配套显示 NeuroOnline 遥测：首次 320 样本及后续 64 样本更新进度、缓冲区类别覆盖、prequential accuracy/balanced accuracy、逐类准确率、累计混淆矩阵，以及每轮总损失、分类损失、一致性损失、CRM gate 和更新耗时曲线。所有在线性能只使用“先预测、后更新”时产生的预测，不会用更新后的模型回算历史样本。
+
+在线更新在隔离的候选模型上后台执行，实时推理继续使用当前模型；候选训练完成后，在模型锁内一次性替换引用并递增 `model_revision`。每次成功更新都会保存主模型和 CRM sidecar。开启实时记录后，最终适配状态和完整更新历史写入 `manifest.json`，每个 chunk 额外保存原始 argmax 预测、阈值处理后的预测、模型 revision 和标签事件 ID。
+
+正式小车实验可启用 `online_adaptation.cued_labels`。GUI 会按项目协议自动显示 fixation、cue、control 和 ITI，并生成平衡的 LEFT/RIGHT/IDLE 序列；只有完整落在 control 有效区间内的解码窗口才会获得训练标签。真实设备实验需关闭 `online_adaptation.simulation.enabled`。如果关闭自动 cue，则继续使用 `http://127.0.0.1:8776/api/label` 接收外部标签。
 
 ## 各模式 EEG 保存逻辑
 

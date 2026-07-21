@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import copy
+from contextlib import nullcontext
 import logging
 import threading
 import time
@@ -15,7 +17,13 @@ import numpy as np
 from rich.console import Console
 
 from acquisition.base import AbstractAcquirer
-from models.factory import BaseModelAdapter
+from adaptation.neuroonline import (
+    NeuroOnlineConfig,
+    NeuroOnlineModelAdapter,
+    NeuroOnlineStreamAdapter,
+)
+from adaptation.online_batch_adapter import BatchAdaptationConfig, OnlineBatchAdapter
+from models.factory import BaseModelAdapter, TorchModelAdapter
 from utils.markers import ArTcpCommandSender, LSLCommandOutlet, MarkerBackend
 from utils.online_labels import OnlineLabelSource
 from utils.preprocessing import filter_and_transform
@@ -61,9 +69,13 @@ class RealTimeDecoder:
         status_callback: Callable[[dict[str, Any]], None] | None = None,
         thread_context: Any | None = None,
         stop_on_game_disconnect: bool = True,
+        batch_update_config: dict[str, Any] | None = None,
+        n_classes: int = 3,
     ) -> None:
         self._acquirer = acquirer
         self._model = model
+        self._model_lock = threading.RLock()
+        self._model_revision = 0
         self._console = console
         self._command_outlet = command_outlet
         self._game_command_outlet = game_command_outlet
@@ -91,6 +103,39 @@ class RealTimeDecoder:
         self._game_disconnect_message: str | None = None
         self._stop_on_game_disconnect = bool(stop_on_game_disconnect)
         self._thread_context = thread_context
+        neuroonline_config = NeuroOnlineConfig.from_mapping(batch_update_config)
+        batch_config = BatchAdaptationConfig.from_mapping(batch_update_config)
+        self._batch_adapter: OnlineBatchAdapter | None = None
+        self._neuroonline_adapter: NeuroOnlineStreamAdapter | None = None
+        self._last_batch_notice: tuple[Any, ...] | None = None
+        self._neuroonline_training_notice = False
+        if neuroonline_config.enabled:
+            if not isinstance(model, TorchModelAdapter):
+                raise ValueError("NeuroOnline requires a PyTorch decoder model.")
+            if model_save_path is None:
+                raise ValueError("NeuroOnline adaptation requires model_save_path.")
+            self._model = NeuroOnlineModelAdapter(
+                model,
+                config=neuroonline_config,
+                state_path=model_save_path,
+            )
+            self._neuroonline_adapter = NeuroOnlineStreamAdapter(
+                config=neuroonline_config,
+                update_callback=self._run_neuroonline_update,
+                save_callback=self._save_current_model,
+                completion_callback=self._on_neuroonline_update_complete,
+                n_classes=n_classes,
+            )
+        elif batch_config.enabled:
+            if model_save_path is None:
+                raise ValueError("Periodic online adaptation requires model_save_path.")
+            self._batch_adapter = OnlineBatchAdapter(
+                config=batch_config,
+                model_getter=self._clone_current_model,
+                model_swapper=self._swap_model,
+                model_save_path=model_save_path,
+                n_classes=n_classes,
+            )
 
     def start(self) -> None:
         self._acquirer.start_stream()
@@ -112,7 +157,17 @@ class RealTimeDecoder:
         self._thread = None
         self._acquirer.stop_stream()
         if self._game_command_outlet is not None:
+            try:
+                self._game_command_outlet.push("STOP")
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.debug("Failed to send final AR STOP: %s", exc)
             self._game_command_outlet.close()
+        if self._batch_adapter is not None:
+            self._batch_adapter.close()
+        if self._neuroonline_adapter is not None:
+            self._neuroonline_adapter.close()
+        if self._online_label_source is not None:
+            self._online_label_source.close()
 
     def run_forever(
         self,
@@ -142,6 +197,9 @@ class RealTimeDecoder:
                 "window_sec": self._window_sec,
                 "step_sec": self._step_sec,
                 "channels": self._acquirer.metadata.n_channels,
+                "model_revision": self._model_revision,
+                "online_adaptation": self._online_adaptation_status(),
+                "online_label_source": self._online_label_source_metadata(),
             })
 
         self._push_game_session_command("START")
@@ -161,7 +219,13 @@ class RealTimeDecoder:
                 heartbeat()
             if hasattr(self, "_writer"):
                 self._writer.stop()
-                self._writer.update_manifest({})
+                self._writer.update_manifest(
+                    {
+                        "model_revision": self._model_revision,
+                        "online_adaptation": self._online_adaptation_status(),
+                        "online_label_source": self._online_label_source_metadata(),
+                    }
+                )
                 self._console.print(f"[bold green]实时数据已保存[/bold green] {self._save_dir}")
 
     def run_test_mode(
@@ -217,6 +281,8 @@ class RealTimeDecoder:
         pred_labels: list[int] = []
         confidences: list[float] = []
         update_losses: list[float] = []
+        run_status = "completed"
+        run_error: str | None = None
         try:
             while time.monotonic() - started < duration_sec:
                 label = labels[cue_index % len(labels)]
@@ -252,7 +318,7 @@ class RealTimeDecoder:
                         time.sleep(self._step_sec)
                         continue
                     processed = filter_and_transform(window, sfreq=self._sfreq)
-                    probabilities = self._model.predict_proba(
+                    probabilities = self._predict_proba(
                         processed[None, ...],
                         mc_dropout_passes=self._mc_dropout_passes,
                     )[0]
@@ -296,13 +362,22 @@ class RealTimeDecoder:
                     elapsed = time.perf_counter() - loop_started
                     self._sleep_with_heartbeat(max(0.0, self._step_sec - elapsed), heartbeat)
         except KeyboardInterrupt:
+            run_status = "interrupted"
             self._console.print("\n[bold red]停止测试模式[/bold red]")
+        except Exception as exc:
+            run_status = "failed"
+            run_error = str(exc)
+            raise
         finally:
-            self._acquirer.stop_stream()
+            self.stop()
+            writer.stop()
+            if run_status == "failed":
+                writer.update_manifest({"status": run_status, "error": run_error})
             if heartbeat is not None:
                 heartbeat()
 
         if not true_labels:
+            writer.update_manifest({"status": "no_windows", "error": "No EEG windows were collected."})
             raise RuntimeError("Test mode did not collect any EEG windows.")
 
         y_true = np.asarray(true_labels, dtype=np.int64)
@@ -311,8 +386,8 @@ class RealTimeDecoder:
         accuracy = float(np.mean(y_pred == y_true))
         valid_accuracy = float(np.mean(y_pred[pred_valid] == y_true[pred_valid])) if np.any(pred_valid) else 0.0
         
-        writer.stop()
         writer.update_manifest({
+            "status": run_status,
             "accuracy": accuracy,
             "valid_accuracy": valid_accuracy,
             "online_update_enabled": self._online_update_enabled,
@@ -336,14 +411,22 @@ class RealTimeDecoder:
         while not self._stop_event.is_set():
             started_at = time.perf_counter()
             try:
-                window, _ = self._acquirer.get_chunk(self._window_sec)
+                try:
+                    window, _ = self._acquirer.get_chunk(self._window_sec)
+                except RuntimeError as exc:
+                    if "Not enough data" in str(exc):
+                        self._sleep_with_heartbeat(self._step_sec, None)
+                        continue
+                    raise
                 window_end = time.monotonic()
                 window_start = window_end - self._window_sec
                 processed = filter_and_transform(window, sfreq=self._sfreq)
-                probabilities = self._model.predict_proba(
+                probability_batch, model_revision = self._predict_proba_with_revision(
                     processed[None, ...],
                     mc_dropout_passes=self._mc_dropout_passes,
-                )[0]
+                )
+                probabilities = probability_batch[0]
+                raw_prediction = int(np.argmax(probabilities))
                 result = self._post_process(probabilities)
                 self._console.print(
                     f"[green][预测][/green] {result.label} "
@@ -351,6 +434,7 @@ class RealTimeDecoder:
                 )
                 self._command_outlet.push(result.label)
                 game_command = self._to_game_command(result)
+                game_command = self._gate_game_command_for_protocol(game_command)
                 self._push_game_command(game_command)
                 self._emit_status(result, game_command)
 
@@ -359,9 +443,11 @@ class RealTimeDecoder:
                     window_end=window_end,
                 )
                 if online_label is not None:
-                    self._maybe_update_model(
+                    self._handle_online_label(
                         processed=processed,
-                        true_label=online_label.label_id,
+                        probabilities=probabilities,
+                        online_label=online_label,
+                        window_end=window_end,
                     )
                 
                 if hasattr(self, "_record") and self._record and hasattr(self, "_writer"):
@@ -370,7 +456,10 @@ class RealTimeDecoder:
                         window=window.astype(np.float32),
                         y_true=-1 if online_label is None else int(online_label.label_id),
                         y_pred=pred_class,
-                        confidence=float(result.confidence)
+                        confidence=float(result.confidence),
+                        raw_pred=raw_prediction,
+                        model_revision=model_revision,
+                        label_event_id="" if online_label is None else str(online_label.event_id),
                     )
             except Exception as exc:  # noqa: BLE001
                 LOGGER.exception("Realtime decoding failed")
@@ -379,6 +468,47 @@ class RealTimeDecoder:
             elapsed = time.perf_counter() - started_at
             sleep_time = max(0.0, self._step_sec - elapsed)
             self._sleep_with_heartbeat(sleep_time, None)
+
+    def _handle_online_label(
+        self,
+        *,
+        processed: np.ndarray,
+        probabilities: np.ndarray,
+        online_label: Any,
+        window_end: float,
+    ) -> None:
+        """Route one labeled window to the configured adaptation strategy."""
+
+        label_id = int(online_label.label_id)
+        if self._neuroonline_adapter is not None:
+            self._neuroonline_adapter.add_window(
+                processed,
+                label_id,
+                predicted_label=int(np.argmax(probabilities)),
+            )
+            status = self._neuroonline_adapter.status()
+            if status.get("training_in_background") and not self._neuroonline_training_notice:
+                self._neuroonline_training_notice = True
+                self._console.print(
+                    "[bold cyan]NeuroOnline 已在后台训练候选模型，实时预测继续使用当前模型[/bold cyan]"
+                )
+            return
+
+        if self._batch_adapter is not None:
+            event_id = str(
+                getattr(online_label, "event_id", "")
+                or f"label-{float(online_label.timestamp_monotonic):.6f}"
+            )
+            self._batch_adapter.add_window(
+                processed,
+                label_id,
+                event_id=event_id,
+                now=window_end,
+            )
+            self._report_batch_adaptation_status()
+            return
+
+        self._maybe_update_model(processed=processed, true_label=label_id)
 
     def _maybe_update_model(
         self,
@@ -397,12 +527,14 @@ class RealTimeDecoder:
         if not callable(update):
             return None
 
-        metrics = update(
-            processed[None, ...].astype(np.float32),
-            np.asarray([int(true_label)], dtype=np.int64),
-            learning_rate=self._online_update_learning_rate,
-            epochs=1,
-        )
+        model_lock = getattr(self, "_model_lock", None)
+        with model_lock if model_lock is not None else nullcontext():
+            metrics = update(
+                processed[None, ...].astype(np.float32),
+                np.asarray([int(true_label)], dtype=np.int64),
+                learning_rate=self._online_update_learning_rate,
+                epochs=1,
+            )
         updated = float(metrics.get("updated", 0.0)) if isinstance(metrics, dict) else 0.0
         if updated > 0:
             self._online_update_count += int(updated)
@@ -424,6 +556,120 @@ class RealTimeDecoder:
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("Failed to read online label: %s", exc)
             return None
+
+    def _predict_proba(self, X: np.ndarray, *, mc_dropout_passes: int) -> np.ndarray:
+        with self._model_lock:
+            return self._model.predict_proba(X, mc_dropout_passes=mc_dropout_passes)
+
+    def _predict_proba_with_revision(
+        self,
+        X: np.ndarray,
+        *,
+        mc_dropout_passes: int,
+    ) -> tuple[np.ndarray, int]:
+        with self._model_lock:
+            probabilities = self._model.predict_proba(X, mc_dropout_passes=mc_dropout_passes)
+            return probabilities, self._model_revision
+
+    def _clone_current_model(self) -> BaseModelAdapter:
+        with self._model_lock:
+            return copy.deepcopy(self._model)
+
+    def _run_neuroonline_update(
+        self,
+        original: np.ndarray,
+        time_masked: np.ndarray,
+        frequency_masked: np.ndarray,
+        labels: np.ndarray,
+    ) -> dict[str, Any]:
+        with self._model_lock:
+            if not isinstance(self._model, NeuroOnlineModelAdapter):
+                raise RuntimeError("NeuroOnline model adapter is not active")
+            candidate = copy.deepcopy(self._model)
+        result = candidate.neuroonline_update(
+            original,
+            time_masked,
+            frequency_masked,
+            labels,
+        )
+        with self._model_lock:
+            self._model = candidate
+            self._model_revision += 1
+            result["model_revision"] = self._model_revision
+        return result
+
+    def _on_neuroonline_update_complete(self, result: dict[str, Any]) -> None:
+        self._neuroonline_training_notice = False
+        if result.get("error"):
+            self._console.print(f"[bold red]NeuroOnline 后台更新失败[/bold red] {result['error']}")
+        else:
+            self._console.print(
+                "[bold green]NeuroOnline 候选模型已原子切换[/bold green] "
+                f"revision={int(result.get('model_revision', self._model_revision))} "
+                f"loss={float(result.get('loss', 0.0)):.4f}"
+            )
+        self._persist_online_adaptation_status()
+
+    def _save_current_model(self) -> None:
+        if self._model_save_path is None:
+            return
+        with self._model_lock:
+            self._model.save(self._model_save_path)
+
+    def _swap_model(self, candidate: BaseModelAdapter) -> None:
+        with self._model_lock:
+            self._model = candidate
+            self._model_revision += 1
+
+    def _persist_online_adaptation_status(self) -> None:
+        writer = getattr(self, "_writer", None)
+        if writer is None:
+            return
+        writer.update_manifest(
+            {
+                "model_revision": self._model_revision,
+                "online_adaptation": self._online_adaptation_status(),
+                "online_label_source": self._online_label_source_metadata(),
+            }
+        )
+
+    def _report_batch_adaptation_status(self) -> None:
+        if self._batch_adapter is None:
+            return
+        status = self._batch_adapter.status()
+        result = status.get("last_result")
+        if isinstance(result, dict):
+            result_key = (
+                result.get("cycle"),
+                result.get("accepted"),
+                result.get("error"),
+                result.get("model_version"),
+            )
+        else:
+            result_key = (str(result),)
+        notice_key = (status.get("state"),) + result_key
+        if notice_key == self._last_batch_notice:
+            return
+        self._last_batch_notice = notice_key
+
+        if status.get("state") == "training":
+            self._console.print("[bold cyan]10分钟数据已就绪，正在后台训练候选分类头[/bold cyan]")
+            return
+        if isinstance(result, dict) and result.get("accepted"):
+            self._console.print(
+                "[bold green]周期模型更新已接受[/bold green] "
+                f"v{result.get('model_version')} balanced_accuracy_gain="
+                f"{float(result.get('balanced_accuracy_gain', 0.0)):+.3f}"
+            )
+        elif isinstance(result, dict) and result.get("error"):
+            self._console.print(f"[bold red]周期模型更新失败[/bold red] {result['error']}")
+        elif isinstance(result, dict):
+            self._console.print(
+                "[bold yellow]候选模型未通过验证，继续使用旧模型[/bold yellow] "
+                f"balanced_accuracy_gain={float(result.get('balanced_accuracy_gain', 0.0)):+.3f}"
+            )
+        elif result:
+            self._console.print(f"[bold yellow]周期模型更新暂缓[/bold yellow] {result}")
 
     @staticmethod
     def _sleep_with_heartbeat(duration_sec: float, heartbeat: Callable[[], None] | None) -> None:
@@ -481,6 +727,17 @@ class RealTimeDecoder:
         if result.class_id == 1:
             return "RIGHT"
         return None
+
+    def _gate_game_command_for_protocol(self, command: str | None) -> str | None:
+        """Keep the car stopped outside an automatic cue protocol's control phase."""
+
+        source_status = self._online_label_source_status()
+        if not source_status or source_status.get("source") != "cued-protocol":
+            return command
+        phase = str(source_status.get("phase", "preparing"))
+        if phase == "done":
+            self._stop_event.set()
+        return command if phase == "control" else "STOP"
 
     def _push_game_command(self, command: str | None) -> None:
         if self._game_command_outlet is None:
@@ -549,9 +806,50 @@ class RealTimeDecoder:
             "last_transport_command": self._last_game_transport_command,
             "last_send_success": self._last_game_transport_error is None and self._last_game_transport_sent_at > 0.0,
             "last_send_error": self._last_game_transport_error,
+            "model_revision": getattr(self, "_model_revision", 0),
             "updated_at": time.time(),
         }
+        adaptation_status = self._online_adaptation_status()
+        if adaptation_status is not None:
+            payload["online_adaptation"] = adaptation_status
+        label_source_status = self._online_label_source_status()
+        if label_source_status is not None:
+            payload["online_label_source"] = label_source_status
         try:
             self._status_callback(payload)
         except Exception as exc:  # noqa: BLE001
             LOGGER.debug("Failed to publish realtime decoder status: %s", exc)
+
+    def _online_adaptation_status(self) -> dict[str, Any] | None:
+        neuroonline_adapter = getattr(self, "_neuroonline_adapter", None)
+        if neuroonline_adapter is not None:
+            return neuroonline_adapter.status()
+        batch_adapter = getattr(self, "_batch_adapter", None)
+        if batch_adapter is not None:
+            return batch_adapter.status()
+        return None
+
+    def _online_label_source_status(self) -> dict[str, Any] | None:
+        source = getattr(self, "_online_label_source", None)
+        status = getattr(source, "status", None)
+        if not callable(status):
+            return None
+        try:
+            payload = status()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("Failed to read online label source status: %s", exc)
+            return None
+        return dict(payload) if isinstance(payload, dict) else None
+
+    def _online_label_source_metadata(self) -> dict[str, Any] | None:
+        source = getattr(self, "_online_label_source", None)
+        metadata = getattr(source, "metadata", None)
+        if callable(metadata):
+            try:
+                payload = metadata()
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.debug("Failed to read online label source metadata: %s", exc)
+            else:
+                if isinstance(payload, dict):
+                    return dict(payload)
+        return self._online_label_source_status()

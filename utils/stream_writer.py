@@ -18,6 +18,9 @@ class RecordItem:
     y_true: int
     y_pred: int
     confidence: float
+    raw_pred: int = -1
+    model_revision: int = 0
+    label_event_id: str = ""
 
 
 class StreamWriter:
@@ -32,6 +35,7 @@ class StreamWriter:
         self._total_windows = 0
         self._chunk_count = 0
         self._files: list[str] = []
+        self._manifest_lock = threading.Lock()
 
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -40,8 +44,9 @@ class StreamWriter:
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._chunks_dir.mkdir(parents=True, exist_ok=True)
         
-        with open(self._output_dir / "manifest.json", "w", encoding="utf-8") as f:
-            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        with self._manifest_lock:
+            with open(self._output_dir / "manifest.json", "w", encoding="utf-8") as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
 
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._writer_loop, daemon=True)
@@ -59,8 +64,26 @@ class StreamWriter:
             self._thread.join()
             self._thread = None
             
-    def put(self, window: np.ndarray, y_true: int, y_pred: int, confidence: float) -> None:
-        item = RecordItem(window, y_true, y_pred, confidence)
+    def put(
+        self,
+        window: np.ndarray,
+        y_true: int,
+        y_pred: int,
+        confidence: float,
+        *,
+        raw_pred: int = -1,
+        model_revision: int = 0,
+        label_event_id: str = "",
+    ) -> None:
+        item = RecordItem(
+            window,
+            y_true,
+            y_pred,
+            confidence,
+            raw_pred,
+            model_revision,
+            label_event_id,
+        )
         try:
             self._queue.put_nowait(item)
         except queue.Full:
@@ -69,25 +92,25 @@ class StreamWriter:
 
     def update_manifest(self, extra: dict) -> None:
         manifest_path = self._output_dir / "manifest.json"
-        
-        try:
-            with open(manifest_path, "r", encoding="utf-8") as f:
-                metadata = json.load(f)
-        except FileNotFoundError:
-            metadata = {}
-            
-        metadata.update({
-            "chunk_size": self._chunk_size,
-            "chunk_count": self._chunk_count,
-            "total_windows": self._total_windows,
-            "dropped_records": self._dropped_records,
-            "files": self._files,
-            "end_time": time.time(),
-        })
-        metadata.update(extra)
-        
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        with self._manifest_lock:
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as f:
+                    metadata = json.load(f)
+            except FileNotFoundError:
+                metadata = {}
+
+            metadata.update({
+                "chunk_size": self._chunk_size,
+                "chunk_count": self._chunk_count,
+                "total_windows": self._total_windows,
+                "dropped_records": self._dropped_records,
+                "files": list(self._files),
+                "end_time": time.time(),
+            })
+            metadata.update(extra)
+
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
 
     def _writer_loop(self) -> None:
         buffer = []
@@ -119,6 +142,9 @@ class StreamWriter:
         y_trues = np.array([item.y_true for item in buffer])
         y_preds = np.array([item.y_pred for item in buffer])
         confidences = np.array([item.confidence for item in buffer])
+        raw_predictions = np.array([item.raw_pred for item in buffer], dtype=np.int64)
+        model_revisions = np.array([item.model_revision for item in buffer], dtype=np.int64)
+        label_event_ids = np.array([item.label_event_id for item in buffer], dtype=np.str_)
         
         chunk_name = f"chunk_{self._chunk_count:06d}.npz"
         chunk_path = self._chunks_dir / chunk_name
@@ -128,7 +154,10 @@ class StreamWriter:
             eeg_windows=windows,
             labels_true=y_trues,
             labels_pred=y_preds,
-            confidences=confidences
+            confidences=confidences,
+            predictions_raw=raw_predictions,
+            model_revisions=model_revisions,
+            label_event_ids=label_event_ids,
         )
         
         self._files.append(chunk_name)

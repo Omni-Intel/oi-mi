@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import random
 import sys
 import tempfile
@@ -460,16 +461,43 @@ class CliHelperTests(unittest.TestCase):
         self.assertIn("sdk quality only", table_html)
         self.assertIn("#15803D", table_html)
         self.assertIn("#6B7280", table_html)
+        self.assertEqual(
+            gui._format_send_state(
+                {"last_send_success": True, "updated_at": 100.0},
+                now=101.0,
+            ),
+            "success",
+        )
+        self.assertEqual(
+            gui._format_send_state(
+                {"last_send_success": True, "updated_at": 100.0},
+                now=104.1,
+            ),
+            "stale",
+        )
+        self.assertIn("新被试", gui._missing_model_guidance({"device_type": "neuracle"}))
+        self.assertIn("seed-dummy-decoders", gui._missing_model_guidance({"device_type": "dummy"}))
 
     def test_build_game_command_outlet_disabled_by_default(self) -> None:
         self.assertIsNone(build_game_command_outlet({"output": {}}))
 
     def test_build_game_command_outlet_enabled(self) -> None:
+        class FakeOutlet:
+            def __init__(self) -> None:
+                self.commands: list[str] = []
+
+            def push(self, command: str) -> None:
+                self.commands.append(command)
+
+        fake_outlet = FakeOutlet()
+
         class FakeRouter:
             def build_proxy(self, *, source: str):
-                return {"source": source}
+                self.source = source
+                return fake_outlet
 
-        with mock.patch("cli.get_shared_game_command_router", return_value=FakeRouter()):
+        fake_router = FakeRouter()
+        with mock.patch("cli.get_shared_game_command_router", return_value=fake_router):
             outlet = build_game_command_outlet(
                 {
                     "output": {
@@ -478,11 +506,42 @@ class CliHelperTests(unittest.TestCase):
                             "host": "127.0.0.1",
                             "port": 5005,
                             "timeout_sec": 0.5,
+                            "startup_command_delay_sec": 0.0,
+                            "startup_sequence": [
+                                {"command": "OPEN_LAUNCHER", "delay_after_sec": 0.0},
+                                {"command": "OPEN_3D_GAME", "delay_after_sec": 0.0},
+                                {"command": "LAUNCHER_SELECT", "delay_after_sec": 0.0},
+                            ],
                         }
                     }
                 }
             )
-        self.assertEqual(outlet, {"source": "decoder"})
+        self.assertIs(outlet, fake_outlet)
+        self.assertEqual(fake_router.source, "decoder")
+        self.assertEqual(
+            fake_outlet.commands,
+            ["OPEN_LAUNCHER", "OPEN_3D_GAME", "LAUNCHER_SELECT"],
+        )
+
+    def test_build_game_command_outlet_can_disable_startup_scene(self) -> None:
+        fake_outlet = mock.Mock()
+        fake_router = mock.Mock()
+        fake_router.build_proxy.return_value = fake_outlet
+
+        with mock.patch("cli.get_shared_game_command_router", return_value=fake_router):
+            outlet = build_game_command_outlet(
+                {
+                    "output": {
+                        "ar_game": {
+                            "enabled": True,
+                            "startup_sequence": [],
+                        }
+                    }
+                }
+            )
+
+        self.assertIs(outlet, fake_outlet)
+        fake_outlet.push.assert_not_called()
 
     def test_realtime_decoder_maps_predictions_to_game_commands(self) -> None:
         self.assertEqual(
@@ -550,6 +609,107 @@ class CliHelperTests(unittest.TestCase):
         decoder._push_game_command("RIGHT")
 
         self.assertEqual(decoder._game_command_outlet.commands, ["LEFT", "LEFT", "STOP", "RIGHT"])
+
+    def test_realtime_decoder_stop_sends_final_stop_and_closes_resources(self) -> None:
+        class FakeAcquirer:
+            def __init__(self) -> None:
+                self.stopped = False
+
+            def stop_stream(self) -> None:
+                self.stopped = True
+
+        class FakeSender:
+            def __init__(self) -> None:
+                self.commands: list[str] = []
+                self.closed = False
+
+            def push(self, command: str) -> None:
+                self.commands.append(command)
+
+            def close(self) -> None:
+                self.closed = True
+
+        decoder = RealTimeDecoder.__new__(RealTimeDecoder)
+        decoder._stop_event = threading.Event()
+        decoder._thread = None
+        decoder._acquirer = FakeAcquirer()
+        decoder._game_command_outlet = FakeSender()
+        decoder._batch_adapter = None
+        decoder._neuroonline_adapter = None
+        decoder._online_label_source = None
+
+        decoder.stop()
+
+        self.assertTrue(decoder._acquirer.stopped)
+        self.assertEqual(decoder._game_command_outlet.commands, ["STOP"])
+        self.assertTrue(decoder._game_command_outlet.closed)
+
+    def test_test_mode_without_windows_finalizes_writer_and_game(self) -> None:
+        class FakeAcquirer:
+            metadata = AcquirerMetadata(name="fake", sfreq=250.0, n_channels=4)
+
+            def __init__(self) -> None:
+                self.started = False
+                self.stopped = False
+
+            def start_stream(self) -> None:
+                self.started = True
+
+            def stop_stream(self) -> None:
+                self.stopped = True
+
+        class FakeSender:
+            def __init__(self) -> None:
+                self.commands: list[str] = []
+                self.closed = False
+
+            def push(self, command: str) -> None:
+                self.commands.append(command)
+
+            def close(self) -> None:
+                self.closed = True
+
+        class FakeConsole:
+            def print(self, *_args, **_kwargs) -> None:
+                return
+
+        class FakeMarker:
+            def send(self, _label: int, timestamp: float | None = None) -> None:
+                del timestamp
+
+        acquirer = FakeAcquirer()
+        sender = FakeSender()
+        decoder = RealTimeDecoder(
+            acquirer=acquirer,
+            model=object(),
+            console=FakeConsole(),
+            command_outlet=object(),
+            game_command_outlet=sender,
+            sfreq=250.0,
+            window_sec=2.0,
+            step_sec=0.5,
+            confidence_threshold=0.7,
+            mc_dropout_passes=1,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "empty-test"
+            with self.assertRaisesRegex(RuntimeError, "did not collect"):
+                decoder.run_test_mode(
+                    subject_id="test",
+                    marker_backend=FakeMarker(),
+                    duration_sec=0,
+                    initial_rest_sec=0.0,
+                    save_dir=output_dir,
+                )
+            manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(acquirer.started)
+        self.assertTrue(acquirer.stopped)
+        self.assertEqual(sender.commands, ["STOP"])
+        self.assertTrue(sender.closed)
+        self.assertEqual(manifest["status"], "no_windows")
+        self.assertIn("end_time", manifest)
 
     def test_realtime_decoder_status_callback_reports_command_state(self) -> None:
         payloads: list[dict] = []

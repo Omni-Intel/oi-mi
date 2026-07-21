@@ -13,7 +13,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from acquisition.base import ElectrodeImpedance
+from acquisition.base import AbstractAcquirer, ElectrodeImpedance
 from acquisition.factory import AcquirerFactory, register_default_acquirers
 from adaptation.calibrator import Calibrator
 from adaptation.mi_protocol import LABEL_DESCRIPTION, LABEL_DISPLAY, LABEL_SYMBOL, ProtocolConfig
@@ -31,6 +31,15 @@ from decoder.real_time_decoder import RealTimeDecoder, TEST_MODE_PROMPTS
 from game_command_router import get_shared_game_command_router
 from models.factory import ModelFactory
 from utils.markers import LSLCommandOutlet
+from utils.online_adaptation_dashboard import render_online_adaptation_panel, render_online_cue_panel
+from utils.online_labels import (
+    CuedOnlineLabelSource,
+    ManualLabelHttpServer,
+    ManualOnlineLabelSource,
+    OnlineLabelSource,
+    SimulatedOnlineLabelSource,
+    build_cued_online_label_source,
+)
 
 _GUI_ROOT = Path(__file__).resolve().parent
 _PAGE_ICON_FILENAME = "OMNI_ICON.svg"
@@ -120,10 +129,21 @@ def _update_ar_decoder_status(payload: dict) -> None:
         last_transport_command=payload.get("last_transport_command"),
         last_send_success=payload.get("last_send_success"),
         last_send_error=payload.get("last_send_error"),
+        online_adaptation=payload.get("online_adaptation"),
     )
 
 
-def _format_send_state(status: dict) -> str:
+def _format_send_state(
+    status: dict,
+    *,
+    now: float | None = None,
+    stale_after_sec: float = 3.0,
+) -> str:
+    updated_at = status.get("updated_at")
+    if updated_at is not None:
+        current_time = time.time() if now is None else float(now)
+        if current_time - float(updated_at) > max(float(stale_after_sec), 0.0):
+            return "stale"
     success = status.get("last_send_success")
     if success is True:
         return "success"
@@ -132,7 +152,21 @@ def _format_send_state(status: dict) -> str:
     return "-"
 
 
-def render_ar_forwarding_panel(config: dict) -> None:
+def _current_streamlit_context() -> object | None:
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+    except Exception:  # noqa: BLE001
+        return None
+    return get_script_run_ctx()
+
+
+def _missing_model_guidance(config: dict) -> str:
+    if bool(config.get("hardware_dummy_mode", False)) or str(config.get("device_type", "")) == "dummy":
+        return "请先执行校准，或运行 `oi-mi seed-dummy-decoders` 生成 dummy 测试权重。"
+    return "当前是真实设备模式，请先在“校准”页选择“新被试 (重新训练)”并完成正式校准。"
+
+
+def render_ar_forwarding_panel(config: dict, *, render_adaptation: bool = True) -> None:
     output_cfg = config.get("output", {})
     ar_game_cfg = output_cfg.get("ar_game", {})
     enabled = bool(ar_game_cfg.get("enabled", False))
@@ -144,6 +178,7 @@ def render_ar_forwarding_panel(config: dict) -> None:
     col2.metric("Mode", _ar_game_mode(ar_game_cfg))
     col3.metric("Target", _ar_game_target(ar_game_cfg))
     col4.metric("Last send", _format_send_state(status))
+    st.caption("Last send 仅表示最近一次 TCP 写入结果；stale 表示当前没有持续心跳，不能视为 Unity 仍在线。")
 
     pred_col, command_col, transport_col = st.columns(3)
     confidence = status.get("confidence")
@@ -156,8 +191,39 @@ def render_ar_forwarding_panel(config: dict) -> None:
     if error:
         st.warning(f"最近一次 AR 转发失败: {error}")
 
+    if render_adaptation:
+        _render_online_adaptation_panel(status.get("online_adaptation"))
+
     st.markdown("### 小车连接测试")
     st.caption("这些按钮只测试 AR/Unity 转发链路，不依赖 EEG、模型或实时解码。")
+    if st.button("启动/重置并进入小车", key="ar_test_open_car"):
+        if not enabled:
+            _set_ar_forward_status(
+                mapped_command="OPEN_3D_GAME + LAUNCHER_SELECT",
+                last_transport_command=None,
+                last_send_success=False,
+                last_send_error="output.ar_game.enabled is false.",
+            )
+            st.error("AR 游戏 TCP 控制未启用。请先在配置页启用后保存。")
+        else:
+            try:
+                build_game_command_outlet(config)
+            except Exception as exc:  # noqa: BLE001
+                _set_ar_forward_status(
+                    mapped_command="OPEN_3D_GAME + LAUNCHER_SELECT",
+                    last_transport_command="LAUNCHER_SELECT",
+                    last_send_success=False,
+                    last_send_error=str(exc),
+                )
+                st.error(f"小车启动失败: {exc}")
+            else:
+                _set_ar_forward_status(
+                    mapped_command="OPEN_3D_GAME + LAUNCHER_SELECT",
+                    last_transport_command="LAUNCHER_SELECT",
+                    last_send_success=True,
+                    last_send_error=None,
+                )
+                st.success("Unity 已启动并进入 Fixed Speed 小车模式。")
     cols = st.columns(len(_AR_TEST_COMMANDS))
     for column, command in zip(cols, _AR_TEST_COMMANDS, strict=True):
         if column.button(f"Send {command}", key=f"ar_test_{command}"):
@@ -981,6 +1047,7 @@ def run_calibration_session(config: dict, protocol: ProtocolConfig, *, is_new_fl
             / subject_id
             / "calibration",
             protocol_config=protocol,
+            online_adaptation_config=config.get("online_adaptation", {}),
         )
 
         if not is_new_flag:
@@ -1459,7 +1526,7 @@ def run_test_mode_session(config: dict, *, duration: int) -> None:
                 st.error(
                     f"未找到模型权重文件: "
                     f"{build_model_path(config, subject_id, model_name, device_name=str(config['device_type']))}。"
-                    "请先执行校准，或运行 `oi-mi seed-dummy-decoders` 生成 dummy 测试权重。"
+                    f"{_missing_model_guidance(config)}"
                 )
                 return
             if model_path.parent.name == "dummy_decoders":
@@ -1524,11 +1591,97 @@ def run_test_mode_session(config: dict, *, duration: int) -> None:
         st.error(f"执行失败: {exc}")
 
 
+def _render_online_adaptation_notice(adaptation_cfg: dict) -> None:
+    if not bool(adaptation_cfg.get("enabled", False)):
+        return
+    simulation_cfg = adaptation_cfg.get("simulation", {})
+    cued_cfg = adaptation_cfg.get("cued_labels", {})
+    if bool(simulation_cfg.get("enabled", False)):
+        source_text = "标签驱动 Dummy"
+    elif bool(cued_cfg.get("enabled", True)):
+        source_text = "自动 Cue 实验协议"
+    else:
+        source_text = "HTTP 真值标签"
+    if str(adaptation_cfg.get("strategy", "periodic_head")).lower() == "neuroonline":
+        neuro_cfg = adaptation_cfg.get("neuroonline", {})
+        st.info(
+            "NeuroOnline 已开启："
+            f"累计 {int(neuro_cfg.get('history_threshold', 320))} 个标签窗口后，"
+            f"每 {int(neuro_cfg.get('update_stride', 64))} 个样本全参数更新一次；"
+            f"当前标签源为 {source_text}。"
+        )
+        return
+    st.info(
+        f"周期模型更新已开启：每 {float(adaptation_cfg.get('update_interval_sec', 600)) / 60.0:.1f} 分钟检查一次，"
+        f"仅微调分类头；当前标签源为 {source_text}。"
+    )
+
+
+def _build_online_label_source(
+    config: dict,
+    adaptation_cfg: dict,
+    acquirer: AbstractAcquirer,
+) -> tuple[OnlineLabelSource | None, ManualLabelHttpServer | None]:
+    if not bool(adaptation_cfg.get("enabled", False)):
+        return None, None
+
+    simulation_cfg = adaptation_cfg.get("simulation", {})
+    if bool(simulation_cfg.get("enabled", False)) and str(acquirer.metadata.name) == "dummy":
+        st.info("在线适配使用标签驱动 Dummy 模拟被试。")
+        return (
+            SimulatedOnlineLabelSource(
+                acquirer,
+                trial_sec=float(simulation_cfg.get("trial_sec", 6.0)),
+                settle_sec=float(simulation_cfg.get("settle_sec", config["window_sec"])),
+                seed=int(adaptation_cfg.get("random_seed", 17)),
+            ),
+            None,
+        )
+
+    cued_cfg = adaptation_cfg.get("cued_labels", {})
+    if bool(cued_cfg.get("enabled", True)):
+        st.info("在线适配使用自动平衡 Cue，并仅接收完整落在 control 有效区间内的窗口。")
+        return build_cued_online_label_source(config), None
+
+    source = ManualOnlineLabelSource(default_ttl_sec=2.0)
+    server = ManualLabelHttpServer(source, host="127.0.0.1", port=8776)
+    server.start()
+    st.info("在线标签接口已启动: `http://127.0.0.1:8776/api/label`")
+    return source, server
+
+
 def render_realtime(config: dict) -> None:
     st.title("实时解码")
     st.markdown("开始后会持续显示模型输出。")
-    render_ar_forwarding_panel(config)
-    record = st.checkbox("保存实时脑波数据至本地记录")
+    render_ar_forwarding_panel(config, render_adaptation=False)
+    cue_panel = st.empty()
+    adaptation_panel = st.empty()
+    online_label_source: OnlineLabelSource | None = None
+
+    def redraw_cue_panel() -> None:
+        cue_panel.empty()
+        source_status = None
+        if isinstance(online_label_source, CuedOnlineLabelSource):
+            source_status = online_label_source.status()
+        with cue_panel.container():
+            render_online_cue_panel(source_status, ui=st)
+
+    def redraw_adaptation_panel() -> None:
+        adaptation_panel.empty()
+        with adaptation_panel.container():
+            render_online_adaptation_panel(
+                _get_ar_forward_status().get("online_adaptation"),
+                ui=st,
+            )
+
+    redraw_cue_panel()
+    redraw_adaptation_panel()
+    record = st.checkbox(
+        "保存实时脑波数据至本地记录",
+        value=bool(config.get("storage", {}).get("record_realtime_default", False)),
+    )
+    adaptation_cfg = config.get("online_adaptation", {})
+    _render_online_adaptation_notice(adaptation_cfg)
 
     if st.button("开始实时解码", type="primary"):
         try:
@@ -1539,7 +1692,17 @@ def render_realtime(config: dict) -> None:
                 config=config,
             )
             effective_n_channels = int(acquirer.metadata.n_channels)
-            console, refresh = init_live_view()
+            console, refresh_console = init_live_view()
+            last_dashboard_refresh = 0.0
+
+            def refresh() -> None:
+                nonlocal last_dashboard_refresh
+                refresh_console()
+                now = time.monotonic()
+                if now - last_dashboard_refresh >= 0.5:
+                    redraw_cue_panel()
+                    redraw_adaptation_panel()
+                    last_dashboard_refresh = now
             model = ModelFactory.get(
                 model_name,
                 n_chans=effective_n_channels,
@@ -1559,13 +1722,25 @@ def render_realtime(config: dict) -> None:
                 st.error(
                     f"未找到模型权重文件: "
                     f"{build_model_path(config, subject_id, model_name, device_name=str(config['device_type']))}。"
-                    "请先执行校准，或运行 `oi-mi seed-dummy-decoders` 生成 dummy 测试权重。"
+                    f"{_missing_model_guidance(config)}"
                 )
                 return
             if model_path.parent.name == "dummy_decoders":
                 st.info(f"使用内置 dummy 测试权重: `{model_path}`")
             model.load(model_path)
 
+            online_label_source, online_label_server = _build_online_label_source(
+                config,
+                adaptation_cfg,
+                acquirer,
+            )
+
+            primary_model_path = build_model_path(
+                config,
+                subject_id,
+                model_name,
+                device_name=str(config["device_type"]),
+            )
             decoder = RealTimeDecoder(
                 acquirer=acquirer,
                 model=model,
@@ -1581,17 +1756,26 @@ def render_realtime(config: dict) -> None:
                 confidence_threshold=float(config["confidence_threshold"]),
                 mc_dropout_passes=int(config["mc_dropout_passes"]),
                 status_callback=_update_ar_decoder_status,
+                thread_context=_current_streamlit_context(),
+                online_label_source=online_label_source,
+                model_save_path=primary_model_path,
+                batch_update_config=adaptation_cfg,
+                n_classes=int(config["n_classes"]),
             )
 
-            with st.spinner("实时解码运行中..."):
-                decoder.run_forever(
-                    subject_id=subject_id,
-                    record=record,
-                    save_dir=Path(str(config.get("storage", {}).get("records_dir", "records_storage")))
-                    / subject_id
-                    / "realtime",
-                    heartbeat=refresh,
-                )
+            try:
+                with st.spinner("实时解码运行中..."):
+                    decoder.run_forever(
+                        subject_id=subject_id,
+                        record=record,
+                        save_dir=Path(str(config.get("storage", {}).get("records_dir", "records_storage")))
+                        / subject_id
+                        / "realtime",
+                        heartbeat=refresh,
+                    )
+            finally:
+                if online_label_server is not None:
+                    online_label_server.close()
         except Exception as exc:  # noqa: BLE001
             st.warning(f"解码已停止: {exc}")
 

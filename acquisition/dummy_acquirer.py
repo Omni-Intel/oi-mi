@@ -36,6 +36,7 @@ class DummyAcquirer(AbstractAcquirer):
         beta_hz: float = 20.0,
         beta_uv: float = 3.5,
         chunk_ms: float = 20.0,
+        label_aware: bool = False,
     ) -> None:
         self.metadata = AcquirerMetadata(name="dummy", sfreq=float(sfreq), n_channels=int(n_channels))
         self._buffer_sec = float(buffer_sec)
@@ -48,6 +49,8 @@ class DummyAcquirer(AbstractAcquirer):
         self._beta_hz = float(beta_hz)
         self._beta_uv = float(beta_uv)
         self._chunk_ms = float(chunk_ms)
+        self._label_aware = bool(label_aware)
+        self._intent_label = 2
 
         self._lock = threading.Lock()
         self._running = False
@@ -62,6 +65,19 @@ class DummyAcquirer(AbstractAcquirer):
         self._phase = self._rng.random(int(n_channels)).astype(np.float64) * (2.0 * np.pi)
         self._channel_gain = (0.8 + 0.4 * self._rng.random(int(n_channels))).astype(np.float64)
         self._drift_state = np.zeros((int(n_channels),), dtype=np.float64)
+
+    @property
+    def label_aware(self) -> bool:
+        return self._label_aware
+
+    def set_intent(self, label: int) -> None:
+        """Select the synthetic left/right/idle pattern used by test simulations."""
+
+        normalized = int(label)
+        if normalized not in {0, 1, 2}:
+            raise ValueError(f"Unsupported dummy intent label: {label}")
+        with self._lock:
+            self._intent_label = normalized
 
     def start_stream(self) -> None:
         if self._running:
@@ -224,8 +240,28 @@ class DummyAcquirer(AbstractAcquirer):
 
     def _generate_block(self, n_samples: int, *, start_index: int, dt: float) -> np.ndarray:
         t = (np.arange(n_samples, dtype=np.float64) + float(start_index)) * dt
-        alpha = np.sin(2.0 * np.pi * self._alpha_hz * t[None, :] + self._phase[:, None])
-        beta = np.sin(2.0 * np.pi * self._beta_hz * t[None, :] + (self._phase[:, None] * 0.5))
+        with self._lock:
+            intent_label = self._intent_label
+
+        if self._label_aware:
+            alpha_hz = 8.0 + (2.0 * intent_label)
+            beta_hz = 18.0 + (1.5 * intent_label)
+            spatial_gain = np.ones((self.metadata.n_channels,), dtype=np.float64)
+            if intent_label == 0:
+                spatial_gain[0::2] = 1.45
+                spatial_gain[1::2] = 0.75
+            elif intent_label == 1:
+                spatial_gain[0::2] = 0.75
+                spatial_gain[1::2] = 1.45
+            else:
+                spatial_gain[:] = 0.65
+        else:
+            alpha_hz = self._alpha_hz
+            beta_hz = self._beta_hz
+            spatial_gain = np.ones((self.metadata.n_channels,), dtype=np.float64)
+
+        alpha = np.sin(2.0 * np.pi * alpha_hz * t[None, :] + self._phase[:, None])
+        beta = np.sin(2.0 * np.pi * beta_hz * t[None, :] + (self._phase[:, None] * 0.5))
 
         drift = self._rng.normal(0.0, self._drift_std, size=(self.metadata.n_channels, n_samples)).astype(np.float64)
         self._drift_state = (0.995 * self._drift_state) + drift.mean(axis=1)
@@ -233,7 +269,9 @@ class DummyAcquirer(AbstractAcquirer):
 
         noise = self._rng.normal(0.0, self._noise_std, size=(self.metadata.n_channels, n_samples)).astype(np.float64)
         signal = (
-            (self._alpha_uv * alpha + self._beta_uv * beta) * self._channel_gain[:, None]
+            (self._alpha_uv * alpha + self._beta_uv * beta)
+            * self._channel_gain[:, None]
+            * spatial_gain[:, None]
             + noise
             + drift_component
         )

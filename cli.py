@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import os
 import re
 import time
 from copy import deepcopy
@@ -27,7 +28,12 @@ from utils.markers import (
     NoOpMarkerBackend,
     TriggerBoxMarkerBackend,
 )
-from utils.online_labels import ManualLabelHttpServer, ManualOnlineLabelSource
+from utils.online_labels import (
+    ManualLabelHttpServer,
+    ManualOnlineLabelSource,
+    SimulatedOnlineLabelSource,
+    build_cued_online_label_source,
+)
 from utils.preprocessing import filter_and_transform
 from utils.unity_runtime import ensure_unity_game_running
 from web_command_server import start_web_command_server
@@ -98,6 +104,7 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
         "brainco_signal_source": "NORMAL",
         "brainco_device_id": "eeg-cap",
         "trigger_serial_port": "",
+        "dummy_label_aware": False,
     },
     "output": {
         "command_stream_name": "oi_mi_commands",
@@ -110,6 +117,12 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
             "auto_launch": True,
             "executable_path": "unity相关/ARPrototype3D-windows-x64/ARPrototype3D.exe",
             "startup_timeout_sec": 15.0,
+            "startup_command_delay_sec": 0.75,
+            "startup_sequence": [
+                {"command": "OPEN_LAUNCHER", "delay_after_sec": 0.5},
+                {"command": "OPEN_3D_GAME", "delay_after_sec": 1.0},
+                {"command": "LAUNCHER_SELECT", "delay_after_sec": 0.25},
+            ],
             "windowed": True,
             "window_width": 1280,
             "window_height": 720,
@@ -129,6 +142,52 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
     "storage": {
         "models_dir": "models_storage",
         "records_dir": "records_storage",
+        "record_realtime_default": True,
+    },
+    "online_adaptation": {
+        "enabled": False,
+        "strategy": "neuroonline",
+        "update_interval_sec": 600,
+        "train_scope": "head",
+        "learning_rate": 0.0001,
+        "epochs": 3,
+        "batch_size": 32,
+        "min_total_windows": 180,
+        "min_windows_per_class": 30,
+        "validation_ratio": 0.2,
+        "min_balanced_accuracy_gain": 0.02,
+        "max_class_accuracy_drop": 0.05,
+        "max_buffer_windows": 1800,
+        "keep_previous_versions": 5,
+        "random_seed": 17,
+        "save_update_dataset": True,
+        "neuroonline": {
+            "learning_rate": 1e-6,
+            "update_batch_size": 16,
+            "epochs": 3,
+            "update_stride": 64,
+            "history_threshold": 320,
+            "recent_samples": 320,
+            "weight_decay": 0.05,
+            "mask_ratio": 0.7,
+            "label_smoothing": 0.1,
+            "prompt_count": 32,
+            "random_seed": 42,
+            "offline_epochs": 50,
+            "offline_batch_size": 16,
+            "offline_learning_rate": 1e-4,
+        },
+        "simulation": {
+            "enabled": False,
+            "trial_sec": 6.0,
+            "settle_sec": 2.0,
+        },
+        "cued_labels": {
+            "enabled": True,
+            "trials_per_class": 32,
+            "start_delay_sec": 5.0,
+            "random_seed": 17,
+        },
     },
     "ssvep_game": {
         "rounds": 5,
@@ -507,7 +566,6 @@ def _interactive_menu(ctx: click.Context, app: AppContext) -> None:
                         default=float(ar_game_cfg.get("startup_timeout_sec", 15.0)),
                     )
                     ar_game_cfg["startup_timeout_sec"] = val
-                    
                 with app.config_path.open("w", encoding="utf-8") as f:
                     yaml.safe_dump(app.config, f, allow_unicode=True, sort_keys=False)
                 CONSOLE.print("[bold green]配置已更新！[/bold green]")
@@ -738,6 +796,8 @@ def build_acquirer(
         kwargs["eeg_gain"] = int(device_cfg.get("brainco_gain", 6))
         kwargs["signal_source"] = str(device_cfg.get("brainco_signal_source", "NORMAL"))
         kwargs["device_id"] = str(device_cfg.get("brainco_device_id", "eeg-cap"))
+    if device_name == "dummy":
+        kwargs["label_aware"] = bool(device_cfg.get("dummy_label_aware", False))
     return AcquirerFactory.create(device_name, **kwargs)
 
 
@@ -757,7 +817,48 @@ def build_game_command_outlet(config: dict[str, Any]) -> Any:
     if not bool(game_output_cfg.get("enabled", False)):
         return None
     ensure_unity_game_running(config, console=CONSOLE)
-    return get_shared_game_command_router(config).build_proxy(source="decoder")
+    outlet = get_shared_game_command_router(config).build_proxy(source="decoder")
+    startup_sequence = game_output_cfg.get("startup_sequence")
+    if startup_sequence is None:
+        startup_scene_command = str(
+            game_output_cfg.get("startup_scene_command", "OPEN_3D_GAME") or ""
+        ).strip().upper()
+        startup_mode_command = str(
+            game_output_cfg.get("startup_mode_command", "LAUNCHER_SELECT") or ""
+        ).strip().upper()
+        startup_sequence = [
+            {
+                "command": startup_scene_command,
+                "delay_after_sec": game_output_cfg.get("scene_load_delay_sec", 1.0),
+            },
+            {
+                "command": startup_mode_command,
+                "delay_after_sec": game_output_cfg.get("mode_load_delay_sec", 0.25),
+            },
+        ]
+
+    if startup_sequence:
+        startup_command_delay_sec = max(
+            float(game_output_cfg.get("startup_command_delay_sec", 0.75)),
+            0.0,
+        )
+        if startup_command_delay_sec > 0:
+            time.sleep(startup_command_delay_sec)
+        for step in startup_sequence:
+            if isinstance(step, str):
+                command = step.strip().upper()
+                delay_after_sec = 0.0
+            elif isinstance(step, dict):
+                command = str(step.get("command", "")).strip().upper()
+                delay_after_sec = max(float(step.get("delay_after_sec", 0.0)), 0.0)
+            else:
+                raise ValueError("Each output.ar_game.startup_sequence item must be a string or mapping.")
+            if not command:
+                continue
+            outlet.push(command)
+            if delay_after_sec > 0:
+                time.sleep(delay_after_sec)
+    return outlet
 
 
 def build_raw_game_transport(config: dict[str, Any]) -> Any:
@@ -886,6 +987,8 @@ def gui(app: AppContext) -> None:
         app.console.print("[bold red]未找到 gui.py 文件！[/bold red]")
         return
     app.console.print(f"[bold cyan]正在启动 GUI: streamlit run {gui_script}[/bold cyan]")
+    environment = os.environ.copy()
+    environment["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
     subprocess.run(
         [
             sys.executable,
@@ -893,10 +996,13 @@ def gui(app: AppContext) -> None:
             "streamlit",
             "run",
             str(gui_script),
+            "--browser.gatherUsageStats",
+            "false",
             "--",
             "--config",
             str(app.config_path),
-        ]
+        ],
+        env=environment,
     )
 
 @cli.command("list-models")
@@ -1095,6 +1201,7 @@ def calibrate(
         / subject_id
         / "calibration",
         protocol_config=ProtocolConfig.from_config(config),
+        online_adaptation_config=config.get("online_adaptation", {}),
     )
     if is_old:
         calibrator.load_existing_weights()
@@ -1150,8 +1257,8 @@ def calibrate(
 )
 @click.option(
     "--label-source",
-    type=click.Choice(["none", "manual-http"]),
-    default="none",
+    type=click.Choice(["auto", "none", "cued", "manual-http"]),
+    default="auto",
     show_default=True,
     help="Realtime true-label source for online updates during normal run.",
 )
@@ -1227,7 +1334,34 @@ def run(
     model.load(model_path)
     online_label_source = None
     online_label_server = None
-    if label_source == "manual-http" and not test_mode:
+    adaptation_cfg = config.get("online_adaptation", {})
+    simulation_cfg = adaptation_cfg.get("simulation", {})
+    cued_cfg = adaptation_cfg.get("cued_labels", {})
+    simulation_enabled = (
+        bool(adaptation_cfg.get("enabled", False))
+        and bool(simulation_cfg.get("enabled", False))
+        and effective_device_name(config, selected_device) == "dummy"
+        and not test_mode
+    )
+    if simulation_enabled:
+        online_label_source = SimulatedOnlineLabelSource(
+            acquirer,
+            trial_sec=float(simulation_cfg.get("trial_sec", 6.0)),
+            settle_sec=float(simulation_cfg.get("settle_sec", config["window_sec"])),
+            seed=int(adaptation_cfg.get("random_seed", 17)),
+        )
+        app.console.print("[bold cyan]已启动标签驱动 Dummy 模拟被试[/bold cyan]")
+    elif not test_mode and (
+        label_source == "cued"
+        or (
+            label_source == "auto"
+            and bool(adaptation_cfg.get("enabled", False))
+            and bool(cued_cfg.get("enabled", True))
+        )
+    ):
+        online_label_source = build_cued_online_label_source(config)
+        app.console.print("[bold cyan]已启动自动 cue 在线实验协议[/bold cyan]")
+    elif label_source == "manual-http" and not test_mode:
         online_label_source = ManualOnlineLabelSource(default_ttl_sec=label_ttl_sec)
         online_label_server = ManualLabelHttpServer(
             online_label_source,
@@ -1242,7 +1376,7 @@ def run(
 
     if online_update and not test_mode and online_label_source is None:
         app.console.print(
-            "[bold yellow]提示[/bold yellow] 普通实时 run 需要 --label-source manual-http 才有真标签更新。"
+            "[bold yellow]提示[/bold yellow] 普通实时 run 需要 cued 或 manual-http 标签源才可更新。"
         )
         online_update = False
     command_outlet = LSLCommandOutlet(
@@ -1272,6 +1406,8 @@ def run(
             device_name=selected_device,
         ),
         online_label_source=online_label_source,
+        batch_update_config=adaptation_cfg if not test_mode else None,
+        n_classes=int(config["n_classes"]),
     )
     if test_mode:
         marker_backend = build_marker_backend(config)

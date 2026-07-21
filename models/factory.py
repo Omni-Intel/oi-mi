@@ -58,10 +58,11 @@ class BaseModelAdapter(ABC):
         *,
         learning_rate: float,
         epochs: int = 1,
+        batch_size: int = 32,
     ) -> dict[str, float]:
         """Optionally update the decoder from newly labeled online windows."""
 
-        del X, y, learning_rate, epochs
+        del X, y, learning_rate, epochs, batch_size
         return {"updated": 0.0}
 
 
@@ -182,6 +183,7 @@ class TorchModelAdapter(BaseModelAdapter):
         *,
         learning_rate: float,
         epochs: int = 1,
+        batch_size: int = 32,
     ) -> dict[str, float]:
         """Run a small supervised online update on labeled realtime windows."""
 
@@ -189,8 +191,11 @@ class TorchModelAdapter(BaseModelAdapter):
             return {"updated": 0.0, "loss": 0.0}
 
         self._configure_trainable_layers(head_only=True)
-        inputs = torch.tensor(X, dtype=torch.float32, device=self._device)
-        targets = torch.tensor(y, dtype=torch.long, device=self._device)
+        dataset = TensorDataset(
+            torch.tensor(X, dtype=torch.float32),
+            torch.tensor(y, dtype=torch.long),
+        )
+        loader = DataLoader(dataset, batch_size=max(int(batch_size), 1), shuffle=True)
         optimizer = torch.optim.Adam(
             (parameter for parameter in self.model.parameters() if parameter.requires_grad),
             lr=learning_rate,
@@ -200,12 +205,19 @@ class TorchModelAdapter(BaseModelAdapter):
         last_loss = 0.0
         self.model.train()
         for _ in range(max(int(epochs), 1)):
-            optimizer.zero_grad()
-            logits = self.model(inputs)
-            loss = criterion(logits, targets)
-            loss.backward()
-            optimizer.step()
-            last_loss = float(loss.item())
+            total_loss = 0.0
+            batch_count = 0
+            for inputs, targets in loader:
+                inputs = inputs.to(self._device)
+                targets = targets.to(self._device)
+                optimizer.zero_grad()
+                logits = self.model(inputs)
+                loss = criterion(logits, targets)
+                loss.backward()
+                optimizer.step()
+                total_loss += float(loss.item())
+                batch_count += 1
+            last_loss = total_loss / max(batch_count, 1)
 
         return {"updated": float(X.shape[0]), "loss": last_loss}
 

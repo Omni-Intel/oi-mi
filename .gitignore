@@ -7,6 +7,7 @@ __pycache__/
 .ruff_cache/
 .coverage
 htmlcov/
+.streamlit.*.log
 
 # Virtual environments
 *venv*/

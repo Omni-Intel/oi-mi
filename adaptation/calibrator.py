@@ -25,8 +25,9 @@ from adaptation.mi_protocol import (
     SessionPlan,
     build_session_plan,
 )
+from adaptation.neuroonline import NeuroOnlineConfig, NeuroOnlineModelAdapter
 from adaptation.session_recorder import SessionRecorder
-from models.factory import BaseModelAdapter
+from models.factory import BaseModelAdapter, TorchModelAdapter
 from utils.markers import MarkerBackend, PROTOCOL_EVENT_CODES
 from utils.preprocessing import filter_and_transform
 
@@ -60,9 +61,20 @@ class Calibrator:
         model_path: Path,
         calibration_records_dir: Path | None = None,
         protocol_config: ProtocolConfig | None = None,
+        online_adaptation_config: dict | None = None,
     ) -> None:
         self._acquirer = acquirer
-        self._model = model
+        neuroonline_config = NeuroOnlineConfig.from_mapping(online_adaptation_config)
+        if neuroonline_config.enabled:
+            if not isinstance(model, TorchModelAdapter):
+                raise ValueError("NeuroOnline calibration requires a PyTorch decoder model.")
+            self._model = NeuroOnlineModelAdapter(
+                model,
+                config=neuroonline_config,
+                state_path=None,
+            )
+        else:
+            self._model = model
         self._marker_backend = marker_backend
         self._console = console
         self._sfreq = float(sfreq)

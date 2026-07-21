@@ -1,7 +1,7 @@
-subject_id: test
+subject_id: S001
 model_name: shallowconvnet
-device_type: dummy
-hardware_dummy_mode: true
+device_type: neuracle
+hardware_dummy_mode: false
 sfreq: 250
 n_classes: 3
 window_sec: 2.0
@@ -60,17 +60,26 @@ device:
   brainco_signal_source: NORMAL
   brainco_device_id: eeg-cap
   trigger_serial_port: ''
+  dummy_label_aware: false
 output:
   command_stream_name: oi_mi_commands
   command_stream_type: Markers
   ar_game:
-    enabled: false
+    enabled: true
     host: 127.0.0.1
     port: 5005
     timeout_sec: 1.0
     auto_launch: true
     executable_path: unity相关/ARPrototype3D-windows-x64/ARPrototype3D.exe
     startup_timeout_sec: 15.0
+    startup_command_delay_sec: 0.75
+    startup_sequence:
+    - command: OPEN_LAUNCHER
+      delay_after_sec: 0.5
+    - command: OPEN_3D_GAME
+      delay_after_sec: 1.0
+    - command: LAUNCHER_SELECT
+      delay_after_sec: 0.25
     windowed: true
     window_width: 1280
     window_height: 720
@@ -85,6 +94,48 @@ output:
 storage:
   models_dir: models_storage
   records_dir: records_storage
+  record_realtime_default: true
+online_adaptation:
+  enabled: true
+  strategy: neuroonline
+  update_interval_sec: 600
+  train_scope: head
+  learning_rate: 0.0001
+  epochs: 3
+  batch_size: 32
+  min_total_windows: 180
+  min_windows_per_class: 30
+  validation_ratio: 0.2
+  min_balanced_accuracy_gain: 0.02
+  max_class_accuracy_drop: 0.05
+  max_buffer_windows: 1800
+  keep_previous_versions: 5
+  random_seed: 17
+  save_update_dataset: true
+  neuroonline:
+    learning_rate: 1.0e-6
+    update_batch_size: 16
+    epochs: 3
+    update_stride: 64
+    history_threshold: 320
+    recent_samples: 320
+    weight_decay: 5.0e-2
+    mask_ratio: 0.7
+    label_smoothing: 0.1
+    prompt_count: 32
+    random_seed: 42
+    offline_epochs: 50
+    offline_batch_size: 16
+    offline_learning_rate: 1.0e-4
+  simulation:
+    enabled: false
+    trial_sec: 6.0
+    settle_sec: 2.0
+  cued_labels:
+    enabled: true
+    trials_per_class: 32
+    start_delay_sec: 5.0
+    random_seed: 17
 ssvep_game:
   rounds: 5
   keeper_save_probability: 0.35
