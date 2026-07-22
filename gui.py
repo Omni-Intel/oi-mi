@@ -1617,6 +1617,46 @@ def _render_online_adaptation_notice(adaptation_cfg: dict) -> None:
     )
 
 
+def _initial_online_adaptation_status(adaptation_cfg: dict) -> dict | None:
+    """Build a visible pre-run dashboard instead of leaving an empty placeholder."""
+
+    if not bool(adaptation_cfg.get("enabled", False)):
+        return None
+    strategy = str(adaptation_cfg.get("strategy", "periodic_head")).strip().lower()
+    if strategy == "neuroonline":
+        neuro_cfg = adaptation_cfg.get("neuroonline", {}) or {}
+        threshold = int(neuro_cfg.get("history_threshold", 320))
+        return {
+            "enabled": True,
+            "strategy": "neuroonline",
+            "state": "等待启动",
+            "update_count": 0,
+            "buffered_windows": 0,
+            "seen_labeled_windows": 0,
+            "samples_until_update": threshold,
+            "next_update_step": threshold,
+            "progress": 0.0,
+            "class_counts": {"0": 0, "1": 0, "2": 0},
+            "prequential": {
+                "balanced_accuracy": 0.0,
+                "per_class_accuracy": {"0": 0.0, "1": 0.0, "2": 0.0},
+                "confusion_matrix": [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+            },
+            "update_history": [],
+            "last_result": None,
+        }
+    return {
+        "enabled": True,
+        "strategy": strategy,
+        "state": "等待启动",
+        "model_version": 0,
+        "buffered_windows": 0,
+        "seconds_until_update": float(adaptation_cfg.get("update_interval_sec", 600)),
+        "class_counts": {"0": 0, "1": 0, "2": 0},
+        "last_result": None,
+    }
+
+
 def _build_online_label_source(
     config: dict,
     adaptation_cfg: dict,
@@ -1654,6 +1694,7 @@ def render_realtime(config: dict) -> None:
     st.title("实时解码")
     st.markdown("开始后会持续显示模型输出。")
     render_ar_forwarding_panel(config, render_adaptation=False)
+    adaptation_cfg = config.get("online_adaptation", {})
     cue_panel = st.empty()
     adaptation_panel = st.empty()
     online_label_source: OnlineLabelSource | None = None
@@ -1668,9 +1709,12 @@ def render_realtime(config: dict) -> None:
 
     def redraw_adaptation_panel() -> None:
         adaptation_panel.empty()
+        adaptation_status = _get_ar_forward_status().get("online_adaptation")
+        if not isinstance(adaptation_status, dict):
+            adaptation_status = _initial_online_adaptation_status(adaptation_cfg)
         with adaptation_panel.container():
             render_online_adaptation_panel(
-                _get_ar_forward_status().get("online_adaptation"),
+                adaptation_status,
                 ui=st,
             )
 
@@ -1680,7 +1724,6 @@ def render_realtime(config: dict) -> None:
         "保存实时脑波数据至本地记录",
         value=bool(config.get("storage", {}).get("record_realtime_default", False)),
     )
-    adaptation_cfg = config.get("online_adaptation", {})
     _render_online_adaptation_notice(adaptation_cfg)
 
     if st.button("开始实时解码", type="primary"):

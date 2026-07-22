@@ -755,6 +755,30 @@ class CliHelperTests(unittest.TestCase):
         self.assertEqual(decoder._online_update_count, 1)
         self.assertEqual(model.calls, [((1, 2, 500), [1], 0.001)])
 
+    def test_realtime_decoder_creates_model_directory_before_online_save(self) -> None:
+        class FakeModel:
+            def __init__(self) -> None:
+                self.saved_path: Path | None = None
+
+            def save(self, path: Path) -> None:
+                self.assert_parent(path)
+                self.saved_path = path
+
+            @staticmethod
+            def assert_parent(path: Path) -> None:
+                if not path.parent.is_dir():
+                    raise AssertionError("model parent directory was not created")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            decoder = RealTimeDecoder.__new__(RealTimeDecoder)
+            decoder._model = FakeModel()
+            decoder._model_lock = threading.RLock()
+            decoder._model_save_path = Path(tmp_dir) / "S001" / "dummy" / "shallowconvnet.pt"
+
+            decoder._save_current_model()
+
+            self.assertEqual(decoder._model.saved_path, decoder._model_save_path)
+
     def test_manual_online_label_source_overlaps_decode_window(self) -> None:
         source = ManualOnlineLabelSource(default_ttl_sec=1.0)
         event = source.set_label("right", timestamp_monotonic=10.0, payload={"target_lane": 1})

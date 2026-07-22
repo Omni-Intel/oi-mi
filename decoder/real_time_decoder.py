@@ -187,7 +187,8 @@ class RealTimeDecoder:
         self._game_disconnect_message = None
         if record and subject_id:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self._save_dir = save_dir or Path("records_storage") / subject_id / "realtime" / timestamp
+            realtime_root = save_dir or Path("records_storage") / subject_id / "realtime"
+            self._save_dir = realtime_root / timestamp
             self._writer = StreamWriter(self._save_dir)
             self._writer.start({
                 "subject_id": subject_id,
@@ -614,6 +615,7 @@ class RealTimeDecoder:
         if self._model_save_path is None:
             return
         with self._model_lock:
+            self._model_save_path.parent.mkdir(parents=True, exist_ok=True)
             self._model.save(self._model_save_path)
 
     def _swap_model(self, candidate: BaseModelAdapter) -> None:
