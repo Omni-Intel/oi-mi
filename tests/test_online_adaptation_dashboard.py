@@ -15,13 +15,15 @@ class _FakeColumn:
     def __exit__(self, *_args: object) -> None:
         return None
 
-    def metric(self, *_args: object, **_kwargs: object) -> None:
+    def metric(self, *args: object, **kwargs: object) -> None:
         self.owner.metrics += 1
+        self.owner.metric_calls.append((args, kwargs))
 
 
 class _FakeStreamlit:
     def __init__(self) -> None:
         self.metrics = 0
+        self.metric_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
         self.dataframes = 0
         self.line_charts = 0
         self.successes = 0
@@ -43,6 +45,24 @@ class _FakeStreamlit:
 
 
 class OnlineAdaptationDashboardTests(unittest.TestCase):
+    def test_continuous_cue_dashboard_uses_cumulative_trial(self) -> None:
+        fake = _FakeStreamlit()
+
+        dashboard.render_online_cue_panel(
+            {
+                "source": "cued-protocol",
+                "phase": "control",
+                "label_name": "left",
+                "phase_remaining_sec": 2.5,
+                "trial_number": 97,
+                "continuous": True,
+            },
+            ui=fake,
+        )
+
+        self.assertIn((("累计 Trial", 97), {}), fake.metric_calls)
+        self.assertFalse(any("轮" in str(args) for args, _ in fake.metric_calls))
+
     def test_neuroonline_dashboard_renders_diagnostics(self) -> None:
         adaptation = {
             "enabled": True,

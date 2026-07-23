@@ -30,6 +30,13 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(app.radio[0].value, "新被试 (重新训练)")
         self.assertIn("正式实验", {button.label for button in app.button})
 
+    def test_calibration_run_disables_return_button(self) -> None:
+        gui_path = Path(__file__).resolve().parents[1] / "gui.py"
+        source = gui_path.read_text(encoding="utf-8")
+
+        self.assertIn('render_experiment_return_button(disabled=is_running)', source)
+        self.assertIn('is_running = calibration_view == "run"', source)
+
 
 if __name__ == "__main__":
     unittest.main()

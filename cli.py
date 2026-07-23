@@ -166,7 +166,7 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
             "update_batch_size": 16,
             "epochs": 3,
             "update_stride": 64,
-            "history_threshold": 320,
+            "history_threshold": 64,
             "recent_samples": 320,
             "weight_decay": 0.05,
             "mask_ratio": 0.7,
@@ -184,7 +184,8 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
         },
         "cued_labels": {
             "enabled": True,
-            "trials_per_class": 32,
+            "continuous": True,
+            "balance_pool_per_class": 32,
             "start_delay_sec": 5.0,
             "random_seed": 17,
         },
@@ -1510,6 +1511,7 @@ def train_from_records(
         n_classes=int(config["n_classes"]),
         n_times=int(X.shape[2]),
     )
+    load_path: Path | None = None
     if head_only:
         load_path = resolve_model_path(
             config,
@@ -1521,6 +1523,25 @@ def train_from_records(
         )
         if not load_path.exists():
             raise click.ClickException(f"Model not found for head-only adaptation: {load_path}")
+
+    from adaptation.neuroonline import NeuroOnlineConfig, NeuroOnlineModelAdapter
+    from models.factory import TorchModelAdapter
+
+    neuroonline_config = NeuroOnlineConfig.from_mapping(config.get("online_adaptation", {}))
+    if neuroonline_config.enabled:
+        if not isinstance(model, TorchModelAdapter):
+            raise click.ClickException("NeuroOnline record recovery requires a PyTorch decoder model.")
+        model = NeuroOnlineModelAdapter(
+            model,
+            config=neuroonline_config,
+            state_path=load_path,
+        )
+        app.console.print(
+            "[bold cyan]NeuroOnline 记录恢复[/bold cyan] "
+            f"offline_epochs={neuroonline_config.offline_epochs}，将同时保存主模型与 CRM"
+        )
+
+    if load_path is not None:
         model.load(load_path)
 
     metrics = model.fit(
@@ -1541,6 +1562,8 @@ def train_from_records(
         f"[bold green]训练完成[/bold green] val_acc={metrics.get('val_acc', 0.0):.3f} "
         f"saved={model_path} labels=[{distribution}]"
     )
+    if neuroonline_config.enabled:
+        app.console.print(f"[bold green]CRM 已保存[/bold green] {model_path}.neuroonline.pt")
 
 
 @cli.command("replay-test-mode")

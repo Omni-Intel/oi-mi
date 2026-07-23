@@ -69,10 +69,10 @@ def suggested_commands():
     if system == "windows":
         return (
             "py -3.12 -m venv .venv",
-            "source .venv/Scripts/activate",
-            "python -m pip install -U pip setuptools wheel",
-            "pip install -e .",
-            "python tools/check_environment.py",
+            r".venv\Scripts\python.exe -m pip install -U pip setuptools wheel",
+            r".venv\Scripts\python.exe -m pip install -e .",
+            r".venv\Scripts\python.exe tools\check_environment.py",
+            r".venv\Scripts\python.exe cli.py gui",
         )
     return (
         "python3.12 -m venv .venv",

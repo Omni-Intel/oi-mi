@@ -163,6 +163,7 @@ class CuedOnlineLabelSource(OnlineLabelSource):
         control_start_offset_sec: float,
         control_stop_offset_sec: float,
         start_delay_sec: float = 5.0,
+        continuous: bool = False,
         clock: Any = time.monotonic,
     ) -> None:
         if not sequence:
@@ -180,6 +181,7 @@ class CuedOnlineLabelSource(OnlineLabelSource):
         )
         self._clock = clock
         self._started_at = float(clock()) + max(float(start_delay_sec), 0.0)
+        self._continuous = bool(continuous)
 
     def get_label(self, *, window_start: float, window_end: float) -> OnlineLabel | None:
         state = self.status(now=window_end)
@@ -210,15 +212,15 @@ class CuedOnlineLabelSource(OnlineLabelSource):
                 trial_index=0,
                 phase_remaining_sec=-elapsed,
             )
-        trial_index = int(elapsed // self._trial_sec)
-        if trial_index >= len(self._sequence):
+        absolute_trial_index = int(elapsed // self._trial_sec)
+        if not self._continuous and absolute_trial_index >= len(self._sequence):
             return self._status_payload(
                 phase="done",
                 trial_index=len(self._sequence),
                 phase_remaining_sec=0.0,
             )
 
-        trial_started = self._started_at + trial_index * self._trial_sec
+        trial_started = self._started_at + absolute_trial_index * self._trial_sec
         within_trial = timestamp - trial_started
         fixation_end = self._fixation_sec
         cue_end = fixation_end + self._cue_sec
@@ -238,16 +240,17 @@ class CuedOnlineLabelSource(OnlineLabelSource):
         control_started = trial_started + cue_end
         return self._status_payload(
             phase=phase,
-            trial_index=trial_index,
+            trial_index=absolute_trial_index,
             phase_remaining_sec=max(phase_end - within_trial, 0.0),
             valid_from_monotonic=control_started + self._valid_start_offset,
             valid_until_monotonic=control_started + self._valid_stop_offset,
         )
 
     def metadata(self) -> dict[str, Any]:
-        return {
+        payload = {
             "source": "cued-protocol",
-            "total_trials": len(self._sequence),
+            "balance_pool_trials": len(self._sequence),
+            "continuous": self._continuous,
             "sequence": [LABEL_ID_TO_NAME[label] for label in self._sequence],
             "timing_sec": {
                 "fixation": self._fixation_sec,
@@ -257,6 +260,9 @@ class CuedOnlineLabelSource(OnlineLabelSource):
             },
             "valid_control_range_sec": [self._valid_start_offset, self._valid_stop_offset],
         }
+        if not self._continuous:
+            payload["total_trials"] = len(self._sequence)
+        return payload
 
     def _status_payload(
         self,
@@ -267,20 +273,34 @@ class CuedOnlineLabelSource(OnlineLabelSource):
         valid_from_monotonic: float | None = None,
         valid_until_monotonic: float | None = None,
     ) -> dict[str, Any]:
-        active_index = min(trial_index, len(self._sequence) - 1)
+        active_index = (
+            trial_index % len(self._sequence)
+            if self._continuous
+            else min(trial_index, len(self._sequence) - 1)
+        )
         label_id = self._sequence[active_index]
-        return {
+        trial_number = (
+            0
+            if self._continuous and phase == "preparing"
+            else trial_index + 1
+            if self._continuous
+            else min(trial_index + 1, len(self._sequence))
+        )
+        payload = {
             "source": "cued-protocol",
             "phase": phase,
             "trial_index": trial_index,
-            "trial_number": min(trial_index + 1, len(self._sequence)),
-            "total_trials": len(self._sequence),
+            "trial_number": trial_number,
+            "continuous": self._continuous,
             "label_id": label_id,
             "label_name": LABEL_ID_TO_NAME[label_id],
             "phase_remaining_sec": float(phase_remaining_sec),
             "valid_from_monotonic": valid_from_monotonic,
             "valid_until_monotonic": valid_until_monotonic,
         }
+        if not self._continuous:
+            payload["total_trials"] = len(self._sequence)
+        return payload
 
 
 def build_cued_online_label_source(
@@ -295,9 +315,12 @@ def build_cued_online_label_source(
     protocol = ProtocolConfig.from_config(config)
     adaptation = config.get("online_adaptation", {}) or {}
     cue_config = adaptation.get("cued_labels", {}) or {}
-    trials_per_class = max(int(cue_config.get("trials_per_class", 32)), 1)
+    balance_pool_per_class = max(
+        int(cue_config.get("balance_pool_per_class", cue_config.get("trials_per_class", 32))),
+        1,
+    )
     sequence = generate_block_sequence(
-        {label: trials_per_class for label in LABEL_NAME_TO_ID},
+        {label: balance_pool_per_class for label in LABEL_NAME_TO_ID},
         rng=random.Random(int(cue_config.get("random_seed", adaptation.get("random_seed", 17)))),
     )
     timing = protocol.trial_timing
@@ -310,6 +333,7 @@ def build_cued_online_label_source(
         control_start_offset_sec=protocol.control_start_offset_sec,
         control_stop_offset_sec=protocol.control_stop_offset_sec,
         start_delay_sec=float(cue_config.get("start_delay_sec", 5.0)),
+        continuous=bool(cue_config.get("continuous", False)),
         clock=clock,
     )
 

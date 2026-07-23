@@ -217,18 +217,14 @@ def _describe_command(command: Sequence[str]) -> str:
 
 def _print_next_steps() -> None:
     if os.name == "nt":
-        activate = "source .venv/Scripts/activate"
+        gui_command = r".venv\Scripts\python.exe cli.py gui"
     else:
-        activate = "source .venv/bin/activate"
+        gui_command = ".venv/bin/python cli.py gui"
 
     print("")
     print("Setup complete.")
-    print("Next commands:")
-    print(f"  {activate}")
-    print("  streamlit run gui.py")
-    print("")
-    print("Alternative CLI entrypoint:")
-    print("  oi-mi gui")
+    print("Start the GUI with the virtual environment interpreter:")
+    print(f"  {gui_command}")
 
 
 if __name__ == "__main__":

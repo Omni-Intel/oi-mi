@@ -1,22 +1,63 @@
 # oi-mi
 
-## 新用户快速开始
+## 新设备快速开始（Windows）
 
-Windows Git Bash:
+项目要求 Python 3.12。每台新电脑都必须重新创建 `.venv`，不要复制其他电脑的虚拟环境。PowerShell 或 CMD 在仓库目录执行：
 
-```bash
-python setup_local.py
-source .venv/Scripts/activate
-streamlit run gui.py
+```powershell
+git pull origin main
+py -3.12 setup_local.py
+.\.venv\Scripts\python.exe tools\check_environment.py
+.\.venv\Scripts\python.exe cli.py gui
 ```
 
-`setup_local.py` 会查找 Python 3.12；Windows 上如果没有 3.12 且 `winget` 可用，会自动安装 Python 3.12。随后脚本会创建 `.venv`、安装 Python 依赖、下载 Unity Windows build，并把 Unity exe 安装到本地忽略目录：
+如果还没有 Python 3.12，先执行：
+
+```powershell
+winget install --id Python.Python.3.12 --exact --source winget --scope user
+```
+
+安装完成后关闭并重新打开终端，再运行上面的命令。不要在 PowerShell/CMD 中运行 `source`；也不要直接运行全局的 `streamlit run gui.py`，否则容易调用到缺少 `yaml`、PyTorch 等依赖的系统 Python。直接使用 `.venv\Scripts\python.exe` 不需要激活虚拟环境。
+
+`setup_local.py` 会创建 `.venv`、安装项目及 PyYAML 等全部依赖、下载 Unity Windows build，并把 Unity exe 安装到本地忽略目录：
 
 ```text
 unity相关/ARPrototype3D-windows-x64/ARPrototype3D.exe
 ```
 
 点击网页左侧的“实时解码”或启动 dummy 测试时，如果 Unity 没有打开，程序会自动以窗口模式启动这个 exe，并等待 `127.0.0.1:5005` 可连接后再继续；TCP 探活连接释放后，会执行 `output.ar_game.startup_sequence`：先回到 Hub，再进入小车场景并选择 Fixed Speed 驾驶模式。这个确定性序列保证 Unity 无论原来停在哪个页面，每次实验都从同一状态开始。实时解码运行期间关闭 Unity 窗口会让 AR TCP 连接断开，网页端实时解码也会停止。
+
+启动成功后浏览器进入 `http://localhost:8501`。实验期间保持启动终端开启，不要重复启动第二个 GUI。
+
+### 新设备第一次正式实验
+
+1. 在“设置”页确认被试 ID、`shallowconvnet`、真实设备类型和设备地址，然后保存。
+2. 在“连通检测”页确认 EEG 数据可读取；需要时再做“阻抗检查”。
+3. 没有预训练模型时，进入“校准”，选择“新被试 (重新训练)”并点击“正式实验”。
+4. 校准采集结束后不要返回、刷新或关闭页面；等待离线训练完成并明确显示模型保存路径。
+5. 模型和 CRM 应分别出现在 `models_storage/<被试>/<设备>/shallowconvnet.pt` 与 `shallowconvnet.pt.neuroonline.pt`。
+6. 先进入“测试模式”验证模型和小车链路，再进入“实时解码”开始连续 NeuroOnline 实验。
+
+真实实验前应确认 [config.yaml](./config.yaml) 中：
+
+```yaml
+hardware_dummy_mode: false
+online_adaptation:
+  enabled: true
+  strategy: neuroonline
+  simulation:
+    enabled: false
+  cued_labels:
+    enabled: true
+    continuous: true
+```
+
+如果 GUI 报 `No module named 'yaml'`，说明启动时用了系统 Python。回到仓库目录重新执行：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe cli.py gui
+```
 
 `oi-mi` 是一个面向 Motor Imagery 的生产级 Python CLI 工程骨架，目标是支持真实 EEG 采集、个体校准与在线解码。
 
@@ -61,25 +102,32 @@ oi-mi/
 
 完整跨平台安装说明见 [INSTALL.md](./INSTALL.md)。虚拟环境不要跨系统复用，也不要提交到仓库。
 
+Windows PowerShell / CMD（推荐，不需要激活环境）：
+
+```powershell
+py -3.12 setup_local.py
+.\.venv\Scripts\python.exe cli.py gui
+```
+
 Windows Git Bash：
 
 ```bash
 python setup_local.py
-source .venv/Scripts/activate
+.venv/Scripts/python.exe cli.py gui
 ```
 
 macOS / Linux：
 
 ```bash
 python3.12 setup_local.py
-source .venv/bin/activate
+.venv/bin/python cli.py gui
 ```
 
-安装后可直接使用：
+命令行操作也建议显式使用虚拟环境解释器，例如：
 
-```bash
-oi-mi list-models
-oi-mi list-devices
+```powershell
+.\.venv\Scripts\python.exe cli.py list-models
+.\.venv\Scripts\python.exe cli.py list-devices
 ```
 
 ## 命令示例
@@ -128,17 +176,17 @@ python download_datasets.py --dataset BNCI2014_001 --subject 1 --data-dir ./data
 - 在线解码：`decoder/real_time_decoder.py`
 - 命令输出：LSL command stream
 
-### NeuroOnline 论文复现模式
+### NeuroOnline 算法复现与小车在线应用
 
-`config.yaml` 中将 `online_adaptation.strategy` 设为 `neuroonline` 后，实时解码采用论文发布代码的运动想象配置：先预测当前窗口，再接收真值标签；累计 320 个有标签窗口后，每 64 个样本使用最近 320 个窗口更新一次。每个样本在进入缓冲区时生成固定的时间遮挡和频率遮挡视图，更新目标为三个视图的分类损失加两项表示一致性损失，并联合更新 backbone、CRM 和分类头。
+`config.yaml` 中将 `online_adaptation.strategy` 设为 `neuroonline` 后，实时解码采用严格的先预测、后更新流程。当前小车实验配置在累计 64 个有标签窗口后开始第一次更新，之后每新增 64 个有标签窗口更新一次；训练数据逐步增长到 320 个，此后始终使用最近 320 个窗口。每个样本在进入缓冲区时生成固定的时间遮挡和频率遮挡视图，更新目标为三个视图的分类损失加两项表示一致性损失，并联合更新 backbone、CRM 和分类头。
 
 该模式仅支持 PyTorch 模型，不支持 `riemann-mdm`。CRM 以恒等门控初始化；更新后的 backbone 保存到原模型文件，CRM 状态保存到同目录的 `<model>.neuroonline.pt` sidecar 文件。将策略改回 `periodic_head` 可继续使用原有的十分钟候选分类头更新流程。
 
-实时解码页面配套显示 NeuroOnline 遥测：首次 320 样本及后续 64 样本更新进度、缓冲区类别覆盖、prequential accuracy/balanced accuracy、逐类准确率、累计混淆矩阵，以及每轮总损失、分类损失、一致性损失、CRM gate 和更新耗时曲线。所有在线性能只使用“先预测、后更新”时产生的预测，不会用更新后的模型回算历史样本。
+实时解码页面配套显示 NeuroOnline 遥测：累计 Trial、累计有标签窗口、距离下一次 64 窗口触发的进度、缓冲区类别覆盖、prequential accuracy/balanced accuracy、逐类准确率、累计混淆矩阵，以及每次更新的总损失、分类损失、一致性损失、CRM gate 和耗时曲线。所有在线性能只使用“先预测、后更新”时产生的预测，不会用更新后的模型回算历史样本。
 
 在线更新在隔离的候选模型上后台执行，实时推理继续使用当前模型；候选训练完成后，在模型锁内一次性替换引用并递增 `model_revision`。每次成功更新都会保存主模型和 CRM sidecar。开启实时记录后，最终适配状态和完整更新历史写入 `manifest.json`，每个 chunk 额外保存原始 argmax 预测、阈值处理后的预测、模型 revision 和标签事件 ID。
 
-正式小车实验可启用 `online_adaptation.cued_labels`。GUI 会按项目协议自动显示 fixation、cue、control 和 ITI，并生成平衡的 LEFT/RIGHT/IDLE 序列；只有完整落在 control 有效区间内的解码窗口才会获得训练标签。真实设备实验需关闭 `online_adaptation.simulation.enabled`。如果关闭自动 cue，则继续使用 `http://127.0.0.1:8776/api/label` 接收外部标签。
+正式小车实验可启用 `online_adaptation.cued_labels`。GUI 按项目协议持续显示 fixation、cue、control 和 ITI；单个 trial 决定当前 LEFT/RIGHT/IDLE 真值以及标签有效时间，只有完整落在 control 有效区间内的解码窗口才会进入训练。连续模式没有“大轮完成”或固定 trial 停止点，GUI 只显示累计 Trial，NeuroOnline 只按累计有标签窗口触发。`balance_pool_per_class: 32` 仅用于内部生成可复现的类别平衡 Cue 池，不会清空缓存、重置计数或停止实验。运行持续到操作员切换页面、关闭 Unity 或停止 GUI。真实设备实验必须保持 `online_adaptation.simulation.enabled: false`。
 
 ## 各模式 EEG 保存逻辑
 
@@ -162,7 +210,7 @@ python download_datasets.py --dataset BNCI2014_001 --subject 1 --data-dir ./data
 默认配置：
 
 - 采样率：250 Hz
-- 窗长：4.0 s
+- 窗长：2.0 s
 - 步长：0.5 s
 - 三分类：左手 / 右手 / 静息
 

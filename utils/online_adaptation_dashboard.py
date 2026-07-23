@@ -32,12 +32,18 @@ def render_online_cue_panel(status: dict[str, Any] | None, *, ui: Any) -> None:
         prompt = "✓"
     else:
         prompt = "·"
-    ui.markdown("### 自动 Cue 实验")
+    ui.markdown("### 连续自动 Cue")
     columns = ui.columns(4)
     columns[0].metric("阶段", phase_text)
+    if bool(status.get("continuous", False)):
+        trial_label = "累计 Trial"
+        trial_text: str | int = int(status.get("trial_number", 0))
+    else:
+        trial_label = "Trial"
+        trial_text = f"{int(status.get('trial_number', 0))}/{int(status.get('total_trials', 0))}"
     columns[1].metric(
-        "Trial",
-        f"{int(status.get('trial_number', 0))}/{int(status.get('total_trials', 0))}",
+        trial_label,
+        trial_text,
     )
     columns[2].metric("目标", label_name.upper())
     columns[3].metric("剩余", f"{remaining:.1f}s")

@@ -11,6 +11,7 @@ import time
 import numpy as np
 import torch
 from torch import nn
+from click.testing import CliRunner
 
 from adaptation.neuroonline import (
     NeuroOnlineConfig,
@@ -18,6 +19,7 @@ from adaptation.neuroonline import (
     NeuroOnlineStreamAdapter,
 )
 from models.factory import TorchModelAdapter
+from cli import cli
 
 
 class _TinyDecoder(nn.Module):
@@ -118,6 +120,75 @@ class NeuroOnlineTests(unittest.TestCase):
         self.assertIsNotNone(wrapped._modulator)
         self.assertIn("val_kappa", metrics)
         self.assertGreaterEqual(metrics["val_acc"], 0.0)
+
+    def test_train_from_records_restores_neuroonline_main_and_crm_weights(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            records = root / "records" / "S001" / "calibration" / "20260722_120000"
+            records.mkdir(parents=True)
+            inputs = np.random.randn(12, 2, 500).astype(np.float32)
+            labels = np.tile(np.arange(3, dtype=np.int64), 4)
+            np.savez_compressed(
+                records / "training_windows_main.npz",
+                raw_windows=inputs,
+                processed_windows=inputs,
+                labels=labels,
+            )
+            config_path = root / "config.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "subject_id: S001",
+                        "model_name: shallowconvnet",
+                        "device_type: neuracle",
+                        "hardware_dummy_mode: false",
+                        "sfreq: 250",
+                        "n_classes: 3",
+                        "window_sec: 2.0",
+                        "step_sec: 0.5",
+                        "new_subject_epochs: 1",
+                        "old_subject_epochs: 1",
+                        "batch_size: 4",
+                        "learning_rate: 0.001",
+                        "early_stopping_patience: 1",
+                        "storage:",
+                        f"  models_dir: {str(root / 'models')!r}",
+                        f"  records_dir: {str(root / 'records')!r}",
+                        "online_adaptation:",
+                        "  enabled: true",
+                        "  strategy: neuroonline",
+                        "  neuroonline:",
+                        "    prompt_count: 4",
+                        "    offline_epochs: 1",
+                        "    offline_batch_size: 4",
+                        "    offline_learning_rate: 0.001",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            result = CliRunner().invoke(
+                cli,
+                [
+                    "--config",
+                    str(config_path),
+                    "train-from-records",
+                    "--subject",
+                    "S001",
+                    "--model",
+                    "shallowconvnet",
+                    "--device",
+                    "neuracle",
+                    "--session",
+                    "20260722_120000",
+                ],
+            )
+
+            self.assertEqual(result.exit_code, 0, f"{result.output}\n{result.exception!r}")
+            model_path = root / "models" / "S001" / "neuracle" / "shallowconvnet.pt"
+            self.assertTrue(model_path.exists())
+            self.assertTrue(Path(f"{model_path}.neuroonline.pt").exists())
+            self.assertIn("CRM 已保存", result.output)
 
     def test_stream_updates_at_threshold_then_stride(self) -> None:
         calls: list[int] = []

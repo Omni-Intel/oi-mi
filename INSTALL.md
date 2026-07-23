@@ -20,6 +20,19 @@ python tools/check_environment.py
 
 这个脚本只使用 Python 标准库，会检查 Python 版本、是否启用虚拟环境，以及主要运行依赖是否可被发现。
 
+## Windows PowerShell / CMD
+
+推荐直接使用虚拟环境中的 Python，不需要执行激活命令：
+
+```powershell
+cd D:\path\to\oi-mi
+py -3.12 setup_local.py
+.\.venv\Scripts\python.exe tools\check_environment.py
+.\.venv\Scripts\python.exe cli.py gui
+```
+
+不要在 PowerShell/CMD 中执行 `source`，也不要使用全局 `streamlit` 命令启动 GUI。
+
 ## Windows Git Bash
 
 直接执行 setup 脚本。脚本会查找 Python 3.12；Windows 上如果没有 3.12 且 `winget` 可用，会自动安装 Python 3.12：
@@ -27,8 +40,8 @@ python tools/check_environment.py
 ```bash
 cd /e/Omni/oi-mi
 python setup_local.py
-source .venv/Scripts/activate
-streamlit run gui.py
+.venv/Scripts/python.exe tools/check_environment.py
+.venv/Scripts/python.exe cli.py gui
 ```
 
 如果 `python` 命令不可用，可以尝试：

@@ -811,10 +811,10 @@ def enter_experiment_view() -> None:
     )
 
 
-def render_experiment_return_button() -> None:
+def render_experiment_return_button(*, disabled: bool = False) -> None:
     """Render the operator return button in experiment view."""
 
-    if st.button("≪", key="calibration_return_from_experiment"):
+    if st.button("≪", key="calibration_return_from_experiment", disabled=disabled):
         st.session_state.pop("calibration_experiment_view", None)
         st.session_state.pop("calibration_is_new", None)
         st.session_state.pop("calibration_after_guidance", None)
@@ -1429,7 +1429,10 @@ def render_calibration(config: dict) -> None:
     calibration_view = st.session_state.get("calibration_experiment_view")
     if calibration_view is not None:
         enter_experiment_view()
-        render_experiment_return_button()
+        is_running = calibration_view == "run"
+        render_experiment_return_button(disabled=is_running)
+        if is_running:
+            st.warning("正式采集及离线训练完成前不可返回。请勿刷新或关闭页面，直到显示模型保存路径。")
         if calibration_view == "guidance":
             render_calibration_guidance()
         elif calibration_view == "practice":
@@ -1599,7 +1602,7 @@ def _render_online_adaptation_notice(adaptation_cfg: dict) -> None:
     if bool(simulation_cfg.get("enabled", False)):
         source_text = "标签驱动 Dummy"
     elif bool(cued_cfg.get("enabled", True)):
-        source_text = "自动 Cue 实验协议"
+        source_text = "连续自动 Cue"
     else:
         source_text = "HTTP 真值标签"
     if str(adaptation_cfg.get("strategy", "periodic_head")).lower() == "neuroonline":

@@ -64,13 +64,13 @@ class Calibrator:
         online_adaptation_config: dict | None = None,
     ) -> None:
         self._acquirer = acquirer
-        neuroonline_config = NeuroOnlineConfig.from_mapping(online_adaptation_config)
-        if neuroonline_config.enabled:
+        self._neuroonline_config = NeuroOnlineConfig.from_mapping(online_adaptation_config)
+        if self._neuroonline_config.enabled:
             if not isinstance(model, TorchModelAdapter):
                 raise ValueError("NeuroOnline calibration requires a PyTorch decoder model.")
             self._model = NeuroOnlineModelAdapter(
                 model,
-                config=neuroonline_config,
+                config=self._neuroonline_config,
                 state_path=None,
             )
         else:
@@ -109,6 +109,12 @@ class Calibrator:
             heartbeat=heartbeat,
         )
         self._console.print("[bold cyan]采集完成，正在保存和训练，请等待工作人员[/bold cyan]")
+        if self._neuroonline_config.enabled:
+            self._console.print(
+                "[bold yellow]正在执行 NeuroOnline 离线训练 "
+                f"({self._neuroonline_config.offline_epochs} epochs)。"
+                "在出现“校准完成”和模型保存路径前，请勿返回、刷新或关闭页面。[/bold yellow]"
+            )
         if heartbeat is not None:
             heartbeat()
         metrics = self._model.fit(

@@ -117,7 +117,7 @@ online_adaptation:
     update_batch_size: 16
     epochs: 3
     update_stride: 64
-    history_threshold: 320
+    history_threshold: 64
     recent_samples: 320
     weight_decay: 5.0e-2
     mask_ratio: 0.7
@@ -133,7 +133,8 @@ online_adaptation:
     settle_sec: 2.0
   cued_labels:
     enabled: true
-    trials_per_class: 32
+    continuous: true
+    balance_pool_per_class: 32
     start_delay_sec: 5.0
     random_seed: 17
 ssvep_game:
