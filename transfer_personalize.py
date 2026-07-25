@@ -142,7 +142,7 @@ def train_and_predict(
 @click.option("--target-subject", required=True)
 @click.option("--test-chunk", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
 @click.option("--model", "model_name", type=str, default="eegnet", show_default=True)
-@click.option("--sfreq", type=float, default=250.0, show_default=True)
+@click.option("--sfreq", type=float, default=200.0, show_default=True)
 @click.option("--threshold", type=float, default=0.5, show_default=True)
 @click.option("--smooth", "smooth_sizes", type=int, multiple=True, default=(1, 3, 5))
 @click.option("--min-windows", type=int, default=60, show_default=True)

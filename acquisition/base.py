@@ -20,6 +20,7 @@ class AcquirerMetadata:
     name: str
     sfreq: float
     n_channels: int
+    timestamp_domain: str = "relative"
 
 
 @dataclass(slots=True)

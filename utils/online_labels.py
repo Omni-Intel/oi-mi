@@ -150,157 +150,182 @@ class SimulatedOnlineLabelSource(OnlineLabelSource):
 
 
 class CuedOnlineLabelSource(OnlineLabelSource):
-    """Generate a balanced realtime cue protocol with strict control-window labels."""
+    """Generate scene-truth labels for the continuously controlled car task."""
 
     def __init__(
         self,
         sequence: list[str | int],
         *,
-        fixation_sec: float,
-        cue_sec: float,
-        control_sec: float,
-        iti_sec: float,
-        control_start_offset_sec: float,
-        control_stop_offset_sec: float,
+        scene_duration_sec: float,
         start_delay_sec: float = 5.0,
-        continuous: bool = False,
+        boundary_guard_sec: float = 0.5,
         clock: Any = time.monotonic,
     ) -> None:
         if not sequence:
-            raise ValueError("Cued online protocol requires at least one trial.")
+            raise ValueError("Car scene protocol requires at least one scene.")
         self._sequence = tuple(coerce_label(label)[0] for label in sequence)
-        self._fixation_sec = max(float(fixation_sec), 0.0)
-        self._cue_sec = max(float(cue_sec), 0.0)
-        self._control_sec = max(float(control_sec), 0.1)
-        self._iti_sec = max(float(iti_sec), 0.0)
-        self._trial_sec = self._fixation_sec + self._cue_sec + self._control_sec + self._iti_sec
-        self._valid_start_offset = min(max(float(control_start_offset_sec), 0.0), self._control_sec)
-        self._valid_stop_offset = min(
-            max(float(control_stop_offset_sec), self._valid_start_offset),
-            self._control_sec,
+        self._scene_duration_sec = max(float(scene_duration_sec), 0.1)
+        self._boundary_guard_sec = min(
+            max(float(boundary_guard_sec), 0.0),
+            self._scene_duration_sec / 2.0,
         )
         self._clock = clock
         self._started_at = float(clock()) + max(float(start_delay_sec), 0.0)
-        self._continuous = bool(continuous)
+        self._lock = threading.RLock()
+        self._scene_index = 0
+        self._scene_started_at = self._started_at
+        self._confirmed_scene_index = -1
+        self._last_transition_reason = "start"
+        self._failed_scenes = 0
+        self._active_scene_failed = False
+        self._last_failed_scene_index = -1
 
     def get_label(self, *, window_start: float, window_end: float) -> OnlineLabel | None:
         state = self.status(now=window_end)
-        if state["phase"] != "control":
+        if state["phase"] != "control" or not bool(state["scene_confirmed"]):
             return None
-        valid_from = float(state["valid_from_monotonic"])
-        valid_until = float(state["valid_until_monotonic"])
+        valid_from = (
+            float(state["valid_from_monotonic"]) + self._boundary_guard_sec
+        )
+        valid_until = (
+            float(state["valid_until_monotonic"]) - self._boundary_guard_sec
+        )
         if float(window_start) < valid_from or float(window_end) > valid_until:
             return None
         label_id = int(state["label_id"])
-        trial_index = int(state["trial_index"])
+        scene_index = int(state["scene_index"])
         return OnlineLabel(
             label_id=label_id,
             label_name=LABEL_ID_TO_NAME[label_id],
             timestamp_monotonic=valid_from,
             expires_at_monotonic=valid_until,
-            event_id=f"cue-{trial_index:06d}",
+            event_id=f"scene-{scene_index:06d}",
             source="cued-protocol",
-            payload={"trial_index": trial_index, "phase": "control"},
+            payload={"scene_index": scene_index},
         )
 
     def status(self, *, now: float | None = None) -> dict[str, Any]:
         timestamp = float(self._clock()) if now is None else float(now)
-        elapsed = timestamp - self._started_at
-        if elapsed < 0:
+        with self._lock:
+            if timestamp < self._started_at:
+                return self._status_payload(
+                    phase="preparing",
+                    scene_index=0,
+                    phase_remaining_sec=self._started_at - timestamp,
+                )
+            self._advance_timeouts_locked(timestamp)
+            scene_started = self._scene_started_at
             return self._status_payload(
-                phase="preparing",
-                trial_index=0,
-                phase_remaining_sec=-elapsed,
-            )
-        absolute_trial_index = int(elapsed // self._trial_sec)
-        if not self._continuous and absolute_trial_index >= len(self._sequence):
-            return self._status_payload(
-                phase="done",
-                trial_index=len(self._sequence),
-                phase_remaining_sec=0.0,
+                phase="control",
+                scene_index=self._scene_index,
+                phase_remaining_sec=max(
+                    self._scene_duration_sec - max(timestamp - scene_started, 0.0),
+                    0.0,
+                ),
+                valid_from_monotonic=scene_started,
+                valid_until_monotonic=scene_started + self._scene_duration_sec,
             )
 
-        trial_started = self._started_at + absolute_trial_index * self._trial_sec
-        within_trial = timestamp - trial_started
-        fixation_end = self._fixation_sec
-        cue_end = fixation_end + self._cue_sec
-        control_end = cue_end + self._control_sec
-        if within_trial < fixation_end:
-            phase = "fixation"
-            phase_end = fixation_end
-        elif within_trial < cue_end:
-            phase = "cue"
-            phase_end = cue_end
-        elif within_trial < control_end:
-            phase = "control"
-            phase_end = control_end
-        else:
-            phase = "iti"
-            phase_end = self._trial_sec
-        control_started = trial_started + cue_end
-        return self._status_payload(
-            phase=phase,
-            trial_index=absolute_trial_index,
-            phase_remaining_sec=max(phase_end - within_trial, 0.0),
-            valid_from_monotonic=control_started + self._valid_start_offset,
-            valid_until_monotonic=control_started + self._valid_stop_offset,
+    def mark_scene_failed(
+        self,
+        *,
+        timestamp_monotonic: float | None = None,
+        expected_scene_index: int | None = None,
+    ) -> bool:
+        """Record a collision without changing the fixed-duration scene clock."""
+
+        timestamp = (
+            float(self._clock())
+            if timestamp_monotonic is None
+            else float(timestamp_monotonic)
         )
+        with self._lock:
+            if timestamp < self._started_at:
+                return False
+            if (
+                expected_scene_index is not None
+                and int(expected_scene_index) != self._scene_index
+            ):
+                return False
+            if self._active_scene_failed:
+                return False
+            self._active_scene_failed = True
+            self._last_failed_scene_index = self._scene_index
+            self._failed_scenes += 1
+            return True
+
+    def confirm_scene_applied(
+        self,
+        *,
+        scene_index: int,
+        timestamp_monotonic: float | None = None,
+    ) -> bool:
+        """Anchor a scene to the time Unity confirms its layout was applied."""
+
+        timestamp = (
+            float(self._clock())
+            if timestamp_monotonic is None
+            else float(timestamp_monotonic)
+        )
+        with self._lock:
+            if int(scene_index) != self._scene_index:
+                return False
+            if timestamp >= self._scene_started_at + self._scene_duration_sec:
+                return False
+            self._scene_started_at = max(self._scene_started_at, timestamp)
+            self._confirmed_scene_index = self._scene_index
+            return True
 
     def metadata(self) -> dict[str, Any]:
-        payload = {
+        return {
             "source": "cued-protocol",
-            "balance_pool_trials": len(self._sequence),
-            "continuous": self._continuous,
+            "protocol_mode": "continuous-scene",
+            "balance_pool_scenes": len(self._sequence),
             "sequence": [LABEL_ID_TO_NAME[label] for label in self._sequence],
-            "timing_sec": {
-                "fixation": self._fixation_sec,
-                "cue": self._cue_sec,
-                "control": self._control_sec,
-                "iti": self._iti_sec,
-            },
-            "valid_control_range_sec": [self._valid_start_offset, self._valid_stop_offset],
+            "scene_duration_sec": self._scene_duration_sec,
+            "boundary_guard_sec": self._boundary_guard_sec,
+            "confirmed_scene_index": self._confirmed_scene_index,
+            "failed_scenes": self._failed_scenes,
+            "active_scene_failed": self._active_scene_failed,
+            "last_failed_scene_index": self._last_failed_scene_index,
+            "last_transition_reason": self._last_transition_reason,
         }
-        if not self._continuous:
-            payload["total_trials"] = len(self._sequence)
-        return payload
+
+    def _advance_timeouts_locked(self, timestamp: float) -> None:
+        elapsed = timestamp - self._scene_started_at
+        timeout_count = int(elapsed // self._scene_duration_sec)
+        if timeout_count > 0:
+            self._scene_started_at += timeout_count * self._scene_duration_sec
+            self._scene_index += timeout_count
+            self._confirmed_scene_index = -1
+            self._active_scene_failed = False
+            self._last_transition_reason = "timeout"
 
     def _status_payload(
         self,
         *,
         phase: str,
-        trial_index: int,
+        scene_index: int,
         phase_remaining_sec: float,
         valid_from_monotonic: float | None = None,
         valid_until_monotonic: float | None = None,
     ) -> dict[str, Any]:
-        active_index = (
-            trial_index % len(self._sequence)
-            if self._continuous
-            else min(trial_index, len(self._sequence) - 1)
-        )
+        active_index = scene_index % len(self._sequence)
         label_id = self._sequence[active_index]
-        trial_number = (
-            0
-            if self._continuous and phase == "preparing"
-            else trial_index + 1
-            if self._continuous
-            else min(trial_index + 1, len(self._sequence))
-        )
-        payload = {
+        return {
             "source": "cued-protocol",
+            "protocol_mode": "continuous-scene",
             "phase": phase,
-            "trial_index": trial_index,
-            "trial_number": trial_number,
-            "continuous": self._continuous,
+            "scene_index": scene_index,
+            "scene_number": 0 if phase == "preparing" else scene_index + 1,
             "label_id": label_id,
             "label_name": LABEL_ID_TO_NAME[label_id],
             "phase_remaining_sec": float(phase_remaining_sec),
+            "scene_confirmed": scene_index == self._confirmed_scene_index,
+            "scene_failed": self._active_scene_failed,
             "valid_from_monotonic": valid_from_monotonic,
             "valid_until_monotonic": valid_until_monotonic,
         }
-        if not self._continuous:
-            payload["total_trials"] = len(self._sequence)
-        return payload
 
 
 def build_cued_online_label_source(
@@ -310,9 +335,8 @@ def build_cued_online_label_source(
 ) -> CuedOnlineLabelSource:
     """Build the car experiment's balanced cue source from the project config."""
 
-    from adaptation.mi_protocol import ProtocolConfig, generate_block_sequence
+    from adaptation.mi_protocol import generate_block_sequence
 
-    protocol = ProtocolConfig.from_config(config)
     adaptation = config.get("online_adaptation", {}) or {}
     cue_config = adaptation.get("cued_labels", {}) or {}
     balance_pool_per_class = max(
@@ -323,17 +347,14 @@ def build_cued_online_label_source(
         {label: balance_pool_per_class for label in LABEL_NAME_TO_ID},
         rng=random.Random(int(cue_config.get("random_seed", adaptation.get("random_seed", 17)))),
     )
-    timing = protocol.trial_timing
+    timing = config.get("protocol", {}).get("trial_timing", {}) or {}
     return CuedOnlineLabelSource(
         sequence,
-        fixation_sec=timing.fixation_sec,
-        cue_sec=timing.cue_sec,
-        control_sec=timing.control_sec,
-        iti_sec=timing.iti_sec,
-        control_start_offset_sec=protocol.control_start_offset_sec,
-        control_stop_offset_sec=protocol.control_stop_offset_sec,
         start_delay_sec=float(cue_config.get("start_delay_sec", 5.0)),
-        continuous=bool(cue_config.get("continuous", False)),
+        scene_duration_sec=float(
+            cue_config.get("scene_duration_sec", timing.get("control_sec", 5.0))
+        ),
+        boundary_guard_sec=float(cue_config.get("boundary_guard_sec", 0.5)),
         clock=clock,
     )
 

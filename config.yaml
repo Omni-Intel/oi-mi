@@ -2,19 +2,16 @@ subject_id: S001
 model_name: shallowconvnet
 device_type: neuracle
 hardware_dummy_mode: false
-sfreq: 250
+sfreq: 200
 n_classes: 3
 window_sec: 2.0
 step_sec: 0.5
 confidence_threshold: 0.7
 mc_dropout_passes: 8
-new_subject_duration_sec: 1800
-old_subject_duration_sec: 300
-new_subject_epochs: 50
-old_subject_epochs: 5
+calibration_epochs: 50
 batch_size: 32
 learning_rate: 0.001
-early_stopping_patience: 40
+early_stopping_patience: 6
 collect_block_sec: 10
 buffer_sec: 60
 protocol:
@@ -39,19 +36,25 @@ protocol:
     cue_sec: 1.0
     control_sec: 5.0
     iti_sec: 2.0
-  new_subject_blocks: 6
-  new_subject_trials_per_class_per_block: 8
-  old_subject_baseline_sec: 60.0
-  old_subject_trials_per_class: 8
-  rest_between_blocks_sec: 35.0
-  extra_rest_sec: 60.0
-  dynamic_total_minutes_hint: 30.0
+  calibration_blocks: 4
+  calibration_trials_per_class_per_block: 5
+  rest_between_blocks_sec: 20.0
   random_seed: 17
 device:
   neuracle_host: 127.0.0.1
   neuracle_port: 8712
+  # Neuracle/JellyFish hardware forwards at 250 Hz. Model-facing windows are
+  # anti-aliased and resampled to the global 200 Hz rate by the acquirer.
+  neuracle_source_sfreq: 250
+  # Measured fixed delay from amplifier sample time to JellyFish forwarding.
+  # Keep 0 until a trigger/loopback measurement is available.
+  neuracle_transport_delay_sec: 0.0
+  neuracle_eeg_channels: 59
   brainco_addr: ''
   brainco_port: 0
+  # BrainCo hardware acquires at 250 Hz; the acquirer resamples model windows
+  # to the global 200 Hz rate before preprocessing and decoding.
+  brainco_source_sfreq: 250
   brainco_auto_discover: true
   brainco_scan_timeout_sec: 6.0
   brainco_ready_timeout_sec: 20.0
@@ -74,12 +77,8 @@ output:
     startup_timeout_sec: 15.0
     startup_command_delay_sec: 0.75
     startup_sequence:
-    - command: OPEN_LAUNCHER
-      delay_after_sec: 0.5
     - command: OPEN_3D_GAME
-      delay_after_sec: 1.0
-    - command: LAUNCHER_SELECT
-      delay_after_sec: 0.25
+      delay_after_sec: 2.0
     windowed: true
     window_width: 1280
     window_height: 720
@@ -95,6 +94,9 @@ storage:
   models_dir: models_storage
   records_dir: records_storage
   record_realtime_default: true
+  # Fill this with the matching Neuracle BDF/NDF file or acquisition-session ID
+  # before each formal run. It is embedded in the experiment manifest.
+  native_recording_id: ""
 online_adaptation:
   enabled: true
   strategy: neuroonline
@@ -120,11 +122,13 @@ online_adaptation:
     history_threshold: 64
     recent_samples: 320
     weight_decay: 5.0e-2
-    mask_ratio: 0.7
+    mask_ratio: 0.3
+    consistency_weight: 0.1
     label_smoothing: 0.1
     prompt_count: 32
     random_seed: 42
     offline_epochs: 50
+    offline_patience: 6
     offline_batch_size: 16
     offline_learning_rate: 1.0e-4
   simulation:
@@ -133,7 +137,13 @@ online_adaptation:
     settle_sec: 2.0
   cued_labels:
     enabled: true
-    continuous: true
+    # The car never enters a hidden STOP phase.  Unity holds one obstacle
+    # layout for this epoch while decoding/control continues every step.
+    # Every scene keeps the same label/layout for exactly 5 s. A collision only
+    # records failure; the next scene still starts at the fixed 5 s boundary.
+    scene_duration_sec: 5.0
+    # Match calibration: only the 0.5-4.5 s control interval enters training.
+    boundary_guard_sec: 0.5
     balance_pool_per_class: 32
     start_delay_sec: 5.0
     random_seed: 17

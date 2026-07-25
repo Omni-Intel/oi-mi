@@ -19,7 +19,7 @@ from utils.preprocessing import filter_and_transform
 
 DEFAULT_PROFILE = {
     "n_chans": 64,
-    "sfreq": 250.0,
+    "sfreq": 200.0,
     "window_sec": 2.0,
     "n_classes": 3,
     "n_samples": 240,

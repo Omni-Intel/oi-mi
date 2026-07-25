@@ -17,6 +17,8 @@ from adaptation.neuroonline import (
     NeuroOnlineConfig,
     NeuroOnlineModelAdapter,
     NeuroOnlineStreamAdapter,
+    _frequency_mask,
+    _time_mask,
 )
 from models.factory import TorchModelAdapter
 from cli import cli
@@ -62,6 +64,47 @@ class NeuroOnlineTests(unittest.TestCase):
         wrapped = NeuroOnlineModelAdapter(base, config=NeuroOnlineConfig(enabled=True))
         actual = wrapped.predict_proba(inputs)
         np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-7)
+
+    def test_mask_ratio_uses_one_contiguous_time_and_frequency_region(self) -> None:
+        inputs = torch.ones(3, 2, 20)
+        time_masked = _time_mask(
+            inputs,
+            0.25,
+            torch.Generator().manual_seed(11),
+        )
+        for sample in time_masked:
+            masked_positions = torch.where(sample[0] == 0)[0]
+            self.assertEqual(masked_positions.numel(), 5)
+            self.assertTrue(torch.equal(masked_positions, torch.arange(
+                masked_positions[0],
+                masked_positions[0] + 5,
+            )))
+            self.assertTrue(torch.equal(sample[0] == 0, sample[1] == 0))
+
+        signal = torch.randn(3, 2, 20)
+        frequency_masked = _frequency_mask(
+            signal,
+            0.25,
+            torch.Generator().manual_seed(11),
+        )
+        masked_spectrum = torch.fft.rfft(frequency_masked, dim=-1)
+        original_spectrum = torch.fft.rfft(signal, dim=-1)
+        expected_bins = round(original_spectrum.shape[-1] * 0.25)
+        for sample_index in range(signal.shape[0]):
+            removed = torch.isclose(
+                masked_spectrum[sample_index, 0],
+                torch.zeros_like(masked_spectrum[sample_index, 0]),
+                atol=1e-5,
+            )
+            self.assertGreaterEqual(int(removed.sum()), expected_bins)
+            self.assertTrue(torch.equal(
+                removed,
+                torch.isclose(
+                    masked_spectrum[sample_index, 1],
+                    torch.zeros_like(masked_spectrum[sample_index, 1]),
+                    atol=1e-5,
+                ),
+            ))
 
     def test_full_neuroonline_objective_updates_backbone_and_persists_crm(self) -> None:
         config = NeuroOnlineConfig(
@@ -126,7 +169,7 @@ class NeuroOnlineTests(unittest.TestCase):
             root = Path(tmp_dir)
             records = root / "records" / "S001" / "calibration" / "20260722_120000"
             records.mkdir(parents=True)
-            inputs = np.random.randn(12, 2, 500).astype(np.float32)
+            inputs = np.random.randn(12, 2, 400).astype(np.float32)
             labels = np.tile(np.arange(3, dtype=np.int64), 4)
             np.savez_compressed(
                 records / "training_windows_main.npz",
@@ -142,12 +185,11 @@ class NeuroOnlineTests(unittest.TestCase):
                         "model_name: shallowconvnet",
                         "device_type: neuracle",
                         "hardware_dummy_mode: false",
-                        "sfreq: 250",
+                        "sfreq: 200",
                         "n_classes: 3",
                         "window_sec: 2.0",
                         "step_sec: 0.5",
-                        "new_subject_epochs: 1",
-                        "old_subject_epochs: 1",
+                        "calibration_epochs: 1",
                         "batch_size: 4",
                         "learning_rate: 0.001",
                         "early_stopping_patience: 1",
@@ -233,6 +275,11 @@ class NeuroOnlineTests(unittest.TestCase):
         self.assertEqual(status["prequential"]["balanced_accuracy"], 1.0)
         self.assertEqual(status["prequential"]["confusion_matrix"], [[3, 0, 0], [0, 2, 0], [0, 0, 2]])
         self.assertEqual(len(status["update_history"]), 2)
+        first_update = status["update_history"][0]
+        self.assertEqual(first_update["trigger_seen_labeled_windows"], 4)
+        self.assertEqual(first_update["snapshot_first_window_id"], 1)
+        self.assertEqual(first_update["snapshot_last_window_id"], 4)
+        self.assertEqual(first_update["snapshot_samples"], 4)
         self.assertAlmostEqual(status["progress"], 0.5)
 
     def test_stream_update_runs_in_background(self) -> None:

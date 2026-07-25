@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 import logging
 import os
 import re
@@ -22,8 +21,6 @@ from acquisition.factory import AcquirerFactory, register_default_acquirers
 from adaptation.mi_protocol import ProtocolConfig
 from game_command_router import get_shared_game_command_router
 from utils.markers import (
-    ArTcpCommandRelay,
-    ArTcpCommandSender,
     LSLCommandOutlet,
     NoOpMarkerBackend,
     TriggerBoxMarkerBackend,
@@ -35,6 +32,7 @@ from utils.online_labels import (
     build_cued_online_label_source,
 )
 from utils.preprocessing import filter_and_transform
+from utils.reproducibility import seed_experiment
 from utils.unity_runtime import ensure_unity_game_running
 from web_command_server import start_web_command_server
 
@@ -47,19 +45,16 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
     "model_name": "riemann-mdm",
     "device_type": "neuracle",
     "hardware_dummy_mode": False,
-    "sfreq": 250,
+    "sfreq": 200,
     "n_classes": 3,
     "window_sec": 2.0,
     "step_sec": 0.5,
     "confidence_threshold": 0.7,
     "mc_dropout_passes": 8,
-    "new_subject_duration_sec": 1800,
-    "old_subject_duration_sec": 300,
-    "new_subject_epochs": 50,
-    "old_subject_epochs": 5,
+    "calibration_epochs": 50,
     "batch_size": 32,
     "learning_rate": 0.001,
-    "early_stopping_patience": 40,
+    "early_stopping_patience": 6,
     "collect_block_sec": 10,
     "buffer_sec": 60,
     "protocol": {
@@ -82,20 +77,20 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
             "control_sec": 5.0,
             "iti_sec": 2.0,
         },
-        "new_subject_blocks": 6,
-        "new_subject_trials_per_class_per_block": 8,
-        "old_subject_baseline_sec": 60.0,
-        "old_subject_trials_per_class": 8,
-        "rest_between_blocks_sec": 35.0,
-        "extra_rest_sec": 60.0,
-        "dynamic_total_minutes_hint": 30.0,
+        "calibration_blocks": 4,
+        "calibration_trials_per_class_per_block": 5,
+        "rest_between_blocks_sec": 20.0,
         "random_seed": 17,
     },
     "device": {
         "neuracle_host": "127.0.0.1",
         "neuracle_port": 8712,
+        "neuracle_source_sfreq": 250,
+        "neuracle_transport_delay_sec": 0.0,
+        "neuracle_eeg_channels": 59,
         "brainco_addr": "",
         "brainco_port": 0,
+        "brainco_source_sfreq": 250,
         "brainco_auto_discover": True,
         "brainco_scan_timeout_sec": 6.0,
         "brainco_ready_timeout_sec": 20.0,
@@ -119,17 +114,12 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
             "startup_timeout_sec": 15.0,
             "startup_command_delay_sec": 0.75,
             "startup_sequence": [
-                {"command": "OPEN_LAUNCHER", "delay_after_sec": 0.5},
-                {"command": "OPEN_3D_GAME", "delay_after_sec": 1.0},
-                {"command": "LAUNCHER_SELECT", "delay_after_sec": 0.25},
+                {"command": "OPEN_3D_GAME", "delay_after_sec": 2.0},
             ],
             "windowed": True,
             "window_width": 1280,
             "window_height": 720,
             "close_on_stop": False,
-            "reverse_enabled": False,
-            "reverse_listen_ip": "0.0.0.0",
-            "reverse_listen_port": 5006,
         },
         "web_control": {
             "enabled": True,
@@ -143,6 +133,7 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
         "models_dir": "models_storage",
         "records_dir": "records_storage",
         "record_realtime_default": True,
+        "native_recording_id": "",
     },
     "online_adaptation": {
         "enabled": False,
@@ -169,11 +160,13 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
             "history_threshold": 64,
             "recent_samples": 320,
             "weight_decay": 0.05,
-            "mask_ratio": 0.7,
+            "mask_ratio": 0.3,
+            "consistency_weight": 0.1,
             "label_smoothing": 0.1,
             "prompt_count": 32,
             "random_seed": 42,
             "offline_epochs": 50,
+            "offline_patience": 6,
             "offline_batch_size": 16,
             "offline_learning_rate": 1e-4,
         },
@@ -184,7 +177,8 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
         },
         "cued_labels": {
             "enabled": True,
-            "continuous": True,
+            "scene_duration_sec": 5.0,
+            "boundary_guard_sec": 0.5,
             "balance_pool_per_class": 32,
             "start_delay_sec": 5.0,
             "random_seed": 17,
@@ -307,6 +301,30 @@ def load_config(path: Path) -> dict[str, Any]:
         raise click.ClickException("window_sec and step_sec must be positive.")
     if config["n_classes"] != 3:
         raise click.ClickException("This minimal build currently requires n_classes=3.")
+    if not np.isclose(float(config["sfreq"]), 200.0):
+        raise click.ClickException(
+            "The NeuroOnline experiment pipeline requires sfreq=200 Hz."
+        )
+    if str(config.get("device_type", "")).strip().lower() == "neuracle":
+        source_sfreq = float(
+            (config.get("device", {}) or {}).get("neuracle_source_sfreq", 250.0)
+        )
+        if not np.isclose(source_sfreq, 250.0):
+            raise click.ClickException(
+                "Neuracle/JellyFish hardware must acquire at 250 Hz: "
+                "set device.neuracle_source_sfreq=250. "
+                "The pipeline output remains sfreq=200 Hz."
+            )
+    if str(config.get("device_type", "")).strip().lower() == "brainco":
+        source_sfreq = float(
+            (config.get("device", {}) or {}).get("brainco_source_sfreq", 250.0)
+        )
+        if not np.isclose(source_sfreq, 250.0):
+            raise click.ClickException(
+                "BrainCo hardware must acquire at 250 Hz: "
+                "set device.brainco_source_sfreq=250. "
+                "The pipeline output remains sfreq=200 Hz."
+            )
     return config
 
 
@@ -332,7 +350,7 @@ def _interactive_menu(ctx: click.Context, app: AppContext) -> None:
         CONSOLE.print("\n[bold cyan]oi-mi 交互菜单[/bold cyan]")
         CONSOLE.print("1) 列出可用模型")
         CONSOLE.print("2) 列出可用采集设备")
-        CONSOLE.print("3) 校准（新/老被试，cue）")
+        CONSOLE.print("3) 重新校准（每次从头训练，cue）")
         CONSOLE.print("4) 实时解码（无 cue 自动输出）")
         CONSOLE.print("5) 测试模式（有 cue + 保存流式 npy + 计算准确率）")
         CONSOLE.print("6) 设备连通性探测（probe-device）")
@@ -340,11 +358,9 @@ def _interactive_menu(ctx: click.Context, app: AppContext) -> None:
         CONSOLE.print("8) 启动 GUI (Streamlit)")
         CONSOLE.print("0) 退出")
 
-        CONSOLE.print("9) 眼镜调试模式 (LEFT/RIGHT 循环)")
-
         choice = click.prompt(
             "选择功能",
-            type=click.Choice(["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]),
+            type=click.Choice(["0", "1", "2", "3", "4", "5", "6", "7", "8"]),
             default="3",
         )
         if choice == "0":
@@ -364,11 +380,10 @@ def _interactive_menu(ctx: click.Context, app: AppContext) -> None:
                 default=str(app.config.get("subject_id", "S001")),
                 type=str,
             )
-            mode = click.prompt("选择新/老被试", type=click.Choice(["new", "old"]), default="new")
             formal_trials = (
-                protocol.new_subject_blocks * protocol.new_subject_trials_per_class_per_block * 3
-                if mode == "new"
-                else protocol.old_subject_trials_per_class * 3
+                protocol.calibration_blocks
+                * protocol.calibration_trials_per_class_per_block
+                * 3
             )
             CONSOLE.print(
                 f"[bold cyan]当前 protocol[/bold cyan] formal_trials={formal_trials} "
@@ -384,8 +399,8 @@ def _interactive_menu(ctx: click.Context, app: AppContext) -> None:
             ctx.invoke(
                 calibrate_cmd,
                 subject_id=subject_id,
-                is_new=(mode == "new"),
-                is_old=(mode == "old"),
+                is_new=True,
+                is_old=False,
                 duration=None,
                 model_name=model_name,
             )
@@ -479,11 +494,11 @@ def _interactive_menu(ctx: click.Context, app: AppContext) -> None:
                 CONSOLE.print(f"7) cue 时长: [green]{trial_timing_cfg.get('cue_sec', 1.0)}[/green]")
                 CONSOLE.print(f"8) control 时长: [green]{trial_timing_cfg.get('control_sec', 5.0)}[/green]")
                 CONSOLE.print(f"9) iti 时长: [green]{trial_timing_cfg.get('iti_sec', 2.0)}[/green]")
-                CONSOLE.print(f"10) 新被试 block 数: [green]{protocol_cfg.get('new_subject_blocks', 6)}[/green]")
-                CONSOLE.print(f"11) 新被试每类每 block trial 数: [green]{protocol_cfg.get('new_subject_trials_per_class_per_block', 8)}[/green]")
-                CONSOLE.print(f"12) 老被试 baseline 时长: [green]{protocol_cfg.get('old_subject_baseline_sec', 60.0)}[/green]")
-                CONSOLE.print(f"13) 老被试每类 trial 数: [green]{protocol_cfg.get('old_subject_trials_per_class', 8)}[/green]")
-                CONSOLE.print(f"14) block 间休息: [green]{protocol_cfg.get('rest_between_blocks_sec', 35.0)}[/green]")
+                CONSOLE.print(f"10) 校准 block 数: [green]{protocol_cfg.get('calibration_blocks', 4)}[/green]")
+                CONSOLE.print(f"11) 每类每 block trial 数: [green]{protocol_cfg.get('calibration_trials_per_class_per_block', 5)}[/green]")
+                CONSOLE.print(f"12) 离线训练最大 epoch: [green]{app.config.get('calibration_epochs', 50)}[/green]")
+                CONSOLE.print(f"13) 训练早停 patience: [green]{app.config.get('early_stopping_patience', 6)}[/green]")
+                CONSOLE.print(f"14) block 间休息: [green]{protocol_cfg.get('rest_between_blocks_sec', 20.0)}[/green]")
                 CONSOLE.print(f"15) AR游戏控制启用: [green]{ar_game_cfg.get('enabled', False)}[/green]")
                 CONSOLE.print(f"16) AR游戏主机: [green]{ar_game_cfg.get('host', '127.0.0.1')}[/green]")
                 CONSOLE.print(f"17) AR游戏端口: [green]{ar_game_cfg.get('port', 5005)}[/green]")
@@ -524,19 +539,19 @@ def _interactive_menu(ctx: click.Context, app: AppContext) -> None:
                     val = click.prompt("iti 时长 (秒)", type=float, default=float(trial_timing_cfg.get("iti_sec", 2.0)))
                     trial_timing_cfg["iti_sec"] = val
                 elif sub_choice == "10":
-                    val = click.prompt("新被试 block 数", type=int, default=int(protocol_cfg.get("new_subject_blocks", 6)))
-                    protocol_cfg["new_subject_blocks"] = val
+                    val = click.prompt("校准 block 数", type=int, default=int(protocol_cfg.get("calibration_blocks", 4)))
+                    protocol_cfg["calibration_blocks"] = val
                 elif sub_choice == "11":
-                    val = click.prompt("新被试每类每 block trial 数", type=int, default=int(protocol_cfg.get("new_subject_trials_per_class_per_block", 8)))
-                    protocol_cfg["new_subject_trials_per_class_per_block"] = val
+                    val = click.prompt("每类每 block trial 数", type=int, default=int(protocol_cfg.get("calibration_trials_per_class_per_block", 5)))
+                    protocol_cfg["calibration_trials_per_class_per_block"] = val
                 elif sub_choice == "12":
-                    val = click.prompt("老被试 baseline 时长 (秒)", type=float, default=float(protocol_cfg.get("old_subject_baseline_sec", 60.0)))
-                    protocol_cfg["old_subject_baseline_sec"] = val
+                    val = click.prompt("离线训练最大 epoch", type=int, default=int(app.config.get("calibration_epochs", 50)))
+                    app.config["calibration_epochs"] = val
                 elif sub_choice == "13":
-                    val = click.prompt("老被试每类 trial 数", type=int, default=int(protocol_cfg.get("old_subject_trials_per_class", 8)))
-                    protocol_cfg["old_subject_trials_per_class"] = val
+                    val = click.prompt("训练早停 patience", type=int, default=int(app.config.get("early_stopping_patience", 6)))
+                    app.config["early_stopping_patience"] = val
                 elif sub_choice == "14":
-                    val = click.prompt("block 间休息时长 (秒)", type=float, default=float(protocol_cfg.get("rest_between_blocks_sec", 35.0)))
+                    val = click.prompt("block 间休息时长 (秒)", type=float, default=float(protocol_cfg.get("rest_between_blocks_sec", 20.0)))
                     protocol_cfg["rest_between_blocks_sec"] = val
                 elif sub_choice == "15":
                     val = click.confirm("是否启用 AR 游戏 TCP 控制", default=bool(ar_game_cfg.get("enabled", False)))
@@ -575,11 +590,6 @@ def _interactive_menu(ctx: click.Context, app: AppContext) -> None:
         if choice == "8":
             gui_cmd = ctx.command.get_command(ctx, "gui")
             ctx.invoke(gui_cmd)
-            continue
-
-        if choice == "9":
-            debug_cmd = ctx.command.get_command(ctx, "debug-glasses")
-            ctx.invoke(debug_cmd, interval_sec=1.0, pulse_sec=0.2)
             continue
 
 
@@ -660,7 +670,11 @@ def load_calibration_windows(
     *,
     session_ids: tuple[str, ...] = (),
     use_processed: bool = True,
-) -> tuple[np.ndarray, np.ndarray, list[Path]]:
+    include_groups: bool = False,
+) -> (
+    tuple[np.ndarray, np.ndarray, list[Path]]
+    | tuple[np.ndarray, np.ndarray, np.ndarray | None, list[Path]]
+):
     """Load and concatenate calibration windows saved on disk."""
 
     calibration_root = records_dir / subject_id / "calibration"
@@ -677,6 +691,9 @@ def load_calibration_windows(
     feature_key = "processed_windows" if use_processed else "raw_windows"
     windows: list[np.ndarray] = []
     labels: list[np.ndarray] = []
+    groups: list[np.ndarray] = []
+    all_sessions_have_groups = True
+    next_group_id = 0
     used_sessions: list[Path] = []
     reference_shape: tuple[int, int] | None = None
 
@@ -689,6 +706,11 @@ def load_calibration_windows(
                 raise click.ClickException(f"Calibration dataset missing required arrays: {dataset_path}")
             X = payload[feature_key].astype(np.float32)
             y = payload["labels"].astype(np.int64)
+            session_groups = (
+                payload["trial_ids"].astype(np.int64)
+                if "trial_ids" in payload
+                else None
+            )
         if X.shape[0] != y.shape[0]:
             raise click.ClickException(f"Mismatched window and label counts in {dataset_path}")
         if X.shape[0] == 0:
@@ -702,11 +724,26 @@ def load_calibration_windows(
             )
         windows.append(X)
         labels.append(y)
+        if session_groups is None or session_groups.shape != y.shape:
+            all_sessions_have_groups = False
+        else:
+            _, remapped = np.unique(session_groups, return_inverse=True)
+            groups.append(remapped.astype(np.int64) + next_group_id)
+            next_group_id += int(np.max(remapped)) + 1
         used_sessions.append(session_dir)
 
     if not windows:
         raise click.ClickException(f"No usable calibration windows found in {calibration_root}")
-    return np.concatenate(windows, axis=0), np.concatenate(labels, axis=0), used_sessions
+    combined_X = np.concatenate(windows, axis=0)
+    combined_y = np.concatenate(labels, axis=0)
+    if include_groups:
+        combined_groups = (
+            np.concatenate(groups, axis=0)
+            if all_sessions_have_groups and len(groups) == len(windows)
+            else None
+        )
+        return combined_X, combined_y, combined_groups, used_sessions
+    return combined_X, combined_y, used_sessions
 
 
 def iter_test_mode_chunks(test_mode_dir: Path) -> list[Path]:
@@ -778,7 +815,11 @@ def build_acquirer(
     register_default_acquirers()
     device_cfg = config.get("device", {})
     device_name = "dummy" if bool(config.get("hardware_dummy_mode", False)) else device_name
-    resolved_channels = default_device_channels(device_name)
+    resolved_channels = (
+        int(device_cfg.get("neuracle_eeg_channels", 59))
+        if device_name == "neuracle"
+        else default_device_channels(device_name)
+    )
     kwargs: dict[str, Any] = {
         "sfreq": float(config["sfreq"]),
         "n_channels": resolved_channels,
@@ -787,7 +828,12 @@ def build_acquirer(
     if device_name == "neuracle":
         kwargs["neuracle_host"] = str(device_cfg.get("neuracle_host", "127.0.0.1"))
         kwargs["neuracle_port"] = int(device_cfg.get("neuracle_port", 8712))
+        kwargs["source_sfreq"] = float(device_cfg.get("neuracle_source_sfreq", 250.0))
+        kwargs["transport_delay_sec"] = float(
+            device_cfg.get("neuracle_transport_delay_sec", 0.0)
+        )
     if device_name == "brainco":
+        kwargs["source_sfreq"] = float(device_cfg.get("brainco_source_sfreq", 250.0))
         kwargs["brainco_addr"] = str(device_cfg.get("brainco_addr", ""))
         kwargs["brainco_port"] = int(device_cfg.get("brainco_port", 0))
         kwargs["auto_discover"] = bool(device_cfg.get("brainco_auto_discover", True))
@@ -819,24 +865,9 @@ def build_game_command_outlet(config: dict[str, Any]) -> Any:
         return None
     ensure_unity_game_running(config, console=CONSOLE)
     outlet = get_shared_game_command_router(config).build_proxy(source="decoder")
-    startup_sequence = game_output_cfg.get("startup_sequence")
-    if startup_sequence is None:
-        startup_scene_command = str(
-            game_output_cfg.get("startup_scene_command", "OPEN_3D_GAME") or ""
-        ).strip().upper()
-        startup_mode_command = str(
-            game_output_cfg.get("startup_mode_command", "LAUNCHER_SELECT") or ""
-        ).strip().upper()
-        startup_sequence = [
-            {
-                "command": startup_scene_command,
-                "delay_after_sec": game_output_cfg.get("scene_load_delay_sec", 1.0),
-            },
-            {
-                "command": startup_mode_command,
-                "delay_after_sec": game_output_cfg.get("mode_load_delay_sec", 0.25),
-            },
-        ]
+    startup_sequence = game_output_cfg.get("startup_sequence", ())
+    if not isinstance(startup_sequence, (list, tuple)):
+        raise ValueError("output.ar_game.startup_sequence must be a list.")
 
     if startup_sequence:
         startup_command_delay_sec = max(
@@ -862,98 +893,6 @@ def build_game_command_outlet(config: dict[str, Any]) -> Any:
     return outlet
 
 
-def build_raw_game_transport(config: dict[str, Any]) -> Any:
-    """Return the underlying shared transport for infrastructure commands."""
-
-    game_output_cfg = config.get("output", {}).get("ar_game", {})
-    if not bool(game_output_cfg.get("enabled", False)):
-        return None
-    ensure_unity_game_running(config, console=CONSOLE)
-    return get_shared_game_command_router(config).raw_transport()
-
-
-def run_glasses_debug_loop(outlet: Any, console: Console, *, interval_sec: float = 1.0) -> None:
-    """Continuously alternate LEFT/RIGHT with STOP gaps for glasses debugging."""
-
-    commands = ("LEFT", "RIGHT")
-    console.print(
-        "[bold cyan]Glasses debug mode running[/bold cyan] "
-        "cycle=LEFT -> STOP -> RIGHT -> STOP, interval=1.0s. Press Ctrl+C to stop."
-    )
-    outlet.push("START")
-    index = 0
-    try:
-        while True:
-            command = commands[index % len(commands)]
-            console.print(f"[bold cyan]AR debug -> {command}[/bold cyan]")
-            outlet.push(command)
-            time.sleep(interval_sec)
-            console.print("[bold cyan]AR debug -> STOP[/bold cyan]")
-            outlet.push("STOP")
-            time.sleep(interval_sec)
-            index += 1
-    finally:
-        try:
-            outlet.push("STOP")
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("Failed to send final STOP in glasses debug mode: %s", exc)
-        close = getattr(outlet, "close", None)
-        if callable(close):
-            close()
-
-
-def run_debug_glasses_loop(
-    app: AppContext,
-    *,
-    interval_sec: float = 1.0,
-    pulse_sec: float = 0.2,
-) -> None:
-    """Continuously alternate LEFT/RIGHT pulses with STOP in between."""
-
-    if interval_sec <= 0:
-        raise click.ClickException("interval_sec must be positive.")
-    if pulse_sec <= 0:
-        raise click.ClickException("pulse_sec must be positive.")
-    if pulse_sec >= interval_sec:
-        raise click.ClickException("pulse_sec must be smaller than interval_sec.")
-
-    outlet = build_raw_game_transport(app.config)
-    if outlet is None:
-        raise click.ClickException("output.ar_game.enabled must be true.")
-
-    commands = ("LEFT", "RIGHT")
-    command_index = 0
-    app.console.print(
-        "[bold cyan]Debug glasses mode running[/bold cyan] "
-        f"interval={interval_sec:.2f}s pulse={pulse_sec:.2f}s "
-        "commands=LEFT/RIGHT, idle=STOP"
-    )
-    app.console.print("[bold cyan]Press Ctrl+C to stop.[/bold cyan]")
-
-    try:
-        outlet.push("START")
-        outlet.push("STOP")
-        while True:
-            command = commands[command_index]
-            outlet.push(command)
-            app.console.print(f"[bold green]AR debug[/bold green] {command}")
-            time.sleep(pulse_sec)
-            outlet.push("STOP")
-            time.sleep(interval_sec - pulse_sec)
-            command_index = (command_index + 1) % len(commands)
-    except KeyboardInterrupt:
-        app.console.print("\n[bold red]Stopping debug glasses mode[/bold red]")
-    except Exception as exc:
-        raise click.ClickException(f"Debug glasses mode failed: {exc}") from exc
-    finally:
-        try:
-            outlet.push("STOP")
-        except Exception:
-            pass
-        if hasattr(outlet, "close"):
-            outlet.close()
-
-
 @click.group(invoke_without_command=True)
 @click.option(
     "--config",
@@ -969,7 +908,6 @@ def cli(ctx: click.Context, config_path: Path | None) -> None:
     setup_logging()
     resolved_config_path = resolve_config_path(config_path)
     config = load_config(resolved_config_path)
-    start_web_command_server(config)
     ctx.obj = AppContext(config=config, config_path=resolved_config_path, console=CONSOLE)
     if ctx.invoked_subcommand is None:
         _interactive_menu(ctx, app=ctx.obj)
@@ -1028,58 +966,6 @@ def list_devices() -> None:
     for device_name in AcquirerFactory.list_devices():
         table.add_row(device_name)
     CONSOLE.print(table)
-
-
-@cli.command("relay-game")
-@click.pass_obj
-def relay_game(app: AppContext) -> None:
-    """Run a standalone reverse relay for the AR game control channel."""
-
-    game_output_cfg = app.config.get("output", {}).get("ar_game", {})
-    if not bool(game_output_cfg.get("enabled", False)):
-        raise click.ClickException("output.ar_game.enabled must be true.")
-    if not bool(game_output_cfg.get("reverse_enabled", False)):
-        raise click.ClickException("output.ar_game.reverse_enabled must be true.")
-
-    outlet = build_game_command_outlet(app.config)
-    if not isinstance(outlet, ArTcpCommandRelay):
-        raise click.ClickException("Failed to start reverse AR relay.")
-
-    app.console.print(
-        "[bold cyan]AR relay running[/bold cyan] "
-        f"local={game_output_cfg.get('host', '127.0.0.1')}:{game_output_cfg.get('port', 5005)} "
-        f"downstream={game_output_cfg.get('reverse_listen_ip', '0.0.0.0')}:{game_output_cfg.get('reverse_listen_port', 5006)}"
-    )
-    app.console.print("[bold cyan]Local tools/oi-mi send to localhost relay; glasses Unity should connect back here.[/bold cyan]")
-    try:
-        while True:
-            time.sleep(0.5)
-    except KeyboardInterrupt:
-        app.console.print("\n[bold red]Stopping AR relay[/bold red]")
-    finally:
-        outlet.close()
-
-
-@cli.command("debug-glasses")
-@click.option(
-    "--interval-sec",
-    type=float,
-    default=1.0,
-    show_default=True,
-    help="Seconds between alternating LEFT and RIGHT pulses.",
-)
-@click.option(
-    "--pulse-sec",
-    type=float,
-    default=0.2,
-    show_default=True,
-    help="How long each LEFT/RIGHT pulse lasts before returning to STOP.",
-)
-@click.pass_obj
-def debug_glasses(app: AppContext, interval_sec: float, pulse_sec: float) -> None:
-    """Send alternating LEFT/RIGHT commands to the glasses with STOP in between."""
-
-    run_debug_glasses_loop(app, interval_sec=interval_sec, pulse_sec=pulse_sec)
 
 
 @cli.command("probe-device")
@@ -1141,9 +1027,14 @@ def probe_device(
 
 @cli.command()
 @click.option("--subject", "subject_id", required=True, type=str)
-@click.option("--new", "is_new", is_flag=True, help="Train a new subject from scratch/base weights.")
-@click.option("--old", "is_old", is_flag=True, help="Fast adaptation for an existing subject.")
-@click.option("--duration", type=int, default=None, help="Calibration duration in seconds.")
+@click.option("--new", "is_new", is_flag=True, help="Compatibility flag; calibration always starts from scratch.")
+@click.option("--old", "is_old", is_flag=True, help="Deprecated; existing weights are no longer reused.")
+@click.option(
+    "--duration",
+    type=int,
+    default=None,
+    help="Compatibility option; the 12-minute protocol controls collection time.",
+)
 @click.option("--model", "model_name", type=str, default=None, help="Model registry name.")
 @click.pass_obj
 def calibrate(
@@ -1154,21 +1045,24 @@ def calibrate(
     duration: int | None,
     model_name: str | None,
 ) -> None:
-    """Collect calibration data and train or adapt a decoder."""
+    """Collect the fixed recalibration protocol and train a fresh decoder."""
 
-    if is_new == is_old:
-        raise click.ClickException("Choose exactly one of --new or --old.")
+    if is_new and is_old:
+        raise click.ClickException("Do not combine --new and --old.")
+    if is_old:
+        raise click.ClickException(
+            "--old was removed: every experiment now performs a full from-scratch "
+            "calibration. Run the command without --old."
+        )
 
     config = app.config
     selected_model = model_name or str(config["model_name"])
-    duration_sec = duration or int(
-        config["new_subject_duration_sec"] if is_new else config["old_subject_duration_sec"]
-    )
+    duration_sec = duration
     if duration is not None:
         app.console.print(
             "[bold yellow]提示[/bold yellow] 当前校准时长由 protocol 配置驱动，`--duration` 仅保留兼容性，不改变正式 trial 结构。"
         )
-    epochs = int(config["new_subject_epochs"] if is_new else config["old_subject_epochs"])
+    epochs = int(config.get("calibration_epochs", 50))
     acquirer = build_acquirer(
         device_name=str(config["device_type"]),
         config=config,
@@ -1180,6 +1074,13 @@ def calibrate(
         selected_model,
         device_name=str(config["device_type"]),
     )
+    experiment_seed = int(
+        config.get("online_adaptation", {}).get("neuroonline", {}).get(
+            "random_seed",
+            config.get("online_adaptation", {}).get("random_seed", 42),
+        )
+    )
+    seed_experiment(experiment_seed)
     model_factory = get_model_factory()
     model = model_factory.get(
         selected_model,
@@ -1203,16 +1104,15 @@ def calibrate(
         / "calibration",
         protocol_config=ProtocolConfig.from_config(config),
         online_adaptation_config=config.get("online_adaptation", {}),
+        experiment_config=config,
     )
-    if is_old:
-        calibrator.load_existing_weights()
     result = calibrator.calibrate(
         duration_sec=duration_sec,
         epochs=epochs,
         batch_size=int(config["batch_size"]),
         learning_rate=float(config["learning_rate"]),
         patience=int(config["early_stopping_patience"]),
-        head_only=is_old,
+        head_only=False,
     )
     app.console.print(
         f"[bold green]校准完成[/bold green] "
@@ -1304,6 +1204,9 @@ def run(
     """Run the realtime decoder."""
 
     config = app.config
+    # Keep the web-control endpoint and decoder in the same process so both
+    # share one Unity TCP router/connection.
+    start_web_command_server(config)
     selected_model = model_name or str(config["model_name"])
     selected_device = device_name or str(config["device_type"])
     acquirer = build_acquirer(device_name=selected_device, config=config)
@@ -1338,6 +1241,19 @@ def run(
     adaptation_cfg = config.get("online_adaptation", {})
     simulation_cfg = adaptation_cfg.get("simulation", {})
     cued_cfg = adaptation_cfg.get("cued_labels", {})
+    if (
+        not test_mode
+        and bool(adaptation_cfg.get("enabled", False))
+        and str(adaptation_cfg.get("strategy", "")).strip().lower() == "neuroonline"
+        and effective_device_name(config, selected_device) != "dummy"
+        and not str(
+            config.get("storage", {}).get("native_recording_id", "") or ""
+        ).strip()
+    ):
+        raise click.ClickException(
+            "正式NeuroOnline实验必须先在config.yaml的"
+            " storage.native_recording_id 填写博瑞康BDF/NDF文件名或采集会话编号。"
+        )
     simulation_enabled = (
         bool(adaptation_cfg.get("enabled", False))
         and bool(simulation_cfg.get("enabled", False))
@@ -1409,6 +1325,9 @@ def run(
         online_label_source=online_label_source,
         batch_update_config=adaptation_cfg if not test_mode else None,
         n_classes=int(config["n_classes"]),
+        experiment_config=config,
+        model_name=selected_model,
+        model_source_path=model_path,
     )
     if test_mode:
         marker_backend = build_marker_backend(config)
@@ -1426,7 +1345,16 @@ def run(
         )
         return
 
-    app.console.print("[bold cyan]开始实时解码（无 cue），按 Ctrl+C 停止[/bold cyan]")
+    if (
+        bool(adaptation_cfg.get("enabled", False))
+        and str(adaptation_cfg.get("strategy", "")).strip().lower() == "neuroonline"
+        and not record
+    ):
+        record = True
+        app.console.print(
+            "[bold yellow]NeuroOnline正式运行已自动开启论文级数据记录[/bold yellow]"
+        )
+    app.console.print("[bold cyan]开始实时解码，按 Ctrl+C 停止[/bold cyan]")
     records_dir = Path(str(config.get("storage", {}).get("records_dir", "records_storage")))
     try:
         decoder.run_forever(
@@ -1487,16 +1415,22 @@ def train_from_records(
     selected_model = model_name or str(config["model_name"])
     selected_device = device_name or str(config["device_type"])
     records_dir = resolve_records_dir(config)
-    X, y, used_sessions = load_calibration_windows(
+    X, y, trial_groups, used_sessions = load_calibration_windows(
         records_dir,
         subject_id,
         session_ids=session_ids,
         use_processed=use_processed,
+        include_groups=True,
     )
     app.console.print(
         f"[bold cyan]加载校准数据[/bold cyan] sessions={len(used_sessions)} "
         f"windows={int(X.shape[0])} shape={tuple(int(dim) for dim in X.shape[1:])}"
     )
+    if trial_groups is None:
+        app.console.print(
+            "[bold yellow]这些旧记录没有 trial_ids；无法执行按 trial 分组验证。"
+            "建议使用当前版本重新校准。[/bold yellow]"
+        )
 
     model_path = build_model_path(
         config,
@@ -1547,11 +1481,12 @@ def train_from_records(
     metrics = model.fit(
         X,
         y,
-        epochs=int(config["old_subject_epochs"] if head_only else config["new_subject_epochs"]),
+        epochs=int(config.get("calibration_epochs", 50)),
         batch_size=int(config["batch_size"]),
         learning_rate=float(config["learning_rate"]),
         patience=int(config["early_stopping_patience"]),
         head_only=head_only,
+        groups=trial_groups,
     )
     model_path.parent.mkdir(parents=True, exist_ok=True)
     model.save(model_path)
@@ -1648,7 +1583,7 @@ def replay_test_mode_command(
 @click.option("--output-dir", type=click.Path(path_type=Path), default=None, help="Asset output directory.")
 @click.option("--models", multiple=True, type=str, help="Model registry names to export.")
 @click.option("--n-chans", type=int, default=64, show_default=True)
-@click.option("--sfreq", type=float, default=250.0, show_default=True)
+@click.option("--sfreq", type=float, default=200.0, show_default=True)
 @click.option("--window-sec", type=float, default=2.0, show_default=True)
 @click.pass_obj
 def seed_dummy_decoders_cmd(

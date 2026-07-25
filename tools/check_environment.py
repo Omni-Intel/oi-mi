@@ -8,6 +8,13 @@ import importlib.util
 import platform
 import subprocess
 import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from utils.unity_runtime import DEFAULT_EXECUTABLE, resolve_project_path, validate_unity_runtime
 
 
 REQUIRED_MAJOR = 3
@@ -115,6 +122,22 @@ def main():
         errors.append(
             "Missing runtime dependencies: %s. Run `pip install -e .` inside the virtual environment."
             % ", ".join(missing)
+        )
+
+    unity_executable = resolve_project_path(DEFAULT_EXECUTABLE)
+    try:
+        unity_manifest = validate_unity_runtime(unity_executable)
+    except RuntimeError as exc:
+        errors.append(
+            "%s Run `python tools/download_unity_build.py --force`." % exc
+        )
+    else:
+        print(
+            "unity runtime: %s (%s)"
+            % (
+                unity_manifest.get("build_id", "unknown"),
+                unity_manifest.get("protocol_version", "unknown"),
+            )
         )
 
     if warnings:

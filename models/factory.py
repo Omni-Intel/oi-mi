@@ -20,6 +20,61 @@ from models.hybrid_net import HybridSpectralTemporalNet
 LOGGER = logging.getLogger(__name__)
 
 
+def split_train_validation_indices(
+    y: np.ndarray,
+    *,
+    groups: np.ndarray | None,
+    random_state: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Split by trial when group IDs are available, otherwise by window."""
+
+    labels = np.asarray(y, dtype=np.int64)
+    indices = np.arange(labels.shape[0])
+    if groups is not None:
+        group_ids = np.asarray(groups, dtype=np.int64)
+        if group_ids.shape != labels.shape:
+            raise ValueError(
+                f"groups must match labels shape {labels.shape}, got {group_ids.shape}."
+            )
+        unique_groups = np.unique(group_ids)
+        group_labels_list: list[int] = []
+        for group in unique_groups:
+            labels_in_group = np.unique(labels[group_ids == group])
+            if labels_in_group.size != 1:
+                raise ValueError(
+                    f"Trial group {int(group)} contains multiple labels: "
+                    f"{labels_in_group.tolist()}."
+                )
+            group_labels_list.append(int(labels_in_group[0]))
+        group_labels = np.asarray(group_labels_list, dtype=np.int64)
+        groups_per_class = [
+            int(np.sum(group_labels == label))
+            for label in np.unique(group_labels)
+        ]
+        n_splits = min(5, min(groups_per_class, default=0))
+        if n_splits >= 2:
+            from sklearn.model_selection import StratifiedGroupKFold
+
+            splitter = StratifiedGroupKFold(
+                n_splits=n_splits,
+                shuffle=True,
+                random_state=random_state,
+            )
+            train_indices, validation_indices = next(
+                splitter.split(indices, labels, groups=group_ids)
+            )
+            return train_indices, validation_indices
+
+    from sklearn.model_selection import train_test_split
+
+    return train_test_split(
+        indices,
+        test_size=0.2,
+        stratify=labels,
+        random_state=random_state,
+    )
+
+
 class BaseModelAdapter(ABC):
     """Common interface for all training and inference backends."""
 
@@ -36,6 +91,7 @@ class BaseModelAdapter(ABC):
         learning_rate: float,
         patience: int,
         head_only: bool = False,
+        groups: np.ndarray | None = None,
     ) -> dict[str, float]:
         """Train the model and return summary metrics."""
 
@@ -85,13 +141,16 @@ class TorchModelAdapter(BaseModelAdapter):
         learning_rate: float,
         patience: int,
         head_only: bool = False,
+        groups: np.ndarray | None = None,
     ) -> dict[str, float]:
-        from sklearn.model_selection import train_test_split
-
         self._configure_trainable_layers(head_only=head_only)
-        X_train, X_val, y_train, y_val = train_test_split(
-            X, y, test_size=0.2, stratify=y, random_state=42
+        train_indices, validation_indices = split_train_validation_indices(
+            y,
+            groups=groups,
+            random_state=42,
         )
+        X_train, X_val = X[train_indices], X[validation_indices]
+        y_train, y_val = y[train_indices], y[validation_indices]
         train_dataset = TensorDataset(
             torch.tensor(X_train, dtype=torch.float32),
             torch.tensor(y_train, dtype=torch.long),
@@ -263,8 +322,9 @@ class RiemannMDMAdapter(BaseModelAdapter):
         learning_rate: float,
         patience: int,
         head_only: bool = False,
+        groups: np.ndarray | None = None,
     ) -> dict[str, float]:
-        del epochs, batch_size, learning_rate, patience, head_only
+        del epochs, batch_size, learning_rate, patience, head_only, groups
         covs = self._covariances.fit_transform(X)
         
         # Add regularization to ensure positive definiteness, especially for short 

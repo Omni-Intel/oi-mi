@@ -1,4 +1,4 @@
-"""Watch realtime road labels posted by the Unity driving task."""
+"""Watch labels posted to the optional manual-label test endpoint."""
 
 from __future__ import annotations
 
@@ -31,7 +31,10 @@ def main() -> None:
     server = ManualLabelHttpServer(source, host=args.host, port=args.port)
     server.start()
     print(f"Listening for labels at http://{args.host}:{args.port}/api/label")
-    print("Unity should POST label=left/right/idle here. Press Ctrl+C to stop.")
+    print(
+        "POST label=left/right/idle from a manual test client. "
+        "The formal car protocol does not use this endpoint. Press Ctrl+C to stop."
+    )
 
     last_seen: tuple[str, float] | None = None
     try:

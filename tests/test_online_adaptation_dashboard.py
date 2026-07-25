@@ -45,7 +45,7 @@ class _FakeStreamlit:
 
 
 class OnlineAdaptationDashboardTests(unittest.TestCase):
-    def test_continuous_cue_dashboard_uses_cumulative_trial(self) -> None:
+    def test_continuous_cue_dashboard_uses_cumulative_scene(self) -> None:
         fake = _FakeStreamlit()
 
         dashboard.render_online_cue_panel(
@@ -54,13 +54,13 @@ class OnlineAdaptationDashboardTests(unittest.TestCase):
                 "phase": "control",
                 "label_name": "left",
                 "phase_remaining_sec": 2.5,
-                "trial_number": 97,
+                "scene_number": 97,
                 "continuous": True,
             },
             ui=fake,
         )
 
-        self.assertIn((("累计 Trial", 97), {}), fake.metric_calls)
+        self.assertIn((("累计 Scene", 97), {}), fake.metric_calls)
         self.assertFalse(any("轮" in str(args) for args, _ in fake.metric_calls))
 
     def test_neuroonline_dashboard_renders_diagnostics(self) -> None:
@@ -103,7 +103,7 @@ class OnlineAdaptationDashboardTests(unittest.TestCase):
 
         dashboard.render_online_adaptation_panel(adaptation, ui=fake)
 
-        self.assertEqual(fake.metrics, 5)
+        self.assertEqual(fake.metrics, 7)
         self.assertEqual(fake.dataframes, 2)
         self.assertEqual(fake.line_charts, 3)
         self.assertEqual(fake.successes, 1)

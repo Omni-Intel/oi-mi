@@ -5,13 +5,21 @@ from __future__ import annotations
 from collections.abc import Callable
 import copy
 from contextlib import nullcontext
+import hashlib
+import importlib.metadata
+import json
 import logging
+import platform
+import shutil
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
+from uuid import uuid4
 
 import numpy as np
 from rich.console import Console
@@ -24,9 +32,9 @@ from adaptation.neuroonline import (
 )
 from adaptation.online_batch_adapter import BatchAdaptationConfig, OnlineBatchAdapter
 from models.factory import BaseModelAdapter, TorchModelAdapter
-from utils.markers import ArTcpCommandSender, LSLCommandOutlet, MarkerBackend
+from utils.markers import LSLCommandOutlet, MarkerBackend
 from utils.online_labels import OnlineLabelSource
-from utils.preprocessing import filter_and_transform
+from utils.preprocessing import DEFAULT_PREPROCESSING, preprocess_eeg_window
 from utils.stream_writer import StreamWriter
 
 LOGGER = logging.getLogger(__name__)
@@ -45,6 +53,16 @@ class PredictionResult:
     class_id: int | None
 
 
+class GameCommandOutlet(Protocol):
+    """Command transport required by the continuous Unity driving protocol."""
+
+    def push(self, command: str) -> None: ...
+
+    def push_with_ack(self, command: str) -> None: ...
+
+    def close(self) -> None: ...
+
+
 class RealTimeDecoder:
     """Continuously decode sliding EEG windows on a background thread."""
 
@@ -54,7 +72,7 @@ class RealTimeDecoder:
         model: BaseModelAdapter,
         console: Console,
         command_outlet: LSLCommandOutlet,
-        game_command_outlet: ArTcpCommandSender | None,
+        game_command_outlet: GameCommandOutlet | None,
         *,
         sfreq: float,
         window_sec: float,
@@ -71,6 +89,9 @@ class RealTimeDecoder:
         stop_on_game_disconnect: bool = True,
         batch_update_config: dict[str, Any] | None = None,
         n_classes: int = 3,
+        experiment_config: dict[str, Any] | None = None,
+        model_name: str | None = None,
+        model_source_path: Path | None = None,
     ) -> None:
         self._acquirer = acquirer
         self._model = model
@@ -84,6 +105,7 @@ class RealTimeDecoder:
         self._step_sec = step_sec
         self._confidence_threshold = confidence_threshold
         self._mc_dropout_passes = mc_dropout_passes
+        self._n_classes = max(int(n_classes), 1)
         self._online_update_enabled = bool(online_update_enabled)
         self._online_update_learning_rate = float(online_update_learning_rate)
         self._online_update_every = max(int(online_update_every), 1)
@@ -98,11 +120,29 @@ class RealTimeDecoder:
         self._last_game_transport_command: str | None = None
         self._last_game_transport_error: str | None = None
         self._last_game_transport_sent_at = 0.0
+        self._last_game_movement_sent_at = 0.0
         self._game_command_keepalive_sec = max(0.2, min(0.5, step_sec * 1.1))
         self._game_session_started = False
         self._game_disconnect_message: str | None = None
+        self._scene_sent_scene_index = -1
+        self._scene_sent_label_id: int | None = None
+        self._scene_sync_error: str | None = None
+        self._failed_scene_indices: set[int] = set()
+        self._scene_started_at: dict[int, float] = {}
+        self._scene_labels: dict[int, int] = {}
+        self._scene_end_recorded: set[int] = set()
+        self._timestamp_fallback_warned = False
         self._stop_on_game_disconnect = bool(stop_on_game_disconnect)
         self._thread_context = thread_context
+        self._experiment_config = copy.deepcopy(experiment_config or {})
+        self._model_name = str(
+            model_name or getattr(model, "model_name", type(model).__name__)
+        )
+        self._model_source_path = (
+            None if model_source_path is None else Path(model_source_path)
+        )
+        self._run_id = uuid4().hex
+        self._model_revision_records: list[dict[str, Any]] = []
         neuroonline_config = NeuroOnlineConfig.from_mapping(batch_update_config)
         batch_config = BatchAdaptationConfig.from_mapping(batch_update_config)
         self._batch_adapter: OnlineBatchAdapter | None = None
@@ -183,25 +223,44 @@ class RealTimeDecoder:
         self._last_game_transport_command = None
         self._last_game_transport_error = None
         self._last_game_transport_sent_at = 0.0
+        self._last_game_movement_sent_at = 0.0
         self._game_session_started = False
         self._game_disconnect_message = None
+        self._scene_sent_scene_index = -1
+        self._scene_sent_label_id = None
+        self._scene_sync_error = None
+        self._failed_scene_indices.clear()
+        self._scene_started_at.clear()
+        self._scene_labels.clear()
+        self._scene_end_recorded.clear()
+        self._model_revision_records.clear()
         if record and subject_id:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             realtime_root = save_dir or Path("records_storage") / subject_id / "realtime"
             self._save_dir = realtime_root / timestamp
             self._writer = StreamWriter(self._save_dir)
             self._writer.start({
+                "run_id": self._run_id,
                 "subject_id": subject_id,
                 "mode": "realtime",
-                "start_time": time.time(),
                 "sfreq": self._sfreq,
                 "window_sec": self._window_sec,
                 "step_sec": self._step_sec,
                 "channels": self._acquirer.metadata.n_channels,
+                "model_name": self._model_name,
                 "model_revision": self._model_revision,
+                "preprocessing": DEFAULT_PREPROCESSING.as_dict(),
                 "online_adaptation": self._online_adaptation_status(),
                 "online_label_source": self._online_label_source_metadata(),
+                "provenance": self._build_run_provenance(),
             })
+            self._writer.append_event(
+                "session_start",
+                run_id=self._run_id,
+                subject_id=subject_id,
+                model_name=self._model_name,
+            )
+            self._snapshot_model_revision(0, source="session_start")
 
         self._push_game_session_command("START")
         self.start()
@@ -216,15 +275,26 @@ class RealTimeDecoder:
             self._console.print("\n[bold red]停止实时解码[/bold red]")
         finally:
             self.stop()
+            self._record_active_scene_end(outcome="incomplete", reason="session_stop")
             if heartbeat is not None:
                 heartbeat()
             if hasattr(self, "_writer"):
+                self._writer.append_event(
+                    "session_stop",
+                    model_revision=self._model_revision,
+                )
                 self._writer.stop()
-                self._writer.update_manifest(
+                self._writer.finalize_manifest(
                     {
                         "model_revision": self._model_revision,
+                        "model_revisions": list(self._model_revision_records),
                         "online_adaptation": self._online_adaptation_status(),
                         "online_label_source": self._online_label_source_metadata(),
+                        "timing_diagnostics": getattr(
+                            self._acquirer,
+                            "timing_diagnostics",
+                            {},
+                        ),
                     }
                 )
                 self._console.print(f"[bold green]实时数据已保存[/bold green] {self._save_dir}")
@@ -249,14 +319,17 @@ class RealTimeDecoder:
         root_dir = save_dir or Path("records_storage") / subject_id / "test_mode" / timestamp
         writer = StreamWriter(root_dir)
         writer.start({
+            "run_id": self._run_id,
             "subject_id": subject_id,
             "mode": "test_mode",
-            "start_time": time.time(),
             "sfreq": self._sfreq,
             "window_sec": self._window_sec,
             "step_sec": self._step_sec,
             "channels": self._acquirer.metadata.n_channels,
+            "preprocessing": DEFAULT_PREPROCESSING.as_dict(),
+            "provenance": self._build_run_provenance(),
         })
+        writer.append_event("session_start", run_id=self._run_id, mode="test_mode")
         
         def update_stage(stage_name: str, elapsed_sec: float, total_sec: float) -> None:
             if stage_progress is not None:
@@ -281,6 +354,7 @@ class RealTimeDecoder:
         true_labels: list[int] = []
         pred_labels: list[int] = []
         confidences: list[float] = []
+        quality_accepted: list[bool] = []
         update_losses: list[float] = []
         run_status = "completed"
         run_error: str | None = None
@@ -292,6 +366,12 @@ class RealTimeDecoder:
                 if heartbeat is not None:
                     heartbeat()
                 marker_backend.send(label)
+                writer.append_event(
+                    "test_cue_start",
+                    cue_index=cue_index - 1,
+                    label_id=label,
+                    label_name=TEST_MODE_PROMPTS[label],
+                )
                 
                 # IMPORTANT: Delay for window_sec before starting to evaluate this cue.
                 # If window is 4s, the immediate chunk returned still mostly contains data PROR to the cue.
@@ -314,15 +394,19 @@ class RealTimeDecoder:
                 while time.monotonic() < block_end and time.monotonic() - started < duration_sec:
                     loop_started = time.perf_counter()
                     try:
-                        window, _ = self._acquirer.get_chunk(self._window_sec)
+                        window, timestamps = self._acquirer.get_chunk(self._window_sec)
                     except RuntimeError:
                         time.sleep(self._step_sec)
                         continue
-                    processed = filter_and_transform(window, sfreq=self._sfreq)
-                    probabilities = self._predict_proba(
+                    window_start, window_end = self._resolve_window_time_bounds(timestamps)
+                    preprocessing = preprocess_eeg_window(window, sfreq=self._sfreq)
+                    processed = preprocessing.data
+                    probability_batch, model_revision = self._predict_proba_with_revision(
                         processed[None, ...],
                         mc_dropout_passes=self._mc_dropout_passes,
-                    )[0]
+                    )
+                    probabilities = probability_batch[0]
+                    raw_prediction = int(np.argmax(probabilities))
                     result = self._post_process(probabilities)
                     self._console.print(
                         f"[green][预测][/green] {result.label} "
@@ -334,16 +418,79 @@ class RealTimeDecoder:
                     self._emit_status(result, game_command)
                     
                     pred_class = -1 if result.class_id is None else int(result.class_id)
+                    timing_diagnostics = getattr(
+                        self._acquirer,
+                        "timing_diagnostics",
+                        {},
+                    ) or {}
                     writer.put(
                         window=window.astype(np.float32),
                         y_true=label,
                         y_pred=pred_class,
-                        confidence=float(result.confidence)
+                        confidence=float(result.confidence),
+                        raw_pred=raw_prediction,
+                        model_revision=model_revision,
+                        label_event_id=f"test-cue-{cue_index - 1:06d}",
+                        probabilities=probabilities,
+                        uncertainty=float(result.uncertainty),
+                        window_start_monotonic=window_start,
+                        window_end_monotonic=window_end,
+                        scene_index=cue_index - 1,
+                        scene_label=label,
+                        mapped_command=game_command or "STOP",
+                        transport_command=self._last_game_transport_command or "",
+                        transport_success=(
+                            self._last_game_transport_error is None
+                            and self._last_game_transport_sent_at > 0.0
+                        ),
+                        transport_sent_at_monotonic=self._last_game_transport_sent_at,
+                        transport_error=self._last_game_transport_error or "",
+                        quality_accepted=preprocessing.quality.accepted,
+                        quality_peak_abs_uv=preprocessing.quality.peak_abs_uv,
+                        quality_clip_fraction=preprocessing.quality.clip_fraction,
+                        quality_bad_channel_fraction=(
+                            preprocessing.quality.bad_channel_fraction
+                        ),
+                        quality_reasons=preprocessing.quality.reasons,
+                        quality_bad_channel_indices=(
+                            preprocessing.quality.bad_channel_indices
+                        ),
+                        quality_nonfinite_fraction=(
+                            preprocessing.quality.nonfinite_fraction
+                        ),
+                        timing_queueing_jitter_sec=float(
+                            timing_diagnostics.get("queueing_jitter_sec", 0.0)
+                        ),
+                        timing_transport_delay_compensation_sec=float(
+                            timing_diagnostics.get(
+                                "transport_delay_compensation_sec",
+                                0.0,
+                            )
+                        ),
+                        timing_packet_arrival_monotonic=float(
+                            timing_diagnostics.get(
+                                "packet_arrival_monotonic",
+                                float("nan"),
+                            )
+                        ),
+                        timing_received_packets=float(
+                            timing_diagnostics.get("received_packets", 0.0)
+                        ),
+                        timing_packet_loss_count=float(
+                            timing_diagnostics.get("packet_loss_count", 0.0)
+                        ),
+                        timing_total_source_samples=float(
+                            timing_diagnostics.get("total_source_samples", 0.0)
+                        ),
                     )
 
-                    update_metrics = self._maybe_update_model(
-                        processed=processed,
-                        true_label=label,
+                    update_metrics = (
+                        self._maybe_update_model(
+                            processed=processed,
+                            true_label=label,
+                        )
+                        if preprocessing.quality.accepted
+                        else None
                     )
                     if update_metrics:
                         loss = update_metrics.get("loss")
@@ -353,6 +500,7 @@ class RealTimeDecoder:
                     true_labels.append(label)
                     pred_labels.append(pred_class)
                     confidences.append(float(result.confidence))
+                    quality_accepted.append(preprocessing.quality.accepted)
                     if heartbeat is not None:
                         heartbeat()
                     update_stage(
@@ -371,26 +519,44 @@ class RealTimeDecoder:
             raise
         finally:
             self.stop()
+            writer.append_event("session_stop", status=run_status, error=run_error)
             writer.stop()
             if run_status == "failed":
-                writer.update_manifest({"status": run_status, "error": run_error})
+                writer.finalize_manifest({"status": run_status, "error": run_error})
             if heartbeat is not None:
                 heartbeat()
 
         if not true_labels:
-            writer.update_manifest({"status": "no_windows", "error": "No EEG windows were collected."})
+            writer.finalize_manifest(
+                {"status": "no_windows", "error": "No EEG windows were collected."}
+            )
             raise RuntimeError("Test mode did not collect any EEG windows.")
 
         y_true = np.asarray(true_labels, dtype=np.int64)
         y_pred = np.asarray(pred_labels, dtype=np.int64)
         pred_valid = y_pred >= 0
+        quality_mask = np.asarray(quality_accepted, dtype=np.bool_)
         accuracy = float(np.mean(y_pred == y_true))
         valid_accuracy = float(np.mean(y_pred[pred_valid] == y_true[pred_valid])) if np.any(pred_valid) else 0.0
+        quality_prediction_mask = quality_mask & pred_valid
+        quality_accuracy = (
+            float(
+                np.mean(
+                    y_pred[quality_prediction_mask]
+                    == y_true[quality_prediction_mask]
+                )
+            )
+            if np.any(quality_prediction_mask)
+            else 0.0
+        )
         
-        writer.update_manifest({
+        writer.finalize_manifest({
             "status": run_status,
             "accuracy": accuracy,
             "valid_accuracy": valid_accuracy,
+            "quality_accuracy": quality_accuracy,
+            "quality_accepted_windows": int(np.sum(quality_mask)),
+            "quality_rejected_windows": int(np.sum(~quality_mask)),
             "online_update_enabled": self._online_update_enabled,
             "online_update_count": self._online_update_count,
             "online_update_learning_rate": self._online_update_learning_rate,
@@ -406,6 +572,8 @@ class RealTimeDecoder:
             "windows": len(true_labels),
             "accuracy": accuracy,
             "valid_accuracy": valid_accuracy,
+            "quality_accuracy": quality_accuracy,
+            "quality_accepted_windows": int(np.sum(quality_mask)),
         }
 
     def _decode_loop(self) -> None:
@@ -413,15 +581,16 @@ class RealTimeDecoder:
             started_at = time.perf_counter()
             try:
                 try:
-                    window, _ = self._acquirer.get_chunk(self._window_sec)
+                    window, timestamps = self._acquirer.get_chunk(self._window_sec)
                 except RuntimeError as exc:
                     if "Not enough data" in str(exc):
                         self._sleep_with_heartbeat(self._step_sec, None)
                         continue
                     raise
-                window_end = time.monotonic()
-                window_start = window_end - self._window_sec
-                processed = filter_and_transform(window, sfreq=self._sfreq)
+                window_start, window_end = self._resolve_window_time_bounds(timestamps)
+                self._sync_game_scene()
+                preprocessing = preprocess_eeg_window(window, sfreq=self._sfreq)
+                processed = preprocessing.data
                 probability_batch, model_revision = self._predict_proba_with_revision(
                     processed[None, ...],
                     mc_dropout_passes=self._mc_dropout_passes,
@@ -435,7 +604,6 @@ class RealTimeDecoder:
                 )
                 self._command_outlet.push(result.label)
                 game_command = self._to_game_command(result)
-                game_command = self._gate_game_command_for_protocol(game_command)
                 self._push_game_command(game_command)
                 self._emit_status(result, game_command)
 
@@ -443,16 +611,34 @@ class RealTimeDecoder:
                     window_start=window_start,
                     window_end=window_end,
                 )
-                if online_label is not None:
+                if online_label is not None and preprocessing.quality.accepted:
                     self._handle_online_label(
                         processed=processed,
                         probabilities=probabilities,
+                        operational_prediction=result.class_id,
+                        prediction_model_revision=model_revision,
                         online_label=online_label,
                         window_end=window_end,
                     )
                 
                 if hasattr(self, "_record") and self._record and hasattr(self, "_writer"):
                     pred_class = -1 if result.class_id is None else int(result.class_id)
+                    timing_diagnostics = getattr(
+                        self._acquirer,
+                        "timing_diagnostics",
+                        {},
+                    ) or {}
+                    label_payload = (
+                        getattr(online_label, "payload", None) or {}
+                        if online_label is not None
+                        else {}
+                    )
+                    scene_index = int(
+                        label_payload.get(
+                            "scene_index",
+                            getattr(self, "_scene_sent_scene_index", -1),
+                        )
+                    )
                     self._writer.put(
                         window=window.astype(np.float32),
                         y_true=-1 if online_label is None else int(online_label.label_id),
@@ -461,6 +647,60 @@ class RealTimeDecoder:
                         raw_pred=raw_prediction,
                         model_revision=model_revision,
                         label_event_id="" if online_label is None else str(online_label.event_id),
+                        probabilities=probabilities,
+                        uncertainty=float(result.uncertainty),
+                        window_start_monotonic=window_start,
+                        window_end_monotonic=window_end,
+                        scene_index=scene_index,
+                        scene_label=(
+                            -1 if online_label is None else int(online_label.label_id)
+                        ),
+                        scene_failed=scene_index in self._failed_scene_indices,
+                        mapped_command=game_command or "STOP",
+                        transport_command=self._last_game_transport_command or "",
+                        transport_success=(
+                            self._last_game_transport_error is None
+                            and self._last_game_transport_sent_at > 0.0
+                        ),
+                        transport_sent_at_monotonic=self._last_game_transport_sent_at,
+                        transport_error=self._last_game_transport_error or "",
+                        quality_accepted=preprocessing.quality.accepted,
+                        quality_peak_abs_uv=preprocessing.quality.peak_abs_uv,
+                        quality_clip_fraction=preprocessing.quality.clip_fraction,
+                        quality_bad_channel_fraction=(
+                            preprocessing.quality.bad_channel_fraction
+                        ),
+                        quality_reasons=preprocessing.quality.reasons,
+                        quality_bad_channel_indices=(
+                            preprocessing.quality.bad_channel_indices
+                        ),
+                        quality_nonfinite_fraction=(
+                            preprocessing.quality.nonfinite_fraction
+                        ),
+                        timing_queueing_jitter_sec=float(
+                            timing_diagnostics.get("queueing_jitter_sec", 0.0)
+                        ),
+                        timing_transport_delay_compensation_sec=float(
+                            timing_diagnostics.get(
+                                "transport_delay_compensation_sec",
+                                0.0,
+                            )
+                        ),
+                        timing_packet_arrival_monotonic=float(
+                            timing_diagnostics.get(
+                                "packet_arrival_monotonic",
+                                float("nan"),
+                            )
+                        ),
+                        timing_received_packets=float(
+                            timing_diagnostics.get("received_packets", 0.0)
+                        ),
+                        timing_packet_loss_count=float(
+                            timing_diagnostics.get("packet_loss_count", 0.0)
+                        ),
+                        timing_total_source_samples=float(
+                            timing_diagnostics.get("total_source_samples", 0.0)
+                        ),
                     )
             except Exception as exc:  # noqa: BLE001
                 LOGGER.exception("Realtime decoding failed")
@@ -470,11 +710,42 @@ class RealTimeDecoder:
             sleep_time = max(0.0, self._step_sec - elapsed)
             self._sleep_with_heartbeat(sleep_time, None)
 
+    def _resolve_window_time_bounds(self, timestamps: np.ndarray) -> tuple[float, float]:
+        """Resolve an EEG window on the same monotonic clock used by Unity."""
+
+        domain = str(
+            getattr(self._acquirer.metadata, "timestamp_domain", "relative")
+        ).strip().lower()
+        values = np.asarray(timestamps, dtype=np.float64).reshape(-1)
+        if domain == "monotonic" and values.size:
+            window_start = float(values[0])
+            window_end = float(values[-1]) + (1.0 / float(self._sfreq))
+            duration = window_end - window_start
+            now = time.monotonic()
+            if (
+                np.all(np.isfinite(values))
+                and window_end >= window_start
+                and np.all(np.diff(values) >= 0.0)
+                and abs(duration - self._window_sec) <= max(2.0 / self._sfreq, 0.02)
+                and window_end <= now + max(2.0 / self._sfreq, 0.02)
+            ):
+                return window_start, window_end
+
+        if domain == "monotonic" and not self._timestamp_fallback_warned:
+            LOGGER.warning(
+                "Acquirer supplied invalid monotonic timestamps; falling back to local retrieval time."
+            )
+            self._timestamp_fallback_warned = True
+        window_end = time.monotonic()
+        return window_end - self._window_sec, window_end
+
     def _handle_online_label(
         self,
         *,
         processed: np.ndarray,
         probabilities: np.ndarray,
+        operational_prediction: int | None,
+        prediction_model_revision: int,
         online_label: Any,
         window_end: float,
     ) -> None:
@@ -486,6 +757,10 @@ class RealTimeDecoder:
                 processed,
                 label_id,
                 predicted_label=int(np.argmax(probabilities)),
+                operational_predicted_label=operational_prediction,
+                probabilities=probabilities,
+                event_id=str(getattr(online_label, "event_id", "")),
+                model_revision=prediction_model_revision,
             )
             status = self._neuroonline_adapter.status()
             if status.get("training_in_background") and not self._neuroonline_training_notice:
@@ -550,10 +825,19 @@ class RealTimeDecoder:
         if self._online_label_source is None:
             return None
         try:
-            return self._online_label_source.get_label(
+            label = self._online_label_source.get_label(
                 window_start=window_start,
                 window_end=window_end,
             )
+            if label is None or str(getattr(label, "source", "")) != "cued-protocol":
+                return label
+            payload = getattr(label, "payload", None) or {}
+            label_scene_index = int(payload.get("scene_index", -1))
+            if label_scene_index != getattr(self, "_scene_sent_scene_index", -1):
+                return None
+            if int(label.label_id) != getattr(self, "_scene_sent_label_id", None):
+                return None
+            return label
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("Failed to read online label: %s", exc)
             return None
@@ -583,10 +867,24 @@ class RealTimeDecoder:
         frequency_masked: np.ndarray,
         labels: np.ndarray,
     ) -> dict[str, Any]:
+        update_started_monotonic = time.monotonic()
         with self._model_lock:
             if not isinstance(self._model, NeuroOnlineModelAdapter):
                 raise RuntimeError("NeuroOnline model adapter is not active")
+            base_model_revision = self._model_revision
             candidate = copy.deepcopy(self._model)
+        writer = getattr(self, "_writer", None)
+        if writer is not None:
+            writer.append_event(
+                "model_update_start",
+                timestamp_monotonic=update_started_monotonic,
+                base_model_revision=base_model_revision,
+                training_samples=int(labels.shape[0]),
+                class_counts=np.bincount(
+                    np.asarray(labels, dtype=np.int64),
+                    minlength=self._n_classes,
+                ).tolist(),
+            )
         result = candidate.neuroonline_update(
             original,
             time_masked,
@@ -597,6 +895,16 @@ class RealTimeDecoder:
             self._model = candidate
             self._model_revision += 1
             result["model_revision"] = self._model_revision
+        result["base_model_revision"] = base_model_revision
+        result["swap_timestamp_monotonic"] = time.monotonic()
+        if writer is not None:
+            writer.append_event(
+                "model_swap",
+                timestamp_monotonic=float(result["swap_timestamp_monotonic"]),
+                base_model_revision=base_model_revision,
+                model_revision=self._model_revision,
+                training_samples=int(labels.shape[0]),
+            )
         return result
 
     def _on_neuroonline_update_complete(self, result: dict[str, Any]) -> None:
@@ -609,14 +917,32 @@ class RealTimeDecoder:
                 f"revision={int(result.get('model_revision', self._model_revision))} "
                 f"loss={float(result.get('loss', 0.0)):.4f}"
             )
+        writer = getattr(self, "_writer", None)
+        if writer is not None:
+            writer.append_event(
+                "model_update_complete",
+                model_revision=int(result.get("model_revision", self._model_revision)),
+                **{
+                    key: value
+                    for key, value in result.items()
+                    if key not in {"model_revision"}
+                },
+            )
         self._persist_online_adaptation_status()
 
     def _save_current_model(self) -> None:
         if self._model_save_path is None:
             return
         with self._model_lock:
-            self._model_save_path.parent.mkdir(parents=True, exist_ok=True)
-            self._model.save(self._model_save_path)
+            model_snapshot = copy.deepcopy(self._model)
+            revision = getattr(self, "_model_revision", 0)
+        self._model_save_path.parent.mkdir(parents=True, exist_ok=True)
+        model_snapshot.save(self._model_save_path)
+        self._snapshot_model_revision(
+            revision,
+            source="online_update",
+            model_snapshot=model_snapshot,
+        )
 
     def _swap_model(self, candidate: BaseModelAdapter) -> None:
         with self._model_lock:
@@ -730,16 +1056,165 @@ class RealTimeDecoder:
             return "RIGHT"
         return None
 
-    def _gate_game_command_for_protocol(self, command: str | None) -> str | None:
-        """Keep the car stopped outside an automatic cue protocol's control phase."""
+    def _sync_game_scene(self) -> None:
+        """Send the current label as Unity's obstacle-layout source of truth."""
 
-        source_status = self._online_label_source_status()
-        if not source_status or source_status.get("source") != "cued-protocol":
-            return command
-        phase = str(source_status.get("phase", "preparing"))
-        if phase == "done":
-            self._stop_event.set()
-        return command if phase == "control" else "STOP"
+        self._consume_game_scene_events()
+        status = self._online_label_source_status()
+        if not status or status.get("source") != "cued-protocol":
+            return
+        if status.get("protocol_mode") != "continuous-scene":
+            return
+        if status.get("phase") == "preparing":
+            return
+        scene_index = int(status.get("scene_index", -1))
+        label_id = int(status.get("label_id", -1))
+        if (
+            scene_index == getattr(self, "_scene_sent_scene_index", -1)
+            and label_id == getattr(self, "_scene_sent_label_id", None)
+        ):
+            return
+        command_by_label = {0: "SCENE_LEFT", 1: "SCENE_RIGHT", 2: "SCENE_IDLE"}
+        command = command_by_label.get(label_id)
+        if command is None:
+            self._scene_sync_error = f"unsupported scene label id: {label_id}"
+            return
+        previous_scene = getattr(self, "_scene_sent_scene_index", -1)
+        if previous_scene >= 0 and previous_scene != scene_index:
+            failed_scene_indices = getattr(self, "_failed_scene_indices", set())
+            self._record_scene_end(
+                previous_scene,
+                outcome=(
+                    "failed"
+                    if previous_scene in failed_scene_indices
+                    else "success"
+                ),
+                reason="fixed_boundary",
+            )
+        if self._push_game_scene_transport_command(command):
+            confirm_scene = getattr(
+                self._online_label_source,
+                "confirm_scene_applied",
+                None,
+            )
+            if callable(confirm_scene) and not confirm_scene(
+                scene_index=scene_index,
+                timestamp_monotonic=self._last_game_transport_sent_at,
+            ):
+                self._scene_sync_error = (
+                    f"Unity ACK arrived after scene {scene_index + 1} was no longer active"
+                )
+                return
+            self._scene_sent_scene_index = scene_index
+            self._scene_sent_label_id = label_id
+            if not hasattr(self, "_scene_started_at"):
+                self._scene_started_at = {}
+            if not hasattr(self, "_scene_labels"):
+                self._scene_labels = {}
+            self._scene_started_at[scene_index] = self._last_game_transport_sent_at
+            self._scene_labels[scene_index] = label_id
+            writer = getattr(self, "_writer", None)
+            if writer is not None:
+                writer.append_event(
+                    "scene_start",
+                    timestamp_monotonic=self._last_game_transport_sent_at,
+                    scene_index=scene_index,
+                    scene_number=scene_index + 1,
+                    label_id=label_id,
+                    label_name=status.get("label_name"),
+                    unity_command=command,
+                    ack_confirmed=True,
+                    planned_duration_sec=float(
+                        self._online_label_source_metadata().get(
+                            "scene_duration_sec",
+                            0.0,
+                        )
+                        if self._online_label_source_metadata()
+                        else 0.0
+                    ),
+                )
+            self._scene_sync_error = None
+            return
+        self._scene_sync_error = self._last_game_transport_error or "scene command send failed"
+
+    def _consume_game_scene_events(self) -> None:
+        if self._game_command_outlet is None or self._online_label_source is None:
+            return
+        poll_events = getattr(self._game_command_outlet, "poll_events", None)
+        mark_scene_failed = getattr(
+            self._online_label_source,
+            "mark_scene_failed",
+            None,
+        )
+        if not callable(poll_events) or not callable(mark_scene_failed):
+            return
+        try:
+            events = poll_events()
+        except Exception as exc:  # noqa: BLE001
+            self._last_game_transport_error = str(exc)
+            LOGGER.warning("Failed to poll Unity scene events: %s", exc)
+            if self._stop_on_game_disconnect:
+                self._game_disconnect_message = f"Unity scene event connection lost: {exc}"
+                self._stop_event.set()
+            return
+
+        for event in events:
+            if str(event.get("event", "")).strip().upper() != "SCENE_FAILED":
+                continue
+            failed_scene_index = int(event.get("scene_number", 0)) - 1
+            if failed_scene_index != self._scene_sent_scene_index:
+                LOGGER.warning(
+                    "Ignored stale Unity SCENE_FAILED event scene_number=%s; current=%s",
+                    event.get("scene_number"),
+                    self._scene_sent_scene_index + 1,
+                )
+                continue
+            recorded = mark_scene_failed(
+                timestamp_monotonic=time.monotonic(),
+                expected_scene_index=failed_scene_index,
+            )
+            if recorded:
+                if not hasattr(self, "_failed_scene_indices"):
+                    self._failed_scene_indices = set()
+                self._failed_scene_indices.add(failed_scene_index)
+                writer = getattr(self, "_writer", None)
+                if writer is not None:
+                    writer.append_event(
+                        "scene_failed",
+                        timestamp_monotonic=time.monotonic(),
+                        scene_index=failed_scene_index,
+                        scene_number=failed_scene_index + 1,
+                        label_id=self._scene_labels.get(
+                            failed_scene_index,
+                            self._scene_sent_label_id,
+                        ),
+                        unity_event=dict(event),
+                    )
+                self._console.print(
+                    f"[bold yellow]Scene {failed_scene_index + 1} 避障失败；"
+                    "保持当前标签，到固定 Scene 边界再进入下一 Scene[/bold yellow]"
+                )
+
+    def _push_game_scene_transport_command(self, command: str) -> bool:
+        if self._game_command_outlet is None:
+            return False
+        push_with_ack = getattr(self._game_command_outlet, "push_with_ack", None)
+        if not callable(push_with_ack):
+            self._last_game_transport_error = "AR transport does not support Unity scene ACK"
+            return False
+        try:
+            push_with_ack(command)
+            self._last_game_transport_command = command
+            self._last_game_transport_error = None
+            self._last_game_transport_sent_at = time.monotonic()
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self._last_game_transport_error = str(exc)
+            LOGGER.warning("Failed to synchronize Unity scene '%s': %s", command, exc)
+            if self._stop_on_game_disconnect:
+                self._game_disconnect_message = f"Unity scene synchronization failed: {exc}"
+                self._stop_event.set()
+            return False
 
     def _push_game_command(self, command: str | None) -> None:
         if self._game_command_outlet is None:
@@ -749,7 +1224,7 @@ class RealTimeDecoder:
             if self._last_game_command is None:
                 self._push_game_keepalive()
                 return
-            self._push_game_transport_command("STOP")
+            self._push_game_transport_command("STOP", movement=True)
             self._last_game_command = None
             return
 
@@ -757,12 +1232,12 @@ class RealTimeDecoder:
         now = time.monotonic()
         if (
             command == self._last_game_command
-            and now - self._last_game_transport_sent_at < self._game_command_keepalive_sec
+            and now - self._last_game_movement_sent_at < self._game_command_keepalive_sec
         ):
             return
 
-        self._push_game_transport_command(command)
-        self._last_game_command = command
+        if self._push_game_transport_command(command, movement=True):
+            self._last_game_command = command
 
     def _push_game_session_command(self, command: str) -> None:
         if self._game_command_outlet is None or self._game_session_started:
@@ -774,11 +1249,11 @@ class RealTimeDecoder:
         if not self._game_session_started:
             return
         now = time.monotonic()
-        if now - self._last_game_transport_sent_at < self._game_command_keepalive_sec:
+        if now - self._last_game_movement_sent_at < self._game_command_keepalive_sec:
             return
-        self._push_game_transport_command("STOP")
+        self._push_game_transport_command("STOP", movement=True)
 
-    def _push_game_transport_command(self, command: str) -> bool:
+    def _push_game_transport_command(self, command: str, *, movement: bool = False) -> bool:
         if self._game_command_outlet is None:
             return False
         try:
@@ -786,6 +1261,8 @@ class RealTimeDecoder:
             self._last_game_transport_command = command
             self._last_game_transport_error = None
             self._last_game_transport_sent_at = time.monotonic()
+            if movement:
+                self._last_game_movement_sent_at = self._last_game_transport_sent_at
             return True
         except Exception as exc:  # noqa: BLE001
             self._last_game_transport_error = str(exc)
@@ -794,6 +1271,192 @@ class RealTimeDecoder:
                 self._game_disconnect_message = f"Unity game connection lost: {exc}"
                 self._stop_event.set()
             return False
+
+    def _record_scene_end(
+        self,
+        scene_index: int,
+        *,
+        outcome: str,
+        reason: str,
+        timestamp_monotonic: float | None = None,
+    ) -> None:
+        index = int(scene_index)
+        scene_end_recorded = getattr(self, "_scene_end_recorded", set())
+        if index < 0 or index in scene_end_recorded:
+            return
+        ended_at = (
+            time.monotonic()
+            if timestamp_monotonic is None
+            else float(timestamp_monotonic)
+        )
+        started_at = getattr(self, "_scene_started_at", {}).get(index)
+        failed_scene_indices = getattr(self, "_failed_scene_indices", set())
+        writer = getattr(self, "_writer", None)
+        if writer is not None:
+            writer.append_event(
+                "scene_end",
+                timestamp_monotonic=ended_at,
+                scene_index=index,
+                scene_number=index + 1,
+                label_id=getattr(self, "_scene_labels", {}).get(index, -1),
+                outcome=str(outcome),
+                reason=str(reason),
+                collision_recorded=index in failed_scene_indices,
+                duration_sec=(
+                    None if started_at is None else max(ended_at - started_at, 0.0)
+                ),
+            )
+        if not hasattr(self, "_scene_end_recorded"):
+            self._scene_end_recorded = set()
+        self._scene_end_recorded.add(index)
+
+    def _record_active_scene_end(self, *, outcome: str, reason: str) -> None:
+        self._record_scene_end(
+            getattr(self, "_scene_sent_scene_index", -1),
+            outcome=outcome,
+            reason=reason,
+        )
+
+    def _snapshot_model_revision(
+        self,
+        revision: int,
+        *,
+        source: str,
+        model_snapshot: BaseModelAdapter | None = None,
+    ) -> None:
+        writer = getattr(self, "_writer", None)
+        save_dir = getattr(self, "_save_dir", None)
+        if writer is None or save_dir is None:
+            return
+        revision_value = int(revision)
+        if any(
+            int(record.get("model_revision", -1)) == revision_value
+            for record in self._model_revision_records
+        ):
+            return
+        revision_dir = Path(save_dir) / "model_revisions"
+        revision_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint = revision_dir / f"revision_{revision_value:04d}.pt"
+        sidecar = Path(f"{checkpoint}.neuroonline.pt")
+        if (
+            revision_value == 0
+            and self._model_source_path is not None
+            and self._model_source_path.exists()
+        ):
+            shutil.copy2(self._model_source_path, checkpoint)
+            source_sidecar = Path(f"{self._model_source_path}.neuroonline.pt")
+            if source_sidecar.exists():
+                shutil.copy2(source_sidecar, sidecar)
+        elif model_snapshot is not None:
+            model_snapshot.save(checkpoint)
+        else:
+            with self._model_lock:
+                snapshot = copy.deepcopy(self._model)
+            snapshot.save(checkpoint)
+        record: dict[str, Any] = {
+            "model_revision": revision_value,
+            "source": str(source),
+            "checkpoint": checkpoint.relative_to(save_dir).as_posix(),
+            "checkpoint_sha256": self._sha256_file(checkpoint),
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        if sidecar.exists():
+            record["crm_sidecar"] = sidecar.relative_to(save_dir).as_posix()
+            record["crm_sidecar_sha256"] = self._sha256_file(sidecar)
+        self._model_revision_records.append(record)
+        writer.append_event("model_checkpoint", **record)
+
+    def _build_run_provenance(self) -> dict[str, Any]:
+        project_root = Path(__file__).resolve().parents[1]
+        commit: str | None = None
+        dirty: bool | None = None
+        try:
+            commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=project_root,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout.strip()
+            dirty = bool(
+                subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=project_root,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                ).stdout.strip()
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+        package_versions: dict[str, str | None] = {}
+        for package in ("numpy", "scipy", "torch", "scikit-learn", "mne"):
+            try:
+                package_versions[package] = importlib.metadata.version(package)
+            except importlib.metadata.PackageNotFoundError:
+                package_versions[package] = None
+        config_json = json.dumps(
+            self._experiment_config,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+        storage_config = self._experiment_config.get("storage", {}) or {}
+        native_recording_id = str(
+            storage_config.get("native_recording_id", "") or ""
+        ).strip()
+        model_files: list[dict[str, Any]] = []
+        if self._model_source_path is not None and self._model_source_path.exists():
+            model_files.append(
+                {
+                    "path": str(self._model_source_path),
+                    "sha256": self._sha256_file(self._model_source_path),
+                    "size_bytes": self._model_source_path.stat().st_size,
+                }
+            )
+            source_sidecar = Path(f"{self._model_source_path}.neuroonline.pt")
+            if source_sidecar.exists():
+                model_files.append(
+                    {
+                        "path": str(source_sidecar),
+                        "sha256": self._sha256_file(source_sidecar),
+                        "size_bytes": source_sidecar.stat().st_size,
+                    }
+                )
+        return {
+            "run_id": self._run_id,
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "git": {"commit": commit, "dirty": dirty},
+            "platform": platform.platform(),
+            "python": sys.version,
+            "packages": package_versions,
+            "experiment_config": self._experiment_config,
+            "experiment_config_sha256": hashlib.sha256(config_json).hexdigest(),
+            "random_seed": int(
+                self._experiment_config.get("online_adaptation", {})
+                .get("neuroonline", {})
+                .get("random_seed", 42)
+            ),
+            "model_name": self._model_name,
+            "initial_model_files": model_files,
+            "native_amplifier_recording": {
+                "required": True,
+                "recording_id": native_recording_id or None,
+                "declared": bool(native_recording_id),
+                "note": "Preserve the Neuracle native BDF/NDF file and trigger channel with this run ID.",
+            },
+        }
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
 
     def _emit_status(self, result: PredictionResult, game_command: str | None) -> None:
         if self._status_callback is None:
@@ -809,6 +1472,11 @@ class RealTimeDecoder:
             "last_send_success": self._last_game_transport_error is None and self._last_game_transport_sent_at > 0.0,
             "last_send_error": self._last_game_transport_error,
             "model_revision": getattr(self, "_model_revision", 0),
+            "timing_alignment": getattr(
+                getattr(self, "_acquirer", None),
+                "timing_diagnostics",
+                {},
+            ),
             "updated_at": time.time(),
         }
         adaptation_status = self._online_adaptation_status()
@@ -841,7 +1509,17 @@ class RealTimeDecoder:
         except Exception as exc:  # noqa: BLE001
             LOGGER.debug("Failed to read online label source status: %s", exc)
             return None
-        return dict(payload) if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            return None
+        result = dict(payload)
+        if result.get("source") == "cued-protocol":
+            result["scene_synced"] = (
+                int(result.get("scene_index", -1))
+                == getattr(self, "_scene_sent_scene_index", -1)
+                and int(result.get("label_id", -1)) == getattr(self, "_scene_sent_label_id", None)
+            )
+            result["scene_sync_error"] = getattr(self, "_scene_sync_error", None)
+        return result
 
     def _online_label_source_metadata(self) -> dict[str, Any] | None:
         source = getattr(self, "_online_label_source", None)

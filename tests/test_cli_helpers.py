@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
 
@@ -20,13 +21,16 @@ import yaml
 from acquisition.base import AcquirerMetadata, ElectrodeImpedance, classify_impedance_kohm
 from acquisition.brainco_acquirer import BrainCoAcquirer
 from adaptation.calibrator import Calibrator
-from adaptation.mi_protocol import ProtocolConfig, generate_block_sequence
+from adaptation.mi_protocol import (
+    ProtocolConfig,
+    build_session_plan,
+    generate_block_sequence,
+)
 from cli import (
     build_acquirer,
     build_game_command_outlet,
     build_model_path,
     default_config,
-    dummy_decoder_asset_path,
     effective_device_name,
     iter_test_mode_chunks,
     load_calibration_windows,
@@ -38,8 +42,9 @@ from cli import (
 )
 from decoder.real_time_decoder import PredictionResult, RealTimeDecoder
 from game_command_router import SharedGameCommandRouter
-from models.factory import ModelFactory
+from models.factory import ModelFactory, split_train_validation_indices
 from utils.online_labels import ManualOnlineLabelSource, coerce_label
+from tools.verify_experiment_bundle import verify_bundle
 
 
 class CliHelperTests(unittest.TestCase):
@@ -49,6 +54,63 @@ class CliHelperTests(unittest.TestCase):
         self.assertEqual(parse_subject_number("S001"), 1)
         self.assertEqual(parse_subject_number("subject-17"), 17)
         self.assertEqual(parse_subject_number("demo"), 1)
+
+    def test_recalibration_protocol_collects_exactly_twelve_minutes(self) -> None:
+        protocol = ProtocolConfig.from_config(
+            {
+                "window_sec": 2.0,
+                "step_sec": 0.5,
+                "protocol": {
+                    "baseline_segments": [
+                        {
+                            "name": "eyes_open_fixation",
+                            "duration_sec": 60.0,
+                            "instruction": "test",
+                        }
+                    ],
+                    "trial_timing": {
+                        "fixation_sec": 2.0,
+                        "cue_sec": 1.0,
+                        "control_sec": 5.0,
+                        "iti_sec": 2.0,
+                    },
+                    "calibration_blocks": 4,
+                    "calibration_trials_per_class_per_block": 5,
+                    "rest_between_blocks_sec": 20.0,
+                },
+            }
+        )
+
+        plan = build_session_plan(protocol)
+        collection_seconds = (
+            sum(segment.duration_sec for segment in plan.baseline_segments)
+            + plan.total_formal_trials * plan.trial_timing.total_sec
+            + (len(plan.blocks) - 1) * plan.rest_between_blocks_sec
+        )
+
+        self.assertEqual(plan.subject_mode, "recalibration")
+        self.assertEqual(plan.total_formal_trials, 60)
+        self.assertEqual(collection_seconds, 720.0)
+        for block in plan.blocks:
+            self.assertEqual(block.count("left"), 5)
+            self.assertEqual(block.count("right"), 5)
+            self.assertEqual(block.count("idle"), 5)
+
+    def test_grouped_validation_never_splits_one_trial_across_sets(self) -> None:
+        groups = np.repeat(np.arange(60, dtype=np.int64), 5)
+        group_labels = np.tile(np.repeat(np.arange(3, dtype=np.int64), 20), 1)
+        labels = np.repeat(group_labels, 5)
+
+        train_indices, validation_indices = split_train_validation_indices(
+            labels,
+            groups=groups,
+            random_state=17,
+        )
+
+        self.assertFalse(
+            set(groups[train_indices]).intersection(groups[validation_indices])
+        )
+        self.assertEqual(set(labels[validation_indices]), {0, 1, 2})
 
     def test_build_model_path_extension(self) -> None:
         config = {"storage": {"models_dir": "models_storage"}, "device_type": "brainco"}
@@ -122,7 +184,7 @@ class CliHelperTests(unittest.TestCase):
             "subject_id": "S001",
             "model_name": "riemann-mdm",
             "device_type": "neuracle",
-            "sfreq": 250,
+            "sfreq": 200,
             "n_channels": 64,
             "n_classes": 3,
             "window_sec": 4.0,
@@ -133,6 +195,23 @@ class CliHelperTests(unittest.TestCase):
             config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
             config = load_config(config_path)
             self.assertEqual(config["subject_id"], "S001")
+
+    def test_load_config_rejects_wrong_neuracle_source_rate(self) -> None:
+        payload = {
+            "subject_id": "S001",
+            "model_name": "shallowconvnet",
+            "device_type": "neuracle",
+            "sfreq": 200,
+            "n_classes": 3,
+            "window_sec": 2.0,
+            "step_sec": 0.5,
+            "device": {"neuracle_source_sfreq": 200},
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "config.yaml"
+            config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+            with self.assertRaisesRegex(Exception, "250 Hz"):
+                load_config(config_path)
 
     def test_load_config_creates_default_when_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -204,11 +283,12 @@ class CliHelperTests(unittest.TestCase):
 
     def test_build_brainco_acquirer(self) -> None:
         config = {
-            "sfreq": 250,
+            "sfreq": 200,
             "buffer_sec": 60,
             "device": {
                 "brainco_addr": "",
                 "brainco_port": 0,
+                "brainco_source_sfreq": 250,
                 "brainco_auto_discover": True,
                 "brainco_scan_timeout_sec": 6.0,
                 "brainco_ready_timeout_sec": 10.0,
@@ -220,6 +300,27 @@ class CliHelperTests(unittest.TestCase):
         acquirer = build_acquirer(device_name="brainco", config=config)
         self.assertEqual(acquirer.metadata.name, "brainco")
         self.assertEqual(acquirer.metadata.n_channels, 32)
+        self.assertEqual(acquirer.metadata.sfreq, 200)
+        self.assertEqual(acquirer.source_sfreq, 250)
+
+    def test_build_neuracle_acquirer_uses_250_hz_source(self) -> None:
+        config = {
+            "sfreq": 200,
+            "buffer_sec": 60,
+            "device": {
+                "neuracle_host": "127.0.0.1",
+                "neuracle_port": 8712,
+                "neuracle_source_sfreq": 250,
+                "neuracle_eeg_channels": 59,
+            },
+        }
+
+        acquirer = build_acquirer(device_name="neuracle", config=config)
+
+        self.assertEqual(acquirer.metadata.name, "neuracle")
+        self.assertEqual(acquirer.metadata.n_channels, 59)
+        self.assertEqual(acquirer.metadata.sfreq, 200)
+        self.assertEqual(acquirer.source_sfreq, 250)
 
     def test_build_acquirer_uses_dummy_when_hardware_dummy_mode_enabled(self) -> None:
         config = {
@@ -376,8 +477,9 @@ class CliHelperTests(unittest.TestCase):
         self.assertEqual(acquirer._callback_sample_count, 2)
 
     def test_brainco_get_chunk_waits_for_fresh_samples(self) -> None:
-        acquirer = BrainCoAcquirer(sfreq=250, n_channels=2, buffer_sec=10.0)
+        acquirer = BrainCoAcquirer(sfreq=200, source_sfreq=250, n_channels=2, buffer_sec=10.0)
         acquirer.metadata = AcquirerMetadata(name="brainco", sfreq=2.0, n_channels=2)
+        acquirer.source_sfreq = 2.0
         acquirer._client = object()
         acquirer._sdk = object()
 
@@ -777,7 +879,8 @@ class CliHelperTests(unittest.TestCase):
 
             decoder._save_current_model()
 
-            self.assertEqual(decoder._model.saved_path, decoder._model_save_path)
+            self.assertIsNone(decoder._model.saved_path)
+            self.assertTrue(decoder._model_save_path.parent.is_dir())
 
     def test_manual_online_label_source_overlaps_decode_window(self) -> None:
         source = ManualOnlineLabelSource(default_ttl_sec=1.0)
@@ -876,8 +979,8 @@ class CliHelperTests(unittest.TestCase):
                                 }
                             ],
                             "practice_labels": [],
-                            "new_subject_blocks": 1,
-                            "new_subject_trials_per_class_per_block": 1,
+                            "calibration_blocks": 1,
+                            "calibration_trials_per_class_per_block": 1,
                             "rest_between_blocks_sec": 0.0,
                             "trial_timing": {
                                 "fixation_sec": 0.0,
@@ -892,8 +995,16 @@ class CliHelperTests(unittest.TestCase):
 
             with (
                 mock.patch(
-                    "adaptation.calibrator.filter_and_transform",
-                    lambda data, sfreq: data.astype(np.float32) + 10.0,
+                    "adaptation.calibrator.preprocess_eeg_window",
+                    lambda data, sfreq: SimpleNamespace(
+                        data=data.astype(np.float32) + 10.0,
+                        quality=SimpleNamespace(
+                            accepted=True,
+                            peak_abs_uv=1.0,
+                            clip_fraction=0.0,
+                            bad_channel_fraction=0.0,
+                        ),
+                    ),
                 ),
             ):
                 result = calibrator.calibrate(
@@ -911,7 +1022,28 @@ class CliHelperTests(unittest.TestCase):
                 self.assertEqual(payload["raw_windows"].shape[0], result.windows_collected)
                 self.assertEqual(payload["processed_windows"].shape[0], result.windows_collected)
                 self.assertEqual(payload["labels"].shape[0], result.windows_collected)
+                self.assertEqual(payload["trial_ids"].shape[0], result.windows_collected)
+                self.assertEqual(
+                    payload["window_start_samples"].shape[0],
+                    result.windows_collected,
+                )
+                self.assertEqual(
+                    payload["window_stop_samples"].shape[0],
+                    result.windows_collected,
+                )
                 self.assertTrue(np.all(payload["processed_windows"] == payload["raw_windows"] + 10.0))
+            assert result.session_dir is not None
+            continuous_eeg = np.load(result.session_dir / "continuous_eeg.npy")
+            sample_timestamps = np.load(
+                result.session_dir / "continuous_sample_timestamps.npy"
+            )
+            self.assertEqual(sample_timestamps.size, continuous_eeg.shape[-1])
+            metadata = json.loads(
+                (result.session_dir / "metadata.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metadata["integrity"]["status"], "complete")
+            self.assertTrue(metadata["integrity"]["sample_timestamp_count_matches"])
+            self.assertTrue(verify_bundle(result.session_dir)["ok"])
 
     def test_load_calibration_windows_concatenates_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -926,12 +1058,14 @@ class CliHelperTests(unittest.TestCase):
                 raw_windows=np.ones((2, 3, 4), dtype=np.float32),
                 processed_windows=np.full((2, 3, 4), 10.0, dtype=np.float32),
                 labels=np.asarray([0, 1], dtype=np.int64),
+                trial_ids=np.asarray([0, 0], dtype=np.int64),
             )
             np.savez_compressed(
                 session_b / "training_windows_main.npz",
                 raw_windows=np.ones((1, 3, 4), dtype=np.float32) * 2,
                 processed_windows=np.full((1, 3, 4), 20.0, dtype=np.float32),
                 labels=np.asarray([2], dtype=np.int64),
+                trial_ids=np.asarray([0], dtype=np.int64),
             )
 
             X, y, sessions = load_calibration_windows(records_dir, "S001")
@@ -941,6 +1075,14 @@ class CliHelperTests(unittest.TestCase):
             self.assertEqual([session.name for session in sessions], ["20260413_100000", "20260413_110000"])
             self.assertTrue(np.all(X[:2] == 10.0))
             self.assertTrue(np.all(X[2:] == 20.0))
+
+            _, _, groups, _ = load_calibration_windows(
+                records_dir,
+                "S001",
+                include_groups=True,
+            )
+            assert groups is not None
+            np.testing.assert_array_equal(groups, np.asarray([0, 0, 1], dtype=np.int64))
 
     def test_replay_test_mode_runs_model_on_saved_chunks(self) -> None:
         class FakeModel:
@@ -1004,9 +1146,9 @@ class CliHelperTests(unittest.TestCase):
             }
         }
 
-        with mock.patch("game_command_router._build_transport", return_value=FakeTransport()):
+        transport = FakeTransport()
+        with mock.patch("game_command_router._build_transport", return_value=transport):
             router = SharedGameCommandRouter(config)
-            transport = router.raw_transport()
 
             router.push("LEFT", source="decoder")
             router.push("RIGHT", source="web")
@@ -1032,15 +1174,61 @@ class CliHelperTests(unittest.TestCase):
             }
         }
 
-        with mock.patch("game_command_router._build_transport", return_value=FakeTransport()):
+        transport = FakeTransport()
+        with mock.patch("game_command_router._build_transport", return_value=transport):
             router = SharedGameCommandRouter(config)
-            transport = router.raw_transport()
 
             router.push("RIGHT", source="web")
             router.push("STOP", source="web")
             router.push("LEFT", source="decoder")
 
             self.assertEqual(transport.commands, ["RIGHT", "STOP", "LEFT"])
+
+    def test_decoder_proxy_forwards_scene_command_with_ack(self) -> None:
+        class FakeTransport:
+            def __init__(self) -> None:
+                self.commands: list[str] = []
+                self.acked_commands: list[str] = []
+
+            def push(self, command: str) -> None:
+                self.commands.append(command)
+
+            def push_with_ack(self, command: str) -> None:
+                self.acked_commands.append(command)
+
+        config = {
+            "output": {
+                "ar_game": {"enabled": True},
+                "web_control": {
+                    "manual_override_hold_sec": 10.0,
+                    "manual_override_release_sec": 0.25,
+                },
+            }
+        }
+
+        transport = FakeTransport()
+        with mock.patch("game_command_router._build_transport", return_value=transport):
+            router = SharedGameCommandRouter(config)
+            proxy = router.build_proxy(source="decoder")
+
+            router.push("RIGHT", source="web")
+            proxy.push_with_ack("SCENE_LEFT")
+
+            self.assertEqual(transport.commands, ["RIGHT"])
+            self.assertEqual(transport.acked_commands, ["SCENE_LEFT"])
+
+    def test_scene_ack_fails_closed_for_unsupported_transport(self) -> None:
+        class FakeTransport:
+            def push(self, command: str) -> None:
+                del command
+
+        config = {"output": {"ar_game": {"enabled": True}}}
+
+        with mock.patch("game_command_router._build_transport", return_value=FakeTransport()):
+            proxy = SharedGameCommandRouter(config).build_proxy(source="decoder")
+
+            with self.assertRaisesRegex(RuntimeError, "does not support scene ACK"):
+                proxy.push_with_ack("SCENE_RIGHT")
 
 
 if __name__ == "__main__":

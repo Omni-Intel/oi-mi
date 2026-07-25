@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import copy
+import hashlib
+import importlib.metadata
 import json
+import os
+import platform
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +36,11 @@ from adaptation.neuroonline import NeuroOnlineConfig, NeuroOnlineModelAdapter
 from adaptation.session_recorder import SessionRecorder
 from models.factory import BaseModelAdapter, TorchModelAdapter
 from utils.markers import MarkerBackend, PROTOCOL_EVENT_CODES
-from utils.preprocessing import filter_and_transform
+from utils.preprocessing import (
+    DEFAULT_PREPROCESSING,
+    preprocess_eeg_window,
+    resample_eeg,
+)
 
 LABEL_SEQUENCE: list[tuple[int, str]] = [(LABEL_TO_ID[label], label) for label in ("left", "right", "idle")]
 
@@ -62,6 +73,7 @@ class Calibrator:
         calibration_records_dir: Path | None = None,
         protocol_config: ProtocolConfig | None = None,
         online_adaptation_config: dict | None = None,
+        experiment_config: dict[str, Any] | None = None,
     ) -> None:
         self._acquirer = acquirer
         self._neuroonline_config = NeuroOnlineConfig.from_mapping(online_adaptation_config)
@@ -78,10 +90,12 @@ class Calibrator:
         self._marker_backend = marker_backend
         self._console = console
         self._sfreq = float(sfreq)
+        self._source_sfreq = float(getattr(acquirer, "source_sfreq", self._sfreq))
         self._window_sec = float(window_sec)
         self._step_sec = float(step_sec)
         self._model_path = model_path
         self._calibration_records_dir = calibration_records_dir
+        self._experiment_config = copy.deepcopy(experiment_config or {})
         self._protocol = protocol_config or ProtocolConfig.from_config(
             {
                 "window_sec": float(window_sec),
@@ -102,8 +116,20 @@ class Calibrator:
         heartbeat: Callable[[], None] | None = None,
     ) -> CalibrationResult:
         del duration_sec
-        plan = build_session_plan(self._protocol, is_new_subject=not head_only)
-        session_dir, raw_windows, processed_windows, labels, session_metadata = self._collect_training_data(
+        if head_only:
+            raise ValueError(
+                "Head-only calibration was removed; each experiment must train "
+                "a fresh full decoder."
+            )
+        plan = build_session_plan(self._protocol)
+        (
+            session_dir,
+            raw_windows,
+            processed_windows,
+            labels,
+            trial_groups,
+            session_metadata,
+        ) = self._collect_training_data(
             plan=plan,
             include_practice=include_practice,
             heartbeat=heartbeat,
@@ -112,7 +138,8 @@ class Calibrator:
         if self._neuroonline_config.enabled:
             self._console.print(
                 "[bold yellow]正在执行 NeuroOnline 离线训练 "
-                f"({self._neuroonline_config.offline_epochs} epochs)。"
+                f"(最多 {self._neuroonline_config.offline_epochs} epochs，"
+                f"patience={self._neuroonline_config.offline_patience})。"
                 "在出现“校准完成”和模型保存路径前，请勿返回、刷新或关闭页面。[/bold yellow]"
             )
         if heartbeat is not None:
@@ -124,12 +151,14 @@ class Calibrator:
             batch_size=batch_size,
             learning_rate=learning_rate,
             patience=patience,
-            head_only=head_only,
+            head_only=False,
+            groups=trial_groups,
         )
         self._model_path.parent.mkdir(parents=True, exist_ok=True)
         self._model.save(self._model_path)
-        self._save_metadata(metrics=metrics, windows_collected=int(processed_windows.shape[0]), head_only=head_only)
+        self._save_metadata(metrics=metrics, windows_collected=int(processed_windows.shape[0]), head_only=False)
         self._write_session_summary(session_dir, metrics=metrics, windows_collected=int(processed_windows.shape[0]), session_metadata=session_metadata)
+        self._seal_session_bundle(session_dir)
         self._console.print("[bold green]校准完成，请等待工作人员[/bold green]")
         if heartbeat is not None:
             heartbeat()
@@ -141,24 +170,26 @@ class Calibrator:
             session_dir=session_dir,
         )
 
-    def load_existing_weights(self) -> None:
-        if not self._model_path.exists():
-            raise FileNotFoundError(f"Model weights not found: {self._model_path}")
-        self._model.load(self._model_path)
-
     def _collect_training_data(
         self,
         *,
         plan: SessionPlan,
         include_practice: bool = True,
         heartbeat: Callable[[], None] | None = None,
-    ) -> tuple[Path | None, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    ) -> tuple[
+        Path | None,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        dict[str, Any],
+    ]:
         self._console.print("[bold cyan]开始按 MI game control protocol 采集[/bold cyan]")
         self._print_instructions(plan)
         self._acquirer.start_stream()
         recorder = SessionRecorder(
             self._acquirer,
-            sfreq=self._sfreq,
+            sfreq=self._source_sfreq,
             n_channels=self._acquirer.metadata.n_channels,
         )
         session_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -181,7 +212,7 @@ class Calibrator:
         if session_dir is not None:
             recorder.export(session_dir, metadata=session_metadata)
         eeg = self._get_continuous_eeg(session_dir=session_dir, recorder=recorder)
-        raw_windows, processed_windows, labels = self._build_training_windows(
+        raw_windows, processed_windows, labels, trial_groups = self._build_training_windows(
             eeg=eeg,
             events=recorder.events,
             trials=trials,
@@ -189,7 +220,14 @@ class Calibrator:
         )
         if raw_windows.shape[0] == 0:
             raise RuntimeError("Calibration did not yield any valid training windows.")
-        return session_dir, raw_windows, processed_windows, labels, session_metadata
+        return (
+            session_dir,
+            raw_windows,
+            processed_windows,
+            labels,
+            trial_groups,
+            session_metadata,
+        )
 
     def _run_practice(
         self,
@@ -315,8 +353,7 @@ class Calibrator:
             stage_name=f"{stage_prefix}: cue {label}",
         )
 
-        control_on_sample = recorder.sample_count
-        self._emit_event(
+        control_on_event = self._emit_event(
             recorder,
             "control_on",
             phase=phase,
@@ -324,14 +361,14 @@ class Calibrator:
             trial_index=trial_index,
             label=label,
         )
+        control_on_sample = int(control_on_event.sample_index)
         self._sleep_with_recording(
             trial_timing.control_sec,
             recorder=recorder,
             heartbeat=heartbeat,
             stage_name=f"{stage_prefix}: control {label}",
         )
-        control_off_sample = recorder.sample_count
-        self._emit_event(
+        control_off_event = self._emit_event(
             recorder,
             "control_off",
             phase=phase,
@@ -339,6 +376,7 @@ class Calibrator:
             trial_index=trial_index,
             label=label,
         )
+        control_off_sample = int(control_off_event.sample_index)
 
         self._emit_event(
             recorder,
@@ -374,32 +412,76 @@ class Calibrator:
         events: list[Any],
         trials: list[dict[str, Any]],
         session_dir: Path | None,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         del events
-        window_samples = int(round(self._protocol.window_sec * self._sfreq))
-        stride_samples = int(round(self._protocol.stride_sec * self._sfreq))
-        start_offset = int(round(self._protocol.control_start_offset_sec * self._sfreq))
-        stop_offset = int(round(self._protocol.control_stop_offset_sec * self._sfreq))
+        source_window_samples = int(round(self._protocol.window_sec * self._source_sfreq))
+        target_window_samples = int(round(self._protocol.window_sec * self._sfreq))
+        stride_samples = int(round(self._protocol.stride_sec * self._source_sfreq))
+        start_offset = int(round(self._protocol.control_start_offset_sec * self._source_sfreq))
+        stop_offset = int(round(self._protocol.control_stop_offset_sec * self._source_sfreq))
         raw_windows: list[np.ndarray] = []
         processed_windows: list[np.ndarray] = []
         labels: list[int] = []
+        trial_groups: list[int] = []
+        quality_peak_abs_uv: list[float] = []
+        quality_clip_fraction: list[float] = []
+        quality_bad_channel_fraction: list[float] = []
+        quality_bad_channel_indices: list[str] = []
+        rejection_reason_counts: dict[str, int] = {}
+        window_start_samples: list[int] = []
+        window_stop_samples: list[int] = []
+        window_offsets_sec: list[float] = []
+        rejected_windows = 0
 
-        for trial in trials:
+        for trial_group, trial in enumerate(trials):
             control_on = int(trial["control_on_sample"])
-            max_start = control_on + stop_offset - window_samples
+            max_start = control_on + stop_offset - source_window_samples
             for offset in range(start_offset, max_start - control_on + 1, stride_samples):
                 start = control_on + offset
-                stop = start + window_samples
+                stop = start + source_window_samples
                 if stop > eeg.shape[1]:
                     continue
-                window = eeg[:, start:stop].astype(np.float32)
+                source_window = eeg[:, start:stop].astype(np.float32)
+                window = resample_eeg(
+                    source_window,
+                    source_sfreq=self._source_sfreq,
+                    target_sfreq=self._sfreq,
+                )
+                if window.shape[1] != target_window_samples:
+                    raise RuntimeError(
+                        f"Resampled calibration window has {window.shape[1]} points; "
+                        f"expected {target_window_samples}."
+                    )
+                result = preprocess_eeg_window(window, sfreq=self._sfreq)
+                if not result.quality.accepted:
+                    rejected_windows += 1
+                    for reason in result.quality.reasons:
+                        rejection_reason_counts[reason] = (
+                            rejection_reason_counts.get(reason, 0) + 1
+                        )
+                    continue
                 raw_windows.append(window)
-                processed_windows.append(filter_and_transform(window, sfreq=self._sfreq))
+                processed_windows.append(result.data)
                 labels.append(int(trial["label_id"]))
+                trial_groups.append(trial_group)
+                quality_peak_abs_uv.append(result.quality.peak_abs_uv)
+                quality_clip_fraction.append(result.quality.clip_fraction)
+                quality_bad_channel_fraction.append(result.quality.bad_channel_fraction)
+                quality_bad_channel_indices.append(
+                    json.dumps(
+                        list(getattr(result.quality, "bad_channel_indices", ())),
+                        separators=(",", ":"),
+                    )
+                )
+                window_start_samples.append(start)
+                window_stop_samples.append(stop)
+                window_offsets_sec.append(offset / self._source_sfreq)
 
-        raw_X = np.stack(raw_windows, axis=0).astype(np.float32) if raw_windows else np.empty((0, eeg.shape[0], window_samples), dtype=np.float32)
-        X = np.stack(processed_windows, axis=0).astype(np.float32) if processed_windows else np.empty((0, eeg.shape[0], window_samples), dtype=np.float32)
+        empty_shape = (0, eeg.shape[0], target_window_samples)
+        raw_X = np.stack(raw_windows, axis=0).astype(np.float32) if raw_windows else np.empty(empty_shape, dtype=np.float32)
+        X = np.stack(processed_windows, axis=0).astype(np.float32) if processed_windows else np.empty(empty_shape, dtype=np.float32)
         y = np.asarray(labels, dtype=np.int64)
+        groups = np.asarray(trial_groups, dtype=np.int64)
 
         if session_dir is not None:
             self._save_training_windows(
@@ -407,11 +489,27 @@ class Calibrator:
                 raw_windows=raw_X,
                 processed_windows=X,
                 labels=y,
+                trial_ids=groups,
                 window_sec=self._protocol.window_sec,
                 stride_sec=self._protocol.stride_sec,
+                quality_peak_abs_uv=np.asarray(quality_peak_abs_uv, dtype=np.float32),
+                quality_clip_fraction=np.asarray(quality_clip_fraction, dtype=np.float32),
+                quality_bad_channel_fraction=np.asarray(
+                    quality_bad_channel_fraction,
+                    dtype=np.float32,
+                ),
+                rejected_windows=rejected_windows,
+                window_start_samples=np.asarray(window_start_samples, dtype=np.int64),
+                window_stop_samples=np.asarray(window_stop_samples, dtype=np.int64),
+                window_offsets_sec=np.asarray(window_offsets_sec, dtype=np.float32),
+                quality_bad_channel_indices=np.asarray(
+                    quality_bad_channel_indices,
+                    dtype=np.str_,
+                ),
+                rejection_reason_counts=rejection_reason_counts,
             )
             if self._protocol.export_window_sec is not None:
-                alt_raw, alt_processed, alt_labels = self._build_aux_windows(
+                alt_raw, alt_processed, alt_labels, alt_groups, alt_quality = self._build_aux_windows(
                     eeg=eeg,
                     trials=trials,
                     window_sec=float(self._protocol.export_window_sec),
@@ -422,10 +520,17 @@ class Calibrator:
                     raw_windows=alt_raw,
                     processed_windows=alt_processed,
                     labels=alt_labels,
+                    trial_ids=alt_groups,
                     window_sec=float(self._protocol.export_window_sec),
                     stride_sec=float(self._protocol.export_stride_sec),
+                    **alt_quality,
                 )
-        return raw_X, X, y
+        if rejected_windows:
+            self._console.print(
+                f"[yellow]预处理质量控制剔除 {rejected_windows} 个伪迹窗；"
+                f"保留 {X.shape[0]} 个训练窗。[/yellow]"
+            )
+        return raw_X, X, y, groups
 
     def _build_aux_windows(
         self,
@@ -434,31 +539,91 @@ class Calibrator:
         trials: list[dict[str, Any]],
         window_sec: float,
         stride_sec: float,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        window_samples = int(round(window_sec * self._sfreq))
-        stride_samples = int(round(stride_sec * self._sfreq))
-        start_offset = int(round(self._protocol.control_start_offset_sec * self._sfreq))
-        stop_offset = int(round(self._protocol.control_stop_offset_sec * self._sfreq))
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+        source_window_samples = int(round(window_sec * self._source_sfreq))
+        target_window_samples = int(round(window_sec * self._sfreq))
+        stride_samples = int(round(stride_sec * self._source_sfreq))
+        start_offset = int(round(self._protocol.control_start_offset_sec * self._source_sfreq))
+        stop_offset = int(round(self._protocol.control_stop_offset_sec * self._source_sfreq))
         raw_windows: list[np.ndarray] = []
         processed_windows: list[np.ndarray] = []
         labels: list[int] = []
-        for trial in trials:
+        trial_groups: list[int] = []
+        quality_peak_abs_uv: list[float] = []
+        quality_clip_fraction: list[float] = []
+        quality_bad_channel_fraction: list[float] = []
+        quality_bad_channel_indices: list[str] = []
+        rejection_reason_counts: dict[str, int] = {}
+        window_start_samples: list[int] = []
+        window_stop_samples: list[int] = []
+        window_offsets_sec: list[float] = []
+        rejected_windows = 0
+        for trial_group, trial in enumerate(trials):
             control_on = int(trial["control_on_sample"])
-            max_start = control_on + stop_offset - window_samples
+            max_start = control_on + stop_offset - source_window_samples
             for offset in range(start_offset, max_start - control_on + 1, stride_samples):
                 start = control_on + offset
-                stop = start + window_samples
+                stop = start + source_window_samples
                 if stop > eeg.shape[1]:
                     continue
-                window = eeg[:, start:stop].astype(np.float32)
+                source_window = eeg[:, start:stop].astype(np.float32)
+                window = resample_eeg(
+                    source_window,
+                    source_sfreq=self._source_sfreq,
+                    target_sfreq=self._sfreq,
+                )
+                if window.shape[1] != target_window_samples:
+                    raise RuntimeError(
+                        f"Resampled auxiliary window has {window.shape[1]} points; "
+                        f"expected {target_window_samples}."
+                    )
+                result = preprocess_eeg_window(window, sfreq=self._sfreq)
+                if not result.quality.accepted:
+                    rejected_windows += 1
+                    for reason in result.quality.reasons:
+                        rejection_reason_counts[reason] = (
+                            rejection_reason_counts.get(reason, 0) + 1
+                        )
+                    continue
                 raw_windows.append(window)
-                processed_windows.append(filter_and_transform(window, sfreq=self._sfreq))
+                processed_windows.append(result.data)
                 labels.append(int(trial["label_id"]))
-        shape = (0, eeg.shape[0], window_samples)
+                trial_groups.append(trial_group)
+                quality_peak_abs_uv.append(result.quality.peak_abs_uv)
+                quality_clip_fraction.append(result.quality.clip_fraction)
+                quality_bad_channel_fraction.append(result.quality.bad_channel_fraction)
+                quality_bad_channel_indices.append(
+                    json.dumps(
+                        list(result.quality.bad_channel_indices),
+                        separators=(",", ":"),
+                    )
+                )
+                window_start_samples.append(start)
+                window_stop_samples.append(stop)
+                window_offsets_sec.append(offset / self._source_sfreq)
+        shape = (0, eeg.shape[0], target_window_samples)
         raw_X = np.stack(raw_windows, axis=0).astype(np.float32) if raw_windows else np.empty(shape, dtype=np.float32)
         X = np.stack(processed_windows, axis=0).astype(np.float32) if processed_windows else np.empty(shape, dtype=np.float32)
         y = np.asarray(labels, dtype=np.int64)
-        return raw_X, X, y
+        groups = np.asarray(trial_groups, dtype=np.int64)
+        quality = {
+            "quality_peak_abs_uv": np.asarray(quality_peak_abs_uv, dtype=np.float32),
+            "quality_clip_fraction": np.asarray(quality_clip_fraction, dtype=np.float32),
+            "quality_bad_channel_fraction": np.asarray(
+                quality_bad_channel_fraction,
+                dtype=np.float32,
+            ),
+            "rejected_windows": rejected_windows,
+            "window_start_samples": np.asarray(window_start_samples, dtype=np.int64),
+            "window_stop_samples": np.asarray(window_stop_samples, dtype=np.int64),
+            "window_offsets_sec": np.asarray(window_offsets_sec, dtype=np.float32),
+            "quality_bad_channel_indices": np.asarray(
+                quality_bad_channel_indices,
+                dtype=np.str_,
+            ),
+            "rejection_reason_counts": rejection_reason_counts,
+        }
+        return raw_X, X, y, groups, quality
 
     def _save_training_windows(
         self,
@@ -467,18 +632,56 @@ class Calibrator:
         raw_windows: np.ndarray,
         processed_windows: np.ndarray,
         labels: np.ndarray,
+        trial_ids: np.ndarray,
         window_sec: float,
         stride_sec: float,
+        quality_peak_abs_uv: np.ndarray,
+        quality_clip_fraction: np.ndarray,
+        quality_bad_channel_fraction: np.ndarray,
+        rejected_windows: int,
+        window_start_samples: np.ndarray,
+        window_stop_samples: np.ndarray,
+        window_offsets_sec: np.ndarray,
+        quality_bad_channel_indices: np.ndarray,
+        rejection_reason_counts: dict[str, int],
     ) -> None:
-        np.savez_compressed(
-            output_path,
-            raw_windows=raw_windows,
-            processed_windows=processed_windows,
-            labels=labels,
-            sfreq=np.asarray([self._sfreq], dtype=np.float32),
-            window_sec=np.asarray([window_sec], dtype=np.float32),
-            step_sec=np.asarray([stride_sec], dtype=np.float32),
-        )
+        temporary = output_path.with_suffix(output_path.suffix + ".tmp")
+        with temporary.open("wb") as handle:
+            np.savez_compressed(
+                handle,
+                raw_windows=raw_windows,
+                processed_windows=processed_windows,
+                labels=labels,
+                trial_ids=trial_ids,
+                source_sfreq=np.asarray([self._source_sfreq], dtype=np.float32),
+                sfreq=np.asarray([self._sfreq], dtype=np.float32),
+                window_sec=np.asarray([window_sec], dtype=np.float32),
+                step_sec=np.asarray([stride_sec], dtype=np.float32),
+                quality_peak_abs_uv=quality_peak_abs_uv,
+                quality_clip_fraction=quality_clip_fraction,
+                quality_bad_channel_fraction=quality_bad_channel_fraction,
+                quality_bad_channel_indices=quality_bad_channel_indices,
+                window_start_samples=window_start_samples,
+                window_stop_samples=window_stop_samples,
+                window_offsets_sec=window_offsets_sec,
+                quality_rejected_windows=np.asarray(
+                    [rejected_windows],
+                    dtype=np.int64,
+                ),
+                quality_rejection_reason_counts=np.asarray(
+                    [
+                        json.dumps(
+                            rejection_reason_counts,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    ],
+                    dtype=np.str_,
+                ),
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, output_path)
 
     def _get_continuous_eeg(self, *, session_dir: Path | None, recorder: SessionRecorder) -> np.ndarray:
         if session_dir is not None:
@@ -494,16 +697,41 @@ class Calibrator:
     ) -> dict[str, Any]:
         return {
             "session_id": session_stamp,
-            "protocol_name": "mi_game_control_data_collection_protocol_v1",
+            "protocol_name": "mi_game_control_recalibration_protocol_v2",
             "subject_mode": plan.subject_mode,
             "sfreq": self._sfreq,
+            "source_sfreq": self._source_sfreq,
             "n_channels": self._acquirer.metadata.n_channels,
+            "timestamp_domain": getattr(
+                self._acquirer.metadata,
+                "timestamp_domain",
+                "relative",
+            ),
+            "timing_diagnostics": getattr(
+                self._acquirer,
+                "timing_diagnostics",
+                {},
+            ),
             "window_sec": self._protocol.window_sec,
             "stride_sec": self._protocol.stride_sec,
             "control_window_range_sec": [
                 self._protocol.control_start_offset_sec,
                 self._protocol.control_stop_offset_sec,
             ],
+            "planned_collection_duration_sec": (
+                sum(segment.duration_sec for segment in plan.baseline_segments)
+                + plan.total_formal_trials * plan.trial_timing.total_sec
+                + max(len(plan.blocks) - 1, 0) * plan.rest_between_blocks_sec
+            ),
+            "formal_trial_count": plan.total_formal_trials,
+            "validation_grouping": "trial_ids",
+            "preprocessing": {
+                **DEFAULT_PREPROCESSING.as_dict(),
+                "reference": "common_average",
+                "filter_design": "Butterworth SOS zero-phase",
+                "bad_channel_repair": "pointwise_median_of_good_channels",
+                "input_unit": "uV",
+            },
             "trial_timing": {
                 "fixation_sec": plan.trial_timing.fixation_sec,
                 "cue_sec": plan.trial_timing.cue_sec,
@@ -522,6 +750,7 @@ class Calibrator:
             ],
             "bad_trials": [],
             "low_quality_blocks": [],
+            "provenance": self._build_provenance(),
         }
 
     def _write_session_summary(
@@ -538,8 +767,136 @@ class Calibrator:
         summary["model_path"] = str(self._model_path)
         summary["windows_collected"] = windows_collected
         summary["metrics"] = metrics
-        with (session_dir / "metadata.json").open("w", encoding="utf-8") as handle:
+        metadata_path = session_dir / "metadata.json"
+        temporary = session_dir / ".metadata.json.tmp"
+        with temporary.open("w", encoding="utf-8") as handle:
             json.dump(summary, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, metadata_path)
+
+    def _seal_session_bundle(self, session_dir: Path | None) -> None:
+        if session_dir is None:
+            return
+        metadata_path = session_dir / "metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        model_files: list[dict[str, Any]] = []
+        for path in (
+            self._model_path,
+            Path(f"{self._model_path}.neuroonline.pt"),
+        ):
+            if path.exists():
+                model_files.append(
+                    {
+                        "path": str(path),
+                        "sha256": self._sha256(path),
+                        "size_bytes": path.stat().st_size,
+                    }
+                )
+        checksums: list[dict[str, Any]] = []
+        for path in sorted(session_dir.iterdir()):
+            if not path.is_file() or path == metadata_path:
+                continue
+            checksums.append(
+                {
+                    "path": path.name,
+                    "sha256": self._sha256(path),
+                    "size_bytes": path.stat().st_size,
+                }
+            )
+        eeg_path = session_dir / "continuous_eeg.npy"
+        timestamps_path = session_dir / "continuous_sample_timestamps.npy"
+        invalid_timestamps = 0
+        timestamp_count_matches = False
+        if eeg_path.exists() and timestamps_path.exists():
+            eeg = np.load(eeg_path, mmap_mode="r")
+            timestamps = np.load(timestamps_path, mmap_mode="r")
+            timestamp_count_matches = bool(timestamps.size == eeg.shape[-1])
+            invalid_timestamps = int(np.sum(~np.isfinite(timestamps)))
+        packet_loss_count = int(
+            float(
+                (metadata.get("timing_diagnostics", {}) or {}).get(
+                    "packet_loss_count",
+                    0,
+                )
+            )
+        )
+        integrity_status = "complete"
+        if packet_loss_count > 0:
+            integrity_status = "source_packet_loss"
+        elif not timestamp_count_matches or invalid_timestamps > 0:
+            integrity_status = "invalid_sample_timestamps"
+        metadata["model_files"] = model_files
+        metadata["integrity"] = {
+            "status": integrity_status,
+            "packet_loss_count": packet_loss_count,
+            "sample_timestamp_count_matches": timestamp_count_matches,
+            "invalid_sample_timestamps": invalid_timestamps,
+            "checksums": checksums,
+        }
+        temporary = session_dir / ".metadata.json.tmp"
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, ensure_ascii=False, indent=2, default=str)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, metadata_path)
+
+    def _build_provenance(self) -> dict[str, Any]:
+        project_root = Path(__file__).resolve().parents[1]
+        commit: str | None = None
+        dirty: bool | None = None
+        try:
+            commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=project_root,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout.strip()
+            dirty = bool(
+                subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=project_root,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                ).stdout.strip()
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+        packages: dict[str, str | None] = {}
+        for package in ("numpy", "scipy", "torch", "scikit-learn", "mne"):
+            try:
+                packages[package] = importlib.metadata.version(package)
+            except importlib.metadata.PackageNotFoundError:
+                packages[package] = None
+        encoded_config = json.dumps(
+            self._experiment_config,
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+        ).encode("utf-8")
+        return {
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "git": {"commit": commit, "dirty": dirty},
+            "platform": platform.platform(),
+            "python": sys.version,
+            "packages": packages,
+            "experiment_config": self._experiment_config,
+            "experiment_config_sha256": hashlib.sha256(encoded_config).hexdigest(),
+            "random_seed": int(self._neuroonline_config.random_seed),
+            "deterministic_algorithms_requested": True,
+        }
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
 
     def _print_instructions(self, plan: SessionPlan) -> None:
         self._console.print("[bold cyan]实验指导语[/bold cyan]")
@@ -555,9 +912,15 @@ class Calibrator:
             f"from control [{self._protocol.control_start_offset_sec:.1f}, {self._protocol.control_stop_offset_sec:.1f}]s"
         )
 
-    def _emit_event(self, recorder: SessionRecorder, event_name: str, **payload: Any) -> None:
-        self._marker_backend.send_event(event_name)
-        recorder.add_event(event_name, marker_code=PROTOCOL_EVENT_CODES[event_name], **payload)
+    def _emit_event(self, recorder: SessionRecorder, event_name: str, **payload: Any) -> Any:
+        event_time = time.monotonic()
+        self._marker_backend.send_event(event_name, timestamp=event_time)
+        return recorder.add_event(
+            event_name,
+            timestamp_monotonic=event_time,
+            marker_code=PROTOCOL_EVENT_CODES[event_name],
+            **payload,
+        )
 
     def _sleep_with_recording(
         self,

@@ -9,7 +9,7 @@ context modulator, and classifier are optimized together.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import logging
 from pathlib import Path
 import threading
@@ -22,7 +22,11 @@ from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from models.factory import BaseModelAdapter, TorchModelAdapter
+from models.factory import (
+    BaseModelAdapter,
+    TorchModelAdapter,
+    split_train_validation_indices,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -39,11 +43,13 @@ class NeuroOnlineConfig:
     history_threshold: int = 320
     recent_samples: int = 320
     weight_decay: float = 5e-2
-    mask_ratio: float = 0.7
+    mask_ratio: float = 0.3
+    consistency_weight: float = 0.1
     label_smoothing: float = 0.1
     prompt_count: int = 32
     random_seed: int = 42
     offline_epochs: int = 50
+    offline_patience: int = 6
     offline_batch_size: int = 16
     offline_learning_rate: float = 1e-4
 
@@ -62,11 +68,13 @@ class NeuroOnlineConfig:
             history_threshold=max(int(data.get("history_threshold", 320)), 1),
             recent_samples=max(int(data.get("recent_samples", 320)), 1),
             weight_decay=max(float(data.get("weight_decay", 5e-2)), 0.0),
-            mask_ratio=min(max(float(data.get("mask_ratio", 0.7)), 0.0), 1.0),
+            mask_ratio=min(max(float(data.get("mask_ratio", 0.3)), 0.0), 1.0),
+            consistency_weight=max(float(data.get("consistency_weight", 0.1)), 0.0),
             label_smoothing=min(max(float(data.get("label_smoothing", 0.1)), 0.0), 1.0),
             prompt_count=max(int(data.get("prompt_count", 32)), 1),
             random_seed=int(data.get("random_seed", 42)),
             offline_epochs=max(int(data.get("offline_epochs", 50)), 1),
+            offline_patience=max(int(data.get("offline_patience", 6)), 1),
             offline_batch_size=max(int(data.get("offline_batch_size", 16)), 1),
             offline_learning_rate=max(float(data.get("offline_learning_rate", 1e-4)), 1e-9),
         )
@@ -184,18 +192,18 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         criterion: nn.Module,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         logits, original_representation = self._forward_adapted(original)
-        time_logits, time_representation = self._forward_adapted(time_masked)
-        frequency_logits, frequency_representation = self._forward_adapted(frequency_masked)
-        classification = (
-            criterion(logits, labels)
-            + criterion(time_logits, labels)
-            + criterion(frequency_logits, labels)
+        _, time_representation = self._forward_adapted(time_masked)
+        _, frequency_representation = self._forward_adapted(frequency_masked)
+        classification = criterion(logits, labels)
+        consistency = (
+            F.mse_loss(time_representation, original_representation)
+            + F.mse_loss(frequency_representation, original_representation)
+        ) / 2.0
+        return (
+            classification + self.config.consistency_weight * consistency,
+            classification,
+            consistency,
         )
-        consistency = F.mse_loss(time_representation, original_representation) + F.mse_loss(
-            frequency_representation,
-            original_representation,
-        )
-        return classification + consistency, classification, consistency
 
     def _train_epoch(
         self,
@@ -225,7 +233,14 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
             optimizer.zero_grad()
             loss.backward()
             if clip_classifier_gradients:
-                torch.nn.utils.clip_grad_norm_(self._classifier.parameters(), 1.0)
+                trainable_parameters = [
+                    parameter
+                    for parameter in (
+                        list(self.base.model.parameters()) + list(self._modulator.parameters())
+                    )
+                    if parameter.requires_grad
+                ]
+                torch.nn.utils.clip_grad_norm_(trainable_parameters, 1.0)
             optimizer.step()
             if scheduler is not None:
                 scheduler.step()
@@ -245,16 +260,14 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         learning_rate: float,
         patience: int,
         head_only: bool = False,
+        groups: np.ndarray | None = None,
     ) -> dict[str, float]:
         del epochs, batch_size, learning_rate, patience, head_only
         from sklearn.metrics import cohen_kappa_score
-        from sklearn.model_selection import train_test_split
 
-        indices = np.arange(len(y))
-        train_indices, validation_indices = train_test_split(
-            indices,
-            test_size=0.2,
-            stratify=y,
+        train_indices, validation_indices = split_train_validation_indices(
+            y,
+            groups=groups,
             random_state=self.config.random_seed,
         )
         generator = torch.Generator().manual_seed(self.config.random_seed)
@@ -285,7 +298,9 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         best_loss = float("inf")
         best_model_state: dict[str, torch.Tensor] | None = None
         best_modulator_state: dict[str, torch.Tensor] | None = None
-        for _ in range(self.config.offline_epochs):
+        stagnant_epochs = 0
+        epochs_completed = 0
+        for epoch_index in range(self.config.offline_epochs):
             metrics = self._train_epoch(
                 loader,
                 optimizer,
@@ -300,17 +315,34 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
             if not np.isfinite(kappa):
                 kappa = -1.0
             accuracy = float(np.mean(predictions == truth))
-            if kappa > best_kappa:
+            epochs_completed = epoch_index + 1
+            if kappa > best_kappa + 1e-6:
                 best_kappa = kappa
                 best_accuracy = accuracy
                 best_loss = metrics["loss"]
                 best_model_state = _copy_state_dict(self.base.model)
                 best_modulator_state = _copy_state_dict(modulator)
+                stagnant_epochs = 0
+            else:
+                stagnant_epochs += 1
+                if stagnant_epochs >= self.config.offline_patience:
+                    LOGGER.info(
+                        "NeuroOnline offline calibration stopped after %s epochs "
+                        "(no validation-kappa improvement for %s epochs).",
+                        epochs_completed,
+                        self.config.offline_patience,
+                    )
+                    break
         if best_model_state is not None and best_modulator_state is not None:
             self.base.model.load_state_dict(best_model_state)
             self._modulator.load_state_dict(best_modulator_state)
         self._optimizer = None
-        return {"val_loss": best_loss, "val_acc": best_accuracy, "val_kappa": best_kappa}
+        return {
+            "val_loss": best_loss,
+            "val_acc": best_accuracy,
+            "val_kappa": best_kappa,
+            "epochs_completed": float(epochs_completed),
+        }
 
     def predict_proba(self, X: np.ndarray, mc_dropout_passes: int = 1) -> np.ndarray:
         inputs = torch.as_tensor(X, dtype=torch.float32, device=self._device)
@@ -341,6 +373,8 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
                 "feature_shape": self._feature_shape,
                 "config": {
                     "prompt_count": self.config.prompt_count,
+                    "mask_ratio": self.config.mask_ratio,
+                    "consistency_weight": self.config.consistency_weight,
                 },
                 "modulator": self._modulator.state_dict(),
             },
@@ -405,7 +439,12 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         criterion = nn.CrossEntropyLoss(label_smoothing=self.config.label_smoothing).to(self._device)
         metrics = {"loss": 0.0, "classification_loss": 0.0, "consistency_loss": 0.0}
         for _ in range(max(int(epochs or self.config.epochs), 1)):
-            metrics = self._train_epoch(loader, self._optimizer, criterion)
+            metrics = self._train_epoch(
+                loader,
+                self._optimizer,
+                criterion,
+                clip_classifier_gradients=True,
+            )
         return {
             "updated": float(X.shape[0]),
             **metrics,
@@ -483,6 +522,9 @@ class NeuroOnlineStreamAdapter:
         self._time: deque[np.ndarray] = deque(maxlen=config.recent_samples)
         self._frequency: deque[np.ndarray] = deque(maxlen=config.recent_samples)
         self._labels: deque[int] = deque(maxlen=config.recent_samples)
+        self._window_ids: deque[int] = deque(maxlen=config.recent_samples)
+        self._event_ids: deque[str] = deque(maxlen=config.recent_samples)
+        self._model_revisions: deque[int] = deque(maxlen=config.recent_samples)
         self._generator = torch.Generator().manual_seed(config.random_seed)
         self._lock = threading.RLock()
         self._worker: threading.Thread | None = None
@@ -490,11 +532,16 @@ class NeuroOnlineStreamAdapter:
         self._pending_update = False
         self._n_classes = max(int(n_classes), 1)
         self._confusion = np.zeros((self._n_classes, self._n_classes), dtype=np.int64)
+        self._operational_confusion = np.zeros(
+            (self._n_classes, self._n_classes),
+            dtype=np.int64,
+        )
+        self._operational_abstentions = 0
         self._seen = 0
         self._updates = 0
         self._state = "collecting"
         self._last_result: dict[str, Any] | None = None
-        self._history: deque[dict[str, Any]] = deque(maxlen=100)
+        self._history: list[dict[str, Any]] = []
 
     def add_window(
         self,
@@ -502,7 +549,12 @@ class NeuroOnlineStreamAdapter:
         label: int,
         *,
         predicted_label: int | None = None,
+        operational_predicted_label: int | None = None,
+        probabilities: np.ndarray | None = None,
+        event_id: str = "",
+        model_revision: int = 0,
     ) -> None:
+        del probabilities
         sample = torch.as_tensor(np.asarray(window, dtype=np.float32)).unsqueeze(0)
         time_view = _time_mask(sample, self.config.mask_ratio, self._generator).squeeze(0).numpy()
         frequency_view = _frequency_mask(
@@ -518,12 +570,26 @@ class NeuroOnlineStreamAdapter:
             self._frequency.append(frequency_view)
             self._labels.append(int(label))
             self._seen += 1
+            self._window_ids.append(self._seen)
+            self._event_ids.append(str(event_id))
+            self._model_revisions.append(int(model_revision))
             if (
                 predicted_label is not None
                 and 0 <= int(label) < self._n_classes
                 and 0 <= int(predicted_label) < self._n_classes
             ):
                 self._confusion[int(label), int(predicted_label)] += 1
+            if 0 <= int(label) < self._n_classes:
+                if (
+                    operational_predicted_label is not None
+                    and 0 <= int(operational_predicted_label) < self._n_classes
+                ):
+                    self._operational_confusion[
+                        int(label),
+                        int(operational_predicted_label),
+                    ] += 1
+                else:
+                    self._operational_abstentions += 1
             should_update = (
                 self._seen >= self.config.history_threshold
                 and self._seen % self.config.update_stride == 0
@@ -582,6 +648,7 @@ class NeuroOnlineStreamAdapter:
         return {
             "enabled": self.config.enabled,
             "strategy": "neuroonline",
+            "config": asdict(self.config),
             "state": self._state,
             "seen_labeled_windows": self._seen,
             "buffered_windows": len(self._labels),
@@ -593,21 +660,48 @@ class NeuroOnlineStreamAdapter:
             "progress": min(max(float(progress), 0.0), 1.0),
             "class_counts": {str(index): int(counts[index]) for index in range(self._n_classes)},
             "prequential": self._prequential_metrics_locked(),
+            "operational_prequential": self._operational_metrics_locked(),
             "update_history": list(self._history),
             "last_result": self._last_result,
         }
 
-    def _snapshot_locked(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def _snapshot_locked(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+        labels = np.asarray(self._labels, dtype=np.int64)
+        window_ids = list(self._window_ids)
         return (
             np.stack(self._original).astype(np.float32),
             np.stack(self._time).astype(np.float32),
             np.stack(self._frequency).astype(np.float32),
-            np.asarray(self._labels, dtype=np.int64),
+            labels,
+            {
+                "trigger_seen_labeled_windows": self._seen,
+                "snapshot_first_window_id": int(window_ids[0]),
+                "snapshot_last_window_id": int(window_ids[-1]),
+                "snapshot_samples": int(labels.size),
+                "snapshot_class_counts": np.bincount(
+                    labels,
+                    minlength=self._n_classes,
+                ).tolist(),
+                "snapshot_first_event_id": self._event_ids[0],
+                "snapshot_last_event_id": self._event_ids[-1],
+                "snapshot_first_model_revision": int(self._model_revisions[0]),
+                "snapshot_last_model_revision": int(self._model_revisions[-1]),
+                "trigger_timestamp_unix": time.time(),
+                "trigger_timestamp_monotonic": time.monotonic(),
+            },
         )
 
     def _start_update_locked(
         self,
-        snapshot: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+        snapshot: tuple[
+            np.ndarray,
+            np.ndarray,
+            np.ndarray,
+            np.ndarray,
+            dict[str, Any],
+        ],
     ) -> None:
         self._state = "training"
         self._worker = threading.Thread(
@@ -624,14 +718,19 @@ class NeuroOnlineStreamAdapter:
         time_masked: np.ndarray,
         frequency_masked: np.ndarray,
         labels: np.ndarray,
+        snapshot_metadata: dict[str, Any],
     ) -> None:
         started_at = time.perf_counter()
+        started_unix = time.time()
         try:
             result = dict(self._update_callback(original, time_masked, frequency_masked, labels))
         except Exception as exc:  # noqa: BLE001
             LOGGER.exception("NeuroOnline background update failed")
             result = {"updated": 0.0, "error": str(exc)}
         result["duration_sec"] = float(time.perf_counter() - started_at)
+        result.update(snapshot_metadata)
+        result["training_started_unix"] = started_unix
+        result["training_completed_unix"] = time.time()
         succeeded = not result.get("error") and float(result.get("updated", 0.0)) > 0
 
         if succeeded and self._save_callback is not None:
@@ -648,7 +747,39 @@ class NeuroOnlineStreamAdapter:
             prequential = self._prequential_metrics_locked()
             history_item: dict[str, Any] = {
                 "update": self._updates,
-                "seen_labeled_windows": self._seen,
+                "seen_labeled_windows": int(
+                    result.get("trigger_seen_labeled_windows", self._seen)
+                ),
+                "trigger_seen_labeled_windows": int(
+                    result.get("trigger_seen_labeled_windows", self._seen)
+                ),
+                "snapshot_first_window_id": int(
+                    result.get("snapshot_first_window_id", 0)
+                ),
+                "snapshot_last_window_id": int(
+                    result.get("snapshot_last_window_id", 0)
+                ),
+                "snapshot_samples": int(result.get("snapshot_samples", labels.size)),
+                "snapshot_class_counts": list(
+                    result.get("snapshot_class_counts", [])
+                ),
+                "snapshot_first_event_id": str(
+                    result.get("snapshot_first_event_id", "")
+                ),
+                "snapshot_last_event_id": str(
+                    result.get("snapshot_last_event_id", "")
+                ),
+                "base_model_revision": int(result.get("base_model_revision", 0)),
+                "model_revision": int(result.get("model_revision", 0)),
+                "trigger_timestamp_unix": float(
+                    result.get("trigger_timestamp_unix", 0.0)
+                ),
+                "training_started_unix": float(
+                    result.get("training_started_unix", 0.0)
+                ),
+                "training_completed_unix": float(
+                    result.get("training_completed_unix", 0.0)
+                ),
                 "loss": float(result.get("loss", 0.0)),
                 "classification_loss": float(result.get("classification_loss", 0.0)),
                 "consistency_loss": float(result.get("consistency_loss", 0.0)),
@@ -683,17 +814,45 @@ class NeuroOnlineStreamAdapter:
             out=np.zeros(self._n_classes, dtype=np.float64),
             where=support > 0,
         )
-        observed = support > 0
-        balanced = float(per_class[observed].mean()) if np.any(observed) else 0.0
+        balanced = float(per_class.mean())
         return {
             "evaluated_windows": evaluated,
             "correct_windows": correct,
             "accuracy": float(correct / evaluated) if evaluated else 0.0,
             "balanced_accuracy": balanced,
+            "all_classes_observed": bool(np.all(support > 0)),
             "per_class_accuracy": {
                 str(index): float(per_class[index]) for index in range(self._n_classes)
             },
             "confusion_matrix": self._confusion.tolist(),
+        }
+
+    def _operational_metrics_locked(self) -> dict[str, Any]:
+        support = self._confusion.sum(axis=1)
+        correct = int(np.trace(self._operational_confusion))
+        evaluated = int(self._confusion.sum())
+        issued = int(self._operational_confusion.sum())
+        per_class = np.divide(
+            np.diag(self._operational_confusion),
+            support,
+            out=np.zeros(self._n_classes, dtype=np.float64),
+            where=support > 0,
+        )
+        return {
+            "evaluated_windows": evaluated,
+            "issued_commands": issued,
+            "abstained_windows": self._operational_abstentions,
+            "coverage": float(issued / evaluated) if evaluated else 0.0,
+            "accuracy_with_abstention_as_error": (
+                float(correct / evaluated) if evaluated else 0.0
+            ),
+            "selective_accuracy": float(correct / issued) if issued else 0.0,
+            "balanced_accuracy": float(per_class.mean()),
+            "per_class_recall": {
+                str(index): float(per_class[index])
+                for index in range(self._n_classes)
+            },
+            "confusion_matrix": self._operational_confusion.tolist(),
         }
 
 
@@ -749,10 +908,28 @@ def _time_mask(
     ratio: float,
     generator: torch.Generator | None,
 ) -> torch.Tensor:
-    mask = torch.rand(inputs.shape, generator=generator, device=inputs.device) < ratio
+    if inputs.ndim < 2:
+        raise ValueError("Time masking expects a tensor with a time dimension.")
+    ratio = float(np.clip(ratio, 0.0, 1.0))
+    time_points = int(inputs.shape[-1])
+    span = min(int(round(time_points * ratio)), time_points)
+    if span <= 0:
+        return inputs.clone()
+    batch_size = int(inputs.shape[0])
+    starts = torch.randint(
+        0,
+        time_points - span + 1,
+        (batch_size,),
+        generator=generator,
+        device=inputs.device,
+    )
+    positions = torch.arange(time_points, device=inputs.device).view(1, time_points)
+    mask = (positions >= starts.view(-1, 1)) & (
+        positions < (starts + span).view(-1, 1)
+    )
+    mask = mask.view(batch_size, *([1] * (inputs.ndim - 2)), time_points)
     output = inputs.clone()
-    output[mask] = 0.0
-    return output
+    return output.masked_fill(mask, 0.0)
 
 
 def _frequency_mask(
@@ -760,10 +937,28 @@ def _frequency_mask(
     ratio: float,
     generator: torch.Generator | None,
 ) -> torch.Tensor:
+    if inputs.ndim < 2:
+        raise ValueError("Frequency masking expects a tensor with a time dimension.")
+    ratio = float(np.clip(ratio, 0.0, 1.0))
     spectrum = torch.fft.rfft(inputs, dim=-1)
-    mask = torch.rand(spectrum.shape, generator=generator, device=inputs.device) < ratio
-    masked = spectrum.clone()
-    masked[mask] = 0.0 + 0.0j
+    frequencies = int(spectrum.shape[-1])
+    span = min(int(round(frequencies * ratio)), frequencies)
+    if span <= 0:
+        return inputs.clone()
+    batch_size = int(inputs.shape[0])
+    starts = torch.randint(
+        0,
+        frequencies - span + 1,
+        (batch_size,),
+        generator=generator,
+        device=inputs.device,
+    )
+    positions = torch.arange(frequencies, device=inputs.device).view(1, frequencies)
+    mask = (positions >= starts.view(-1, 1)) & (
+        positions < (starts + span).view(-1, 1)
+    )
+    mask = mask.view(batch_size, *([1] * (inputs.ndim - 2)), frequencies)
+    masked = spectrum.masked_fill(mask, 0.0 + 0.0j)
     return torch.fft.irfft(masked, n=inputs.shape[-1], dim=-1)
 
 

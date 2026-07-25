@@ -153,10 +153,19 @@ Calibration 是“协议驱动的 cue 采集”。
 
 默认还包含：
 
-- baseline：通常为 60s 睁眼注视中央十字
-- 新被试：`6` 个 block
-- 每个 block：每类 `8` 个 trial
+- baseline：60s 睁眼注视中央十字
+- 每次实验都从头校准，不区分新/老被试
+- `4` 个 block
+- 每个 block：每类 `5` 个 trial
 - 三类：`left / right / idle`
+- block 间休息：`20s`
+
+因此正式采集时间为：
+
+- baseline：`60s`
+- 60 个 trial × `10s`：`600s`
+- 3 次休息 × `20s`：`60s`
+- 合计：`720s = 12min`
 
 对训练真正生效的窗，不是整个 trial，而是 `control` 时段中的一部分：
 
@@ -177,6 +186,9 @@ Calibration 是“协议驱动的 cue 采集”。
 - `1.5 - 3.5`
 - `2.0 - 4.0`
 - `2.5 - 4.5`
+
+质量筛选前每个 trial 产生 5 个窗口，共 300 个窗口、每类 100 个。数据文件保存
+`trial_ids`，训练/验证按 trial 分组拆分，避免同一 trial 的重叠窗口同时进入两边。
 
 这意味着 calibration 训练数据来自较“干净”的 control 段，而不是整个 cue block。
 
@@ -224,16 +236,26 @@ Calibration 是“协议驱动的 cue 采集”。
 
 默认预处理定义在 `utils/preprocessing.py`：
 
-1. Common Average Reference
-2. `8-30 Hz` 带通滤波
-3. 幅值裁剪到 `[-150, 150] uV`
+1. 检查非有限值、平直导联和相对异常高噪导联
+2. 无 montage 坐标时，以健康导联逐点中位数稳健修复坏导
+3. Common Average Reference
+4. `0.3-40 Hz` 五阶 Butterworth SOS 零相位带通
+5. 记录峰值、超幅比例和坏导比例
+6. 为数值安全将模型输入限制到 `[-150, 150] uV`
 
 对应函数：
 
 - `common_average_reference`
 - `bandpass_filter`
 - `reject_artifacts`
+- `preprocess_eeg_window`
 - `filter_and_transform`
+
+这里没有逐窗 z-score：CBraMod 的 MI 预处理也保留微伏幅值，而
+ShallowConvNet 的运动想象特征依赖节律功率变化。`reject_artifacts` 只是兼容旧
+调用的数值保护，真正的质量判定来自 `preprocess_eeg_window().quality`。校准和
+NeuroOnline 只接收 `quality.accepted=True` 的窗口，实时落盘仍保留原始窗口和
+质量字段，便于事后复核。
 
 ## Metadata 能看出什么
 

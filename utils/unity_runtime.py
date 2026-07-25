@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
+import json
 import logging
 import os
 import socket
@@ -17,6 +19,16 @@ LOGGER = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BUILD_DIR = Path("unity相关") / "ARPrototype3D-windows-x64"
 DEFAULT_EXECUTABLE = DEFAULT_BUILD_DIR / "ARPrototype3D.exe"
+RUNTIME_MANIFEST_FILENAME = "oi-mi-runtime.json"
+REQUIRED_RUNTIME_PROTOCOL = "continuous-scene-v2"
+REQUIRED_RUNTIME_FEATURES = frozenset(
+    {
+        "continuous_control",
+        "obstacle_truth",
+        "scene_ack",
+        "scene_failure_event",
+    }
+)
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
 
 # Win32 window-style flags used to compensate for Unity builds made with
@@ -50,6 +62,143 @@ def configured_unity_executable(config: dict[str, Any], *, project_root: Path | 
     return resolve_project_path(executable_path, project_root=project_root)
 
 
+def validate_unity_runtime(executable: Path) -> dict[str, Any]:
+    """Validate that a bundled Unity player implements the required protocol."""
+
+    executable = executable.resolve()
+    if not executable.is_file():
+        raise RuntimeError(f"Unity game executable was not found: {executable}")
+
+    build_dir = executable.parent
+    managed_dir = build_dir / f"{executable.stem}_Data" / "Managed"
+    required_paths = (
+        build_dir / "UnityPlayer.dll",
+        managed_dir / "Assembly-CSharp.dll",
+        managed_dir / "ARPong.Runtime.dll",
+    )
+    missing = [str(path) for path in required_paths if not path.is_file()]
+    if missing:
+        raise RuntimeError(
+            "Unity runtime is incomplete; missing: " + ", ".join(missing)
+        )
+
+    manifest_path = build_dir / RUNTIME_MANIFEST_FILENAME
+    if not manifest_path.is_file():
+        raise RuntimeError(
+            f"Unity runtime manifest was not found: {manifest_path}. "
+            "Install the current oi-mi Unity release; older unversioned builds "
+            "cannot be used for the continuous-scene experiment."
+        )
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Invalid Unity runtime manifest: {manifest_path}: {exc}") from exc
+
+    protocol = str(manifest.get("protocol_version", "")).strip()
+    if protocol != REQUIRED_RUNTIME_PROTOCOL:
+        raise RuntimeError(
+            "Unity runtime protocol mismatch: "
+            f"expected {REQUIRED_RUNTIME_PROTOCOL!r}, got {protocol or '<missing>'!r}. "
+            "Reinstall the current oi-mi Unity release."
+        )
+
+    features = {
+        str(feature).strip()
+        for feature in manifest.get("features", [])
+        if str(feature).strip()
+    }
+    missing_features = sorted(REQUIRED_RUNTIME_FEATURES - features)
+    if missing_features:
+        raise RuntimeError(
+            "Unity runtime is missing required features: "
+            + ", ".join(missing_features)
+        )
+
+    declared_files = manifest.get("files", {})
+    if not isinstance(declared_files, dict) or not declared_files:
+        raise RuntimeError("Unity runtime manifest must declare file SHA-256 hashes.")
+    required_declared_files = {
+        executable.name,
+        "UnityPlayer.dll",
+        f"{executable.stem}_Data/Managed/Assembly-CSharp.dll",
+        f"{executable.stem}_Data/Managed/ARPong.Runtime.dll",
+    }
+    normalized_declared_files = {
+        str(relative_name).replace("\\", "/") for relative_name in declared_files
+    }
+    missing_hashes = sorted(required_declared_files - normalized_declared_files)
+    if missing_hashes:
+        raise RuntimeError(
+            "Unity runtime manifest is missing critical file hashes: "
+            + ", ".join(missing_hashes)
+        )
+    for relative_name, expected_hash in declared_files.items():
+        relative_path = Path(str(relative_name))
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise RuntimeError(f"Unsafe path in Unity runtime manifest: {relative_name}")
+        file_path = (build_dir / relative_path).resolve()
+        try:
+            file_path.relative_to(build_dir)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Unsafe path in Unity runtime manifest: {relative_name}"
+            ) from exc
+        if not file_path.is_file():
+            raise RuntimeError(f"Unity runtime file is missing: {file_path}")
+        actual_hash = _sha256(file_path)
+        if actual_hash.casefold() != str(expected_hash).strip().casefold():
+            raise RuntimeError(
+                f"Unity runtime file hash mismatch: {relative_name}. "
+                "Reinstall the current oi-mi Unity release."
+            )
+
+    return manifest
+
+
+def write_unity_runtime_manifest(executable: Path, *, build_id: str) -> Path:
+    """Create the protocol manifest shipped beside a Unity Windows player."""
+
+    executable = executable.resolve()
+    build_id = str(build_id).strip()
+    if not build_id:
+        raise ValueError("build_id must not be empty.")
+
+    build_dir = executable.parent
+    unity_player = build_dir / "UnityPlayer.dll"
+    managed_dir = build_dir / f"{executable.stem}_Data" / "Managed"
+    managed_dlls = (
+        managed_dir / "Assembly-CSharp.dll",
+        managed_dir / "ARPong.Runtime.dll",
+    )
+    for required_path in (executable, unity_player, *managed_dlls):
+        if not required_path.is_file():
+            raise RuntimeError(f"Unity runtime file is missing: {required_path}")
+
+    manifest = {
+        "schema_version": 1,
+        "build_id": build_id,
+        "protocol_version": REQUIRED_RUNTIME_PROTOCOL,
+        "features": sorted(REQUIRED_RUNTIME_FEATURES),
+        "files": {
+            executable.name: _sha256(executable),
+            unity_player.name: _sha256(unity_player),
+            **{
+                managed_dll.relative_to(build_dir).as_posix(): _sha256(managed_dll)
+                for managed_dll in managed_dlls
+            },
+        },
+    }
+    manifest_path = build_dir / RUNTIME_MANIFEST_FILENAME
+    temporary_path = manifest_path.with_suffix(f"{manifest_path.suffix}.tmp")
+    temporary_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary_path, manifest_path)
+    return manifest_path
+
+
 def ensure_unity_game_running(
     config: dict[str, Any],
     *,
@@ -75,17 +224,24 @@ def ensure_unity_game_running(
         )
         return None
 
+    executable = configured_unity_executable(config, project_root=project_root)
+    try:
+        manifest = validate_unity_runtime(executable)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"{exc} Run `python tools/download_unity_build.py --force` "
+            "before realtime decoding."
+        ) from exc
+
+    _notify(
+        console,
+        "Unity runtime verified: "
+        f"{manifest.get('build_id', 'unknown')} ({REQUIRED_RUNTIME_PROTOCOL})",
+    )
+
     if _is_tcp_open(host, port, timeout_sec=0.25):
         _enable_existing_window_resize(config, project_root=project_root, console=console)
         return None
-
-    executable = configured_unity_executable(config, project_root=project_root)
-    if not executable.exists():
-        raise RuntimeError(
-            "Unity game executable was not found: "
-            f"{executable}. Run `python setup_local.py` or "
-            "`python tools/download_unity_build.py` before realtime decoding."
-        )
 
     _notify(console, f"Launching Unity game: {executable}")
     process = _launch_process(executable, ar_game_cfg)
@@ -182,10 +338,8 @@ def _make_windows_resizable(
 ) -> bool:
     """Add resize/maximize styles to matching top-level Windows windows.
 
-    This is a runtime fallback for a bundled Unity player whose source project
-    is unavailable.  A future Unity rebuild should instead enable
-    ``PlayerSettings.resizableWindow`` and can then disable this workaround in
-    config.
+    This remains a compatibility fallback for older packaged players. Builds
+    with ``PlayerSettings.resizableWindow`` enabled can disable it in config.
     """
 
     if os.name != "nt" or (process_id is None and not window_title):
@@ -296,6 +450,14 @@ def _is_tcp_open(host: str, port: int, *, timeout_sec: float) -> bool:
             return True
     except OSError:
         return False
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _notify(console: Any | None, message: str) -> None:

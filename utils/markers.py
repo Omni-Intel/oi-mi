@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
+import select
 import socket
 import threading
 import time
 from abc import ABC, abstractmethod
 from collections import deque
+from typing import Any
 
 LOGGER = logging.getLogger(__name__)
 
@@ -101,6 +103,8 @@ class ArTcpCommandSender:
         self._timeout_sec = timeout_sec
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
+        self._receive_buffer = bytearray()
+        self._events: deque[dict[str, Any]] = deque()
 
     def push(self, command: str) -> None:
         payload = _encode_command_payload(command)
@@ -115,6 +119,52 @@ class ArTcpCommandSender:
                     f"Failed to send AR command to {self._host}:{self._port}: {exc}"
                 ) from exc
 
+    def push_with_ack(self, command: str) -> None:
+        """Send a scene command and require Unity to confirm it was applied."""
+
+        payload = _encode_command_payload(command)
+        with self._lock:
+            try:
+                self._ensure_connected()
+                assert self._sock is not None
+                self._sock.sendall(payload)
+                deadline = time.monotonic() + self._timeout_sec
+                while time.monotonic() < deadline:
+                    if self._drain_messages_locked(expected_ack=command):
+                        return
+                    chunk = self._sock.recv(4096)
+                    if not chunk:
+                        raise OSError("Unity closed the connection before scene ACK")
+                    self._receive_buffer.extend(chunk)
+                raise TimeoutError(f"Unity did not ACK {command}")
+            except (OSError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+                self._close_locked()
+                raise RuntimeError(
+                    f"Unity scene protocol mismatch or connection failure for {command}: {exc}"
+                ) from exc
+
+    def poll_events(self) -> list[dict[str, Any]]:
+        """Return Unity events already available without blocking decoding."""
+
+        with self._lock:
+            if self._sock is None:
+                return []
+            try:
+                self._drain_messages_locked()
+                while select.select([self._sock], [], [], 0.0)[0]:
+                    chunk = self._sock.recv(4096)
+                    if not chunk:
+                        raise OSError("Unity closed the scene event connection")
+                    self._receive_buffer.extend(chunk)
+                    self._drain_messages_locked()
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                self._close_locked()
+                raise RuntimeError(f"Failed to receive Unity scene event: {exc}") from exc
+
+            events = list(self._events)
+            self._events.clear()
+            return events
+
     def close(self) -> None:
         with self._lock:
             self._close_locked()
@@ -128,6 +178,25 @@ class ArTcpCommandSender:
         )
         self._sock.settimeout(self._timeout_sec)
 
+    def _drain_messages_locked(self, *, expected_ack: str | None = None) -> bool:
+        ack_received = False
+        while True:
+            line_break = self._receive_buffer.find(b"\n")
+            if line_break < 0:
+                return ack_received
+            raw = bytes(self._receive_buffer[:line_break]).strip()
+            del self._receive_buffer[: line_break + 1]
+            if not raw:
+                continue
+            response = json.loads(raw.decode("utf-8"))
+            if str(response.get("event", "")).strip():
+                self._events.append(response)
+            if (
+                expected_ack is not None
+                and str(response.get("ack", "")).upper() == expected_ack.upper()
+            ):
+                ack_received = True
+
     def _close_locked(self) -> None:
         if self._sock is None:
             return
@@ -135,216 +204,5 @@ class ArTcpCommandSender:
             self._sock.close()
         finally:
             self._sock = None
-
-
-class ArTcpCommandRelay:
-    """PC-side relay that accepts a reverse Unity connection and local producers."""
-
-    def __init__(
-        self,
-        local_host: str,
-        local_port: int,
-        *,
-        downstream_bind_host: str = "0.0.0.0",
-        downstream_bind_port: int = 5006,
-        timeout_sec: float = 1.0,
-    ) -> None:
-        self._local_host = local_host
-        self._local_port = local_port
-        self._downstream_bind_host = downstream_bind_host
-        self._downstream_bind_port = downstream_bind_port
-        self._timeout_sec = timeout_sec
-
-        self._running = True
-        self._local_listener: socket.socket | None = None
-        self._downstream_listener: socket.socket | None = None
-        self._downstream_client: socket.socket | None = None
-        self._downstream_lock = threading.Lock()
-        self._pending_payloads: deque[bytes] = deque(maxlen=64)
-        self._threads: list[threading.Thread] = []
-
-        self._start_thread(self._run_local_listener, "oi-mi-local-command-relay")
-        self._start_thread(self._run_downstream_listener, "oi-mi-downstream-command-relay")
-        LOGGER.info(
-            "AR command relay started. local=%s:%s downstream=%s:%s",
-            self._local_host,
-            self._local_port,
-            self._downstream_bind_host,
-            self._downstream_bind_port,
-        )
-
-    def push(self, command: str) -> None:
-        self._forward_payload(_encode_command_payload(command))
-
-    def close(self) -> None:
-        self._running = False
-        self._close_socket(self._local_listener)
-        self._local_listener = None
-        self._close_socket(self._downstream_listener)
-        self._downstream_listener = None
-        with self._downstream_lock:
-            self._close_socket(self._downstream_client)
-            self._downstream_client = None
-        for thread in self._threads:
-            thread.join(timeout=1.0)
-
-    def _start_thread(self, target: callable, name: str) -> None:
-        thread = threading.Thread(target=target, name=name, daemon=True)
-        thread.start()
-        self._threads.append(thread)
-
-    def _run_local_listener(self) -> None:
-        try:
-            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            listener.bind((self._local_host, self._local_port))
-            listener.listen()
-            listener.settimeout(0.5)
-            self._local_listener = listener
-        except OSError as exc:
-            LOGGER.error(
-                "Failed to start local AR command relay listener on %s:%s: %s",
-                self._local_host,
-                self._local_port,
-                exc,
-            )
-            return
-
-        while self._running:
-            try:
-                client, remote = listener.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-
-            LOGGER.info("Accepted local AR command producer from %s:%s", remote[0], remote[1])
-            self._start_thread(
-                lambda sock=client: self._handle_local_client(sock),
-                f"oi-mi-local-command-producer-{remote[0]}:{remote[1]}",
-            )
-
-    def _handle_local_client(self, client: socket.socket) -> None:
-        try:
-            client.settimeout(0.5)
-            buffer = bytearray()
-            while self._running:
-                try:
-                    chunk = client.recv(4096)
-                except socket.timeout:
-                    continue
-                except OSError:
-                    break
-
-                if not chunk:
-                    break
-                buffer.extend(chunk)
-                while True:
-                    line_break = buffer.find(b"\n")
-                    if line_break < 0:
-                        break
-                    line = bytes(buffer[:line_break]).strip()
-                    del buffer[: line_break + 1]
-                    if line:
-                        self._forward_payload(line + b"\n")
-        finally:
-            self._close_socket(client)
-
-    def _run_downstream_listener(self) -> None:
-        try:
-            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            listener.bind((self._downstream_bind_host, self._downstream_bind_port))
-            listener.listen()
-            listener.settimeout(0.5)
-            self._downstream_listener = listener
-        except OSError as exc:
-            LOGGER.error(
-                "Failed to start downstream AR relay listener on %s:%s: %s",
-                self._downstream_bind_host,
-                self._downstream_bind_port,
-                exc,
-            )
-            return
-
-        while self._running:
-            try:
-                client, remote = listener.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-
-            LOGGER.info("Unity downstream connected from %s:%s", remote[0], remote[1])
-            client.settimeout(1.0)
-            with self._downstream_lock:
-                self._close_socket(self._downstream_client)
-                self._downstream_client = client
-                self._flush_pending_payloads_locked()
-
-            self._start_thread(
-                lambda sock=client, addr=remote[0], port=remote[1]: self._monitor_downstream_client(sock, addr, port),
-                f"oi-mi-downstream-monitor-{remote[0]}:{remote[1]}",
-            )
-
-    def _monitor_downstream_client(self, client: socket.socket, host: str, port: int) -> None:
-        try:
-            while self._running:
-                try:
-                    data = client.recv(1)
-                except socket.timeout:
-                    continue
-                except OSError:
-                    break
-
-                if not data:
-                    break
-        finally:
-            LOGGER.info("Unity downstream disconnected from %s:%s", host, port)
-            with self._downstream_lock:
-                if self._downstream_client is client:
-                    self._close_socket(self._downstream_client)
-                    self._downstream_client = None
-            self._close_socket(client)
-
-    def _forward_payload(self, payload: bytes) -> None:
-        with self._downstream_lock:
-            client = self._downstream_client
-            if client is None:
-                self._pending_payloads.append(payload)
-                LOGGER.debug("Buffered AR command because no Unity downstream client is connected.")
-                return
-            try:
-                client.sendall(payload)
-            except OSError as exc:
-                LOGGER.warning("Failed to forward AR command to downstream Unity client: %s", exc)
-                self._close_socket(client)
-                if self._downstream_client is client:
-                    self._downstream_client = None
-                self._pending_payloads.append(payload)
-
-    def _flush_pending_payloads_locked(self) -> None:
-        client = self._downstream_client
-        if client is None or not self._pending_payloads:
-            return
-
-        while self._pending_payloads:
-            payload = self._pending_payloads.popleft()
-            try:
-                client.sendall(payload)
-            except OSError as exc:
-                LOGGER.warning("Failed to flush buffered AR command to downstream Unity client: %s", exc)
-                self._close_socket(client)
-                if self._downstream_client is client:
-                    self._downstream_client = None
-                self._pending_payloads.appendleft(payload)
-                return
-
-    @staticmethod
-    def _close_socket(sock: socket.socket | None) -> None:
-        if sock is None:
-            return
-        try:
-            sock.close()
-        except OSError:
-            pass
+            self._receive_buffer.clear()
+            self._events.clear()

@@ -27,7 +27,10 @@ class GuiSmokeTests(unittest.TestCase):
 
         app.button(key="nav_btn_校准").click().run()
         self.assertEqual(list(app.exception), [])
-        self.assertEqual(app.radio[0].value, "新被试 (重新训练)")
+        self.assertEqual(list(app.radio), [])
+        self.assertTrue(
+            any("预计正式采集 12.0 分钟" in info.value for info in app.info)
+        )
         self.assertIn("正式实验", {button.label for button in app.button})
 
     def test_calibration_run_disables_return_button(self) -> None:

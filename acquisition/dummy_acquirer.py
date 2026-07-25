@@ -23,7 +23,7 @@ class DummyAcquirer(AbstractAcquirer):
 
     def __init__(
         self,
-        sfreq: float = 250.0,
+        sfreq: float = 200.0,
         n_channels: int = 64,
         buffer_sec: float = 60.0,
         *,
@@ -38,7 +38,12 @@ class DummyAcquirer(AbstractAcquirer):
         chunk_ms: float = 20.0,
         label_aware: bool = False,
     ) -> None:
-        self.metadata = AcquirerMetadata(name="dummy", sfreq=float(sfreq), n_channels=int(n_channels))
+        self.metadata = AcquirerMetadata(
+            name="dummy",
+            sfreq=float(sfreq),
+            n_channels=int(n_channels),
+            timestamp_domain="monotonic",
+        )
         self._buffer_sec = float(buffer_sec)
         self._startup_delay_sec = float(startup_delay_sec)
         self._rng = np.random.default_rng(seed)
@@ -129,7 +134,10 @@ class DummyAcquirer(AbstractAcquirer):
             start = end - required
             eeg = self._read_ring(self._buffer, start, end)
 
-        timestamps = np.arange(required, dtype=np.float64) / self.metadata.sfreq
+        window_end = time.monotonic()
+        timestamps = window_end - (
+            np.arange(required, 0, -1, dtype=np.float64) / self.metadata.sfreq
+        )
         return eeg.astype(np.float32, copy=False), timestamps
 
     def get_new_samples(self) -> EEGChunk:
@@ -159,7 +167,10 @@ class DummyAcquirer(AbstractAcquirer):
             eeg = self._read_ring(self._buffer, start, end)
             self._last_read_sample = total
 
-        timestamps = np.arange(eeg.shape[1], dtype=np.float64) / self.metadata.sfreq
+        window_end = time.monotonic()
+        timestamps = window_end - (
+            np.arange(eeg.shape[1], 0, -1, dtype=np.float64) / self.metadata.sfreq
+        )
         return eeg.astype(np.float32, copy=False), timestamps
 
     def save_full_buffer_npy(self, path: Path) -> Path:

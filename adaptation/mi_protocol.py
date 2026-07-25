@@ -59,13 +59,9 @@ class ProtocolConfig:
     practice_labels: list[str]
     practice_repetitions: int
     baseline_segments: list[BaselineSegment]
-    new_subject_blocks: int
-    new_subject_trials_per_class_per_block: int
-    old_subject_baseline_sec: float
-    old_subject_trials_per_class: int
+    calibration_blocks: int
+    calibration_trials_per_class_per_block: int
     rest_between_blocks_sec: float
-    extra_rest_sec: float
-    dynamic_total_minutes_hint: float
     random_seed: int
 
     @classmethod
@@ -105,13 +101,11 @@ class ProtocolConfig:
             practice_labels=[str(label) for label in protocol.get("practice_labels", ["left", "right", "idle", "left", "right", "idle"])],
             practice_repetitions=int(protocol.get("practice_repetitions", 1)),
             baseline_segments=baseline_segments,
-            new_subject_blocks=int(protocol.get("new_subject_blocks", 6)),
-            new_subject_trials_per_class_per_block=int(protocol.get("new_subject_trials_per_class_per_block", 8)),
-            old_subject_baseline_sec=float(protocol.get("old_subject_baseline_sec", 60.0)),
-            old_subject_trials_per_class=int(protocol.get("old_subject_trials_per_class", 8)),
-            rest_between_blocks_sec=float(protocol.get("rest_between_blocks_sec", 35.0)),
-            extra_rest_sec=float(protocol.get("extra_rest_sec", 60.0)),
-            dynamic_total_minutes_hint=float(protocol.get("dynamic_total_minutes_hint", 30.0)),
+            calibration_blocks=int(protocol.get("calibration_blocks", 4)),
+            calibration_trials_per_class_per_block=int(
+                protocol.get("calibration_trials_per_class_per_block", 5)
+            ),
+            rest_between_blocks_sec=float(protocol.get("rest_between_blocks_sec", 20.0)),
             random_seed=int(protocol.get("random_seed", 17)),
         )
 
@@ -134,38 +128,25 @@ class SessionPlan:
         return self.total_formal_trials * self.trial_timing.total_sec / 60.0
 
 
-def build_session_plan(protocol: ProtocolConfig, *, is_new_subject: bool) -> SessionPlan:
-    rng = random.Random(protocol.random_seed + (0 if is_new_subject else 1000))
+def build_session_plan(protocol: ProtocolConfig) -> SessionPlan:
+    """Build the single-session, from-scratch calibration plan."""
+    rng = random.Random(protocol.random_seed)
     practice_labels = list(protocol.practice_labels) * max(protocol.practice_repetitions, 0)
-    if is_new_subject:
-        blocks = [
-            generate_block_sequence(
-                {"left": protocol.new_subject_trials_per_class_per_block, "right": protocol.new_subject_trials_per_class_per_block, "idle": protocol.new_subject_trials_per_class_per_block},
-                rng=rng,
-            )
-            for _ in range(protocol.new_subject_blocks)
-        ]
-        baseline_segments = list(protocol.baseline_segments)
-        subject_mode = "new"
-    else:
-        blocks = [
-            generate_block_sequence(
-                {"left": protocol.old_subject_trials_per_class, "right": protocol.old_subject_trials_per_class, "idle": protocol.old_subject_trials_per_class},
-                rng=rng,
-            )
-        ]
-        baseline_segments = [
-            BaselineSegment(
-                name="idle_baseline",
-                duration_sec=protocol.old_subject_baseline_sec,
-                instruction="睁眼注视固定点或游戏界面，不发指令，不做动作想象。",
-            )
-        ]
-        subject_mode = "old"
+    blocks = [
+        generate_block_sequence(
+            {
+                "left": protocol.calibration_trials_per_class_per_block,
+                "right": protocol.calibration_trials_per_class_per_block,
+                "idle": protocol.calibration_trials_per_class_per_block,
+            },
+            rng=rng,
+        )
+        for _ in range(protocol.calibration_blocks)
+    ]
     return SessionPlan(
-        subject_mode=subject_mode,
+        subject_mode="recalibration",
         practice_labels=practice_labels,
-        baseline_segments=baseline_segments,
+        baseline_segments=list(protocol.baseline_segments),
         blocks=blocks,
         rest_between_blocks_sec=protocol.rest_between_blocks_sec,
         trial_timing=protocol.trial_timing,

@@ -40,6 +40,8 @@ from utils.online_labels import (
     SimulatedOnlineLabelSource,
     build_cued_online_label_source,
 )
+from utils.reproducibility import seed_experiment
+from web_command_server import start_web_command_server
 
 _GUI_ROOT = Path(__file__).resolve().parent
 _PAGE_ICON_FILENAME = "OMNI_ICON.svg"
@@ -97,14 +99,11 @@ _AR_TEST_COMMANDS = ("START", "LEFT", "RIGHT", "STOP")
 
 
 def _ar_game_mode(ar_game_cfg: dict) -> str:
-    return "reverse relay" if bool(ar_game_cfg.get("reverse_enabled", False)) else "direct TCP"
+    del ar_game_cfg
+    return "direct TCP"
 
 
 def _ar_game_target(ar_game_cfg: dict) -> str:
-    if bool(ar_game_cfg.get("reverse_enabled", False)):
-        listen_ip = str(ar_game_cfg.get("reverse_listen_ip", "0.0.0.0"))
-        listen_port = int(ar_game_cfg.get("reverse_listen_port", 5006))
-        return f"listen {listen_ip}:{listen_port}"
     host = str(ar_game_cfg.get("host", "127.0.0.1"))
     port = int(ar_game_cfg.get("port", 5005))
     return f"{host}:{port}"
@@ -130,6 +129,8 @@ def _update_ar_decoder_status(payload: dict) -> None:
         last_send_success=payload.get("last_send_success"),
         last_send_error=payload.get("last_send_error"),
         online_adaptation=payload.get("online_adaptation"),
+        online_label_source=payload.get("online_label_source"),
+        timing_alignment=payload.get("timing_alignment"),
     )
 
 
@@ -163,7 +164,7 @@ def _current_streamlit_context() -> object | None:
 def _missing_model_guidance(config: dict) -> str:
     if bool(config.get("hardware_dummy_mode", False)) or str(config.get("device_type", "")) == "dummy":
         return "请先执行校准，或运行 `oi-mi seed-dummy-decoders` 生成 dummy 测试权重。"
-    return "当前是真实设备模式，请先在“校准”页选择“新被试 (重新训练)”并完成正式校准。"
+    return "当前是真实设备模式，请先在“校准”页完成统一从头校准；无需再选择新被试或老被试。"
 
 
 def render_ar_forwarding_panel(config: dict, *, render_adaptation: bool = True) -> None:
@@ -816,7 +817,6 @@ def render_experiment_return_button(*, disabled: bool = False) -> None:
 
     if st.button("≪", key="calibration_return_from_experiment", disabled=disabled):
         st.session_state.pop("calibration_experiment_view", None)
-        st.session_state.pop("calibration_is_new", None)
         st.session_state.pop("calibration_after_guidance", None)
         st.session_state.pop("calibration_guidance_step", None)
         st.session_state.pop("test_mode_experiment_view", None)
@@ -1009,7 +1009,7 @@ def _sleep_preview_stage(
     console.set_stage_progress(stage_name="", elapsed_sec=total, duration_sec=total)
 
 
-def run_calibration_session(config: dict, protocol: ProtocolConfig, *, is_new_flag: bool) -> None:
+def run_calibration_session(config: dict, protocol: ProtocolConfig) -> None:
     """Run real calibration in the subject-facing experiment view."""
 
     try:
@@ -1021,6 +1021,13 @@ def run_calibration_session(config: dict, protocol: ProtocolConfig, *, is_new_fl
         )
         effective_n_channels = int(acquirer.metadata.n_channels)
         console, refresh = init_live_view(fullscreen=True)
+        experiment_seed = int(
+            config.get("online_adaptation", {}).get("neuroonline", {}).get(
+                "random_seed",
+                config.get("online_adaptation", {}).get("random_seed", 42),
+            )
+        )
+        seed_experiment(experiment_seed)
         model = ModelFactory.get(
             model_name,
             n_chans=effective_n_channels,
@@ -1048,38 +1055,19 @@ def run_calibration_session(config: dict, protocol: ProtocolConfig, *, is_new_fl
             / "calibration",
             protocol_config=protocol,
             online_adaptation_config=config.get("online_adaptation", {}),
+            experiment_config=config,
         )
-
-        if not is_new_flag:
-            load_path = resolve_model_path(
-                config,
-                subject_id,
-                model_name,
-                device_name=str(config["device_type"]),
-                n_chans=effective_n_channels,
-                n_times=int(float(config["sfreq"]) * float(config["window_sec"])),
-            )
-            if not load_path.exists():
-                st.error(
-                    f"未找到模型权重文件: "
-                    f"{build_model_path(config, subject_id, model_name, device_name=str(config['device_type']))}。"
-                    "请先执行校准。"
-                )
-                return
-            if load_path.parent.name == "dummy_decoders":
-                st.info(f"使用内置 dummy 测试权重: `{load_path}`")
-            model.load(load_path)
 
         console.set_stage_progress(stage_name="启动 EEG 采集", elapsed_sec=0.0, duration_sec=10.0)
         refresh()
         with st.spinner("校准进行中..."):
             result = calibrator.calibrate(
                 duration_sec=None,
-                epochs=int(config["new_subject_epochs"] if is_new_flag else config["old_subject_epochs"]),
+                epochs=int(config.get("calibration_epochs", 50)),
                 batch_size=int(config["batch_size"]),
                 learning_rate=float(config["learning_rate"]),
                 patience=int(config["early_stopping_patience"]),
-                head_only=not is_new_flag,
+                head_only=False,
                 include_practice=False,
                 heartbeat=refresh,
             )
@@ -1258,41 +1246,33 @@ def render_settings(config: dict) -> None:
         protocol_col6.number_input(
             "block 间休息 (秒)",
             min_value=0.0,
-            value=float(protocol_cfg.get("rest_between_blocks_sec", 35.0)),
+            value=float(protocol_cfg.get("rest_between_blocks_sec", 20.0)),
             step=5.0,
         )
     )
     subject_col1, subject_col2, subject_col3 = st.columns(3)
-    new_subject_blocks = int(
+    calibration_blocks = int(
         subject_col1.number_input(
-            "新被试 block 数",
+            "校准 block 数",
             min_value=1,
-            value=int(protocol_cfg.get("new_subject_blocks", 6)),
+            value=int(protocol_cfg.get("calibration_blocks", 4)),
             step=1,
         )
     )
-    new_subject_trials_per_class_per_block = int(
+    calibration_trials_per_class_per_block = int(
         subject_col2.number_input(
-            "新被试每类每 block trial 数",
+            "每类每 block trial 数",
             min_value=1,
-            value=int(protocol_cfg.get("new_subject_trials_per_class_per_block", 8)),
+            value=int(protocol_cfg.get("calibration_trials_per_class_per_block", 5)),
             step=1,
         )
     )
-    old_subject_trials_per_class = int(
+    calibration_epochs = int(
         subject_col3.number_input(
-            "老被试每类 trial 数",
+            "离线训练最大 epoch",
             min_value=1,
-            value=int(protocol_cfg.get("old_subject_trials_per_class", 8)),
+            value=int(config.get("calibration_epochs", 50)),
             step=1,
-        )
-    )
-    old_subject_baseline_sec = float(
-        st.number_input(
-            "老被试 baseline idle 时长 (秒)",
-            min_value=1.0,
-            value=float(protocol_cfg.get("old_subject_baseline_sec", 60.0)),
-            step=5.0,
         )
     )
 
@@ -1323,6 +1303,7 @@ def render_settings(config: dict) -> None:
             {
                 "subject_id": subject_id,
                 "model_name": model_name,
+                "calibration_epochs": calibration_epochs,
                 "device_type": device_type,
                 "window_sec": window_sec,
                 "step_sec": step_sec,
@@ -1337,10 +1318,10 @@ def render_settings(config: dict) -> None:
                     "control_sec": control_sec,
                     "iti_sec": iti_sec,
                 },
-                "new_subject_blocks": new_subject_blocks,
-                "new_subject_trials_per_class_per_block": new_subject_trials_per_class_per_block,
-                "old_subject_baseline_sec": old_subject_baseline_sec,
-                "old_subject_trials_per_class": old_subject_trials_per_class,
+                "calibration_blocks": calibration_blocks,
+                "calibration_trials_per_class_per_block": (
+                    calibration_trials_per_class_per_block
+                ),
                 "rest_between_blocks_sec": rest_between_blocks_sec,
             }
         )
@@ -1444,7 +1425,6 @@ def render_calibration(config: dict) -> None:
             run_calibration_session(
                 config,
                 protocol,
-                is_new_flag=bool(st.session_state.pop("calibration_is_new", True)),
             )
             st.session_state.pop("calibration_experiment_view", None)
         return
@@ -1458,7 +1438,20 @@ def render_calibration(config: dict) -> None:
         f"{protocol.trial_timing.iti_sec:.1f}s iti。"
     )
 
-    is_new = st.radio("被试类型", ["新被试 (重新训练)", "老被试 (已有模型微调)"])
+    formal_trials = (
+        protocol.calibration_blocks
+        * protocol.calibration_trials_per_class_per_block
+        * 3
+    )
+    collection_seconds = (
+        sum(segment.duration_sec for segment in protocol.baseline_segments)
+        + formal_trials * protocol.trial_timing.total_sec
+        + max(protocol.calibration_blocks - 1, 0) * protocol.rest_between_blocks_sec
+    )
+    st.info(
+        f"当前为统一从头校准：{formal_trials} 个正式 trial，"
+        f"预计正式采集 {collection_seconds / 60.0:.1f} 分钟。"
+    )
 
     tutorial_col, practice_col, run_col = st.columns([1, 1, 1])
     tutorial_requested = tutorial_col.button("教程", type="secondary", use_container_width=True)
@@ -1476,7 +1469,6 @@ def render_calibration(config: dict) -> None:
         st.rerun()
 
     if run_requested:
-        st.session_state.calibration_is_new = is_new.startswith("新")
         st.session_state.calibration_experiment_view = "run"
         st.rerun()
 
@@ -1552,6 +1544,9 @@ def run_test_mode_session(config: dict, *, duration: int) -> None:
                 confidence_threshold=float(config["confidence_threshold"]),
                 mc_dropout_passes=int(config["mc_dropout_passes"]),
                 status_callback=_update_ar_decoder_status,
+                experiment_config=config,
+                model_name=model_name,
+                model_source_path=model_path,
             )
 
             block_sec = float(config.get("test_mode", {}).get("block_sec", config.get("collect_block_sec", 10.0)))
@@ -1602,7 +1597,7 @@ def _render_online_adaptation_notice(adaptation_cfg: dict) -> None:
     if bool(simulation_cfg.get("enabled", False)):
         source_text = "标签驱动 Dummy"
     elif bool(cued_cfg.get("enabled", True)):
-        source_text = "连续自动 Cue"
+        source_text = "连续统一场景"
     else:
         source_text = "HTTP 真值标签"
     if str(adaptation_cfg.get("strategy", "periodic_head")).lower() == "neuroonline":
@@ -1683,7 +1678,10 @@ def _build_online_label_source(
 
     cued_cfg = adaptation_cfg.get("cued_labels", {})
     if bool(cued_cfg.get("enabled", True)):
-        st.info("在线适配使用自动平衡 Cue，并仅接收完整落在 control 有效区间内的窗口。")
+        st.info(
+            "在线适配使用与 Unity 障碍布局统一的连续场景真值；小车始终接受模型控制，"
+            "仅跨越场景切换边界的 EEG 窗口不进入训练和准确率。"
+        )
         return build_cued_online_label_source(config), None
 
     source = ManualOnlineLabelSource(default_ttl_sec=2.0)
@@ -1707,6 +1705,13 @@ def render_realtime(config: dict) -> None:
         source_status = None
         if isinstance(online_label_source, CuedOnlineLabelSource):
             source_status = online_label_source.status()
+            decoder_status = _get_ar_forward_status()
+            runtime_label_status = decoder_status.get("online_label_source")
+            if isinstance(runtime_label_status, dict):
+                source_status.update(runtime_label_status)
+            timing_alignment = decoder_status.get("timing_alignment")
+            if isinstance(timing_alignment, dict):
+                source_status["timing_alignment"] = timing_alignment
         with cue_panel.container():
             render_online_cue_panel(source_status, ui=st)
 
@@ -1727,9 +1732,36 @@ def render_realtime(config: dict) -> None:
         "保存实时脑波数据至本地记录",
         value=bool(config.get("storage", {}).get("record_realtime_default", False)),
     )
+    storage_cfg = config.setdefault("storage", {})
+    native_recording_id = st.text_input(
+        "博瑞康原始 BDF/NDF 文件名或采集会话编号",
+        value=str(storage_cfg.get("native_recording_id", "") or ""),
+        help="用于把本次oi-mi记录与博瑞康原始连续脑电及Trigger文件一一对应。",
+    ).strip()
+    storage_cfg["native_recording_id"] = native_recording_id
     _render_online_adaptation_notice(adaptation_cfg)
 
     if st.button("开始实时解码", type="primary"):
+        if (
+            bool(adaptation_cfg.get("enabled", False))
+            and str(adaptation_cfg.get("strategy", "")).strip().lower()
+            == "neuroonline"
+            and not record
+        ):
+            st.error("NeuroOnline正式实验必须开启实时记录，请勾选“保存实时脑波数据至本地记录”。")
+            return
+        if (
+            bool(adaptation_cfg.get("enabled", False))
+            and str(adaptation_cfg.get("strategy", "")).strip().lower()
+            == "neuroonline"
+            and not (
+                bool(config.get("hardware_dummy_mode", False))
+                or str(config.get("device_type", "")).strip().lower() == "dummy"
+            )
+            and not native_recording_id
+        ):
+            st.error("正式实验必须填写对应的博瑞康原始 BDF/NDF 文件名或采集会话编号。")
+            return
         try:
             subject_id = str(config["subject_id"])
             model_name = str(config["model_name"])
@@ -1807,6 +1839,9 @@ def render_realtime(config: dict) -> None:
                 model_save_path=primary_model_path,
                 batch_update_config=adaptation_cfg,
                 n_classes=int(config["n_classes"]),
+                experiment_config=config,
+                model_name=model_name,
+                model_source_path=model_path,
             )
 
             try:
@@ -1976,6 +2011,10 @@ def main() -> None:
     if not config:
         return
 
+    # Streamlit runs in a child process when launched through ``cli.py gui``.
+    # Starting the endpoint here keeps manual commands and realtime decoder
+    # commands on the same shared Unity transport.
+    start_web_command_server(config)
     _inject_gui_nav_styles()
     st.session_state.setdefault("gui_nav_mode", SIDEBAR_NAV_PAGES[0])
 

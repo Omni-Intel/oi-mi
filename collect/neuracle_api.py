@@ -419,7 +419,7 @@ class DataServerThread:
     Users only need to call this class.
     """
 
-    def __init__(self, sample_rate: int = 1000, t_buffer: float = 60):
+    def __init__(self, sample_rate: int = 250, t_buffer: float = 60):
         """
         Initialize.
         :param sample_rate: Sampling rate
@@ -451,8 +451,16 @@ class DataServerThread:
         self.max_single_packet = 20
         # Total number of received packets
         self.packet_count = 0
+        self.packet_loss_count = 0
         # Timestamps of received packets, separated by data and trigger
         self.timeStamp = {'data': [], 'trigger': []}
+        # Keep buffer contents and their device-clock endpoint in one atomic
+        # snapshot.  Higher layers use this to align EEG samples with the
+        # local monotonic clock instead of assuming that the newest sample was
+        # generated at the instant GetBufferData() happens to return.
+        self.dataTimingLock = Lock()
+        self.latestDataTiming = None
+        self.totalSamplesReceived = 0
         # # For real-time output of triggers in per-module forwarding, for comparison with JellyFish
         # self.trigger_count = 0
 
@@ -791,8 +799,11 @@ class DataServerThread:
                 tempBuf = self.ResampleTrigger(tempBuf)
                 tempBuf = np.array(tempBuf)
                 if self.state == ConnectState.RUNNING:
-                    # Append data to RingBuffer
-                    self.buffer.appendBuffer(tempBuf)
+                    # Append data and its source timestamp atomically.
+                    self._append_buffer_with_timing(
+                        tempBuf,
+                        start_timestamp_ms=dataStruct['startTimeStamp'],
+                    )
                     # Also append to DoubleBuffer for verification
                     self.save_buffer.appendBuffer(tempBuf)
                     # Timestamp
@@ -851,6 +862,7 @@ class DataServerThread:
             self.firstTimestamp = dataStruct["startTimeStamp"]
         # Verify packet loss via timestamps
         if self.lastTimestamp > 0 and self.lastTimestamp != dataStruct["startTimeStamp"]:
+            self.packet_loss_count += 1
             raise RuntimeError(
                 "Maybe a packet loss happened. Expected startTimestamp "
                 f"is {self.lastTimestamp} but received "
@@ -899,7 +911,10 @@ class DataServerThread:
         temp_buffer = np.array(temp_buffer)
         # Send the assembled packet into the buffer
         if self.state == ConnectState.RUNNING:
-            self.buffer.appendBuffer(temp_buffer)
+            self._append_buffer_with_timing(
+                temp_buffer,
+                start_timestamp_ms=self.single_module_data_buffer[0]['startTimeStamp'],
+            )
             # Also send to save_buffer for correctness verification
             self.save_buffer.appendBuffer(temp_buffer)
         # Clear cached data packets
@@ -972,6 +987,42 @@ class DataServerThread:
         """
         return self.buffer.getData()
 
+    def GetBufferDataWithTiming(self):
+        """Return one ring-buffer snapshot and timing for its newest sample.
+
+        Device timestamps are expressed in JellyFish milliseconds.  The
+        endpoint is exclusive, matching Python slice semantics.
+        """
+
+        with self.dataTimingLock:
+            data = self.buffer.getData()
+            timing = None if self.latestDataTiming is None else dict(self.latestDataTiming)
+        return data, timing
+
+    def GetBufferUpdateWithTiming(self):
+        """Return newly appended samples and the same atomic timing snapshot."""
+
+        with self.dataTimingLock:
+            data = self.buffer.getUpdate()
+            timing = None if self.latestDataTiming is None else dict(self.latestDataTiming)
+        return data, timing
+
+    def _append_buffer_with_timing(self, data, *, start_timestamp_ms):
+        """Append a source packet while preserving its sample-clock endpoint."""
+
+        sample_count = int(data.shape[1])
+        duration_ms = (sample_count * 1000.0) / float(self.sample_rate)
+        with self.dataTimingLock:
+            self.buffer.appendBuffer(data)
+            self.totalSamplesReceived += sample_count
+            self.latestDataTiming = {
+                "device_start_ms": float(start_timestamp_ms),
+                "device_end_ms": float(start_timestamp_ms) + duration_ms,
+                "arrival_monotonic": time.monotonic(),
+                "total_samples": int(self.totalSamplesReceived),
+                "sample_rate": float(self.sample_rate),
+            }
+
     def getSaveDataBuffer(self):
         temBuf = self.save_buffer.getData()
         return temBuf
@@ -1028,7 +1079,7 @@ class DataServerThread:
 #################################################################################
 if __name__ == "__main__":
     # sample_rate must match the JellyFish device sampling rate
-    w4_data = DataServerThread(sample_rate=1000, t_buffer=60)
+    w4_data = DataServerThread(sample_rate=250, t_buffer=60)
 
     # Connect to JellyFish data forwarding
     notconnect = w4_data.connect()

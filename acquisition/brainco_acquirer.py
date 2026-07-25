@@ -22,6 +22,7 @@ from acquisition.base import (
     ElectrodeImpedance,
     classify_impedance_kohm,
 )
+from utils.preprocessing import resample_eeg
 
 LOGGER = logging.getLogger(__name__)
 _BRAINCO_MDNS_SERVICE = "_brainco-eeg._tcp.local."
@@ -53,9 +54,10 @@ class BrainCoAcquirer(AbstractAcquirer):
 
     def __init__(
         self,
-        sfreq: float = 250.0,
+        sfreq: float = 200.0,
         n_channels: int = 32,
         buffer_sec: float = 60.0,
+        source_sfreq: float = 250.0,
         brainco_addr: str = "",
         brainco_port: int = 0,
         auto_discover: bool = True,
@@ -68,16 +70,25 @@ class BrainCoAcquirer(AbstractAcquirer):
     ) -> None:
         if n_channels <= 0 or n_channels > 32:
             raise ValueError("BrainCo EEG Cap supports 1-32 EEG channels.")
-        if int(sfreq) not in _SAMPLE_RATE_TO_ENUM:
+        source_rate = int(round(float(source_sfreq)))
+        if (
+            not np.isclose(float(source_sfreq), float(source_rate))
+            or source_rate not in _SAMPLE_RATE_TO_ENUM
+        ):
             allowed = ", ".join(str(v) for v in sorted(_SAMPLE_RATE_TO_ENUM))
-            raise ValueError(f"Unsupported BrainCo sample rate {sfreq}. Allowed: {allowed}")
+            raise ValueError(
+                f"Unsupported BrainCo hardware sample rate {source_sfreq}. Allowed: {allowed}"
+            )
+        if float(sfreq) <= 0:
+            raise ValueError("BrainCo target sample rate must be positive.")
         if eeg_gain not in _GAIN_TO_ENUM:
             allowed = ", ".join(str(v) for v in sorted(_GAIN_TO_ENUM))
             raise ValueError(f"Unsupported BrainCo gain {eeg_gain}. Allowed: {allowed}")
 
         self.metadata = AcquirerMetadata(name="brainco", sfreq=float(sfreq), n_channels=n_channels)
+        self.source_sfreq = float(source_rate)
         self._buffer_sec = float(buffer_sec)
-        self._drain_samples_per_read = max(int(round(self.metadata.sfreq * 0.25)), 1)
+        self._drain_samples_per_read = max(int(round(self.source_sfreq * 0.25)), 1)
         self._brainco_addr = brainco_addr.strip()
         self._brainco_port = int(brainco_port)
         self._auto_discover = bool(auto_discover)
@@ -123,11 +134,11 @@ class BrainCoAcquirer(AbstractAcquirer):
 
             try:
                 addr, port = self._connect_control_session()
-                buffer_len = max(int(self.metadata.sfreq * min(self._buffer_sec, 60.0)), 1024)
-                sdk.set_cfg(buffer_len, max(256, int(self.metadata.sfreq)), 256)
+                buffer_len = max(int(self.source_sfreq * min(self._buffer_sec, 60.0)), 1024)
+                sdk.set_cfg(buffer_len, max(256, int(self.source_sfreq)), 256)
                 config_msg_id = self._run_sdk_call(
                     self._client.set_eeg_config,
-                    getattr(sdk.EegSampleRate, _SAMPLE_RATE_TO_ENUM[int(self.metadata.sfreq)]),
+                    getattr(sdk.EegSampleRate, _SAMPLE_RATE_TO_ENUM[int(self.source_sfreq)]),
                     getattr(sdk.EegSignalGain, _GAIN_TO_ENUM[self._eeg_gain]),
                     getattr(sdk.EegSignalSource, self._signal_source),
                 )
@@ -158,9 +169,10 @@ class BrainCoAcquirer(AbstractAcquirer):
                 raise last_error
 
         LOGGER.info(
-            "BrainCo acquisition started at %s:%s sfreq=%.1fHz channels=%s",
+            "BrainCo acquisition started at %s:%s hardware=%.1fHz output=%.1fHz channels=%s",
             addr,
             port,
+            self.source_sfreq,
             self.metadata.sfreq,
             self.metadata.n_channels,
         )
@@ -210,8 +222,9 @@ class BrainCoAcquirer(AbstractAcquirer):
         if self._client is None or self._sdk is None:
             raise RuntimeError("BrainCo stream is not started")
 
-        required = int(window_sec * self.metadata.sfreq)
-        if required <= 0:
+        required_source = int(round(window_sec * self.source_sfreq))
+        required_target = int(round(window_sec * self.metadata.sfreq))
+        if required_source <= 0 or required_target <= 0:
             raise RuntimeError("window_sec must yield at least one sample")
 
         deadline = time.monotonic() + max(window_sec, 0.1) + self._ready_timeout_sec
@@ -220,18 +233,35 @@ class BrainCoAcquirer(AbstractAcquirer):
         # calls can return the exact same trailing window forever.
         while time.monotonic() < deadline:
             self._drain_eeg_buffer()
-            if self._cache_sample_count() >= required and self._total_samples_seen > self._last_chunk_total_samples:
+            if (
+                self._cache_sample_count() >= required_source
+                and self._total_samples_seen > self._last_chunk_total_samples
+            ):
                 break
             time.sleep(0.05)
         available = self._cache_sample_count()
-        if available < required:
-            raise RuntimeError(f"Not enough BrainCo samples yet: have {available}, need {required}")
+        if available < required_source:
+            raise RuntimeError(
+                f"Not enough BrainCo source samples yet: have {available}, need {required_source}"
+            )
         if self._total_samples_seen <= self._last_chunk_total_samples:
             raise RuntimeError("BrainCo stream produced no new samples for realtime chunking.")
         with self._cache_lock:
-            eeg = np.asarray(self._eeg_cache[: self.metadata.n_channels, -required:], dtype=np.float32)
+            raw_eeg = np.asarray(
+                self._eeg_cache[: self.metadata.n_channels, -required_source:],
+                dtype=np.float32,
+            )
+        eeg = resample_eeg(
+            raw_eeg,
+            source_sfreq=self.source_sfreq,
+            target_sfreq=self.metadata.sfreq,
+        )
+        if eeg.shape[1] != required_target:
+            raise RuntimeError(
+                f"Resampled BrainCo window has {eeg.shape[1]} points; expected {required_target}."
+            )
         self._last_chunk_total_samples = self._total_samples_seen
-        timestamps = np.arange(required, dtype=np.float64) / self.metadata.sfreq
+        timestamps = np.arange(required_target, dtype=np.float64) / self.metadata.sfreq
         return eeg, timestamps
 
     def get_new_samples(self) -> EEGChunk:
@@ -243,7 +273,11 @@ class BrainCoAcquirer(AbstractAcquirer):
                 np.empty((self.metadata.n_channels, 0), dtype=np.float32),
                 np.empty((0,), dtype=np.float64),
             )
-        timestamps = np.arange(data.shape[1], dtype=np.float64) / self.metadata.sfreq
+        # Preserve the original 250 Hz stream for continuous calibration
+        # recording. Calibration resamples each complete trial window to the
+        # 200 Hz model rate before preprocessing, avoiding chunk-boundary
+        # artifacts from independently resampling short incremental reads.
+        timestamps = np.arange(data.shape[1], dtype=np.float64) / self.source_sfreq
         return data, timestamps
 
     def supports_impedance_check(self) -> bool:
@@ -751,7 +785,7 @@ class BrainCoAcquirer(AbstractAcquirer):
     def _append_eeg_samples(self, data: np.ndarray, *, from_callback: bool) -> None:
         if data.shape[1] == 0:
             return
-        max_samples = max(int(self.metadata.sfreq * self._buffer_sec), data.shape[1], 1)
+        max_samples = max(int(self.source_sfreq * self._buffer_sec), data.shape[1], 1)
         with self._cache_lock:
             self._eeg_cache = np.concatenate([self._eeg_cache, data], axis=1)
             if self._eeg_cache.shape[1] > max_samples:

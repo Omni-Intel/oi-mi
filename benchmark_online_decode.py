@@ -79,7 +79,7 @@ def evaluate_predictions(y_true: np.ndarray, probabilities: np.ndarray, *, thres
 @click.option("--calibration", "calibration_path", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
 @click.option("--test-chunk", "test_chunk_path", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
 @click.option("--model", "model_name", type=str, default="eegnet", show_default=True)
-@click.option("--sfreq", type=float, default=250.0, show_default=True)
+@click.option("--sfreq", type=float, default=200.0, show_default=True)
 @click.option("--threshold", type=float, default=0.5, show_default=True)
 @click.option("--epochs", type=int, default=35, show_default=True)
 @click.option("--batch-size", type=int, default=32, show_default=True)

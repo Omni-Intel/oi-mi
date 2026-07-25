@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from utils.stream_writer import StreamWriter
+from tools.verify_experiment_bundle import verify_bundle
 
 
 class StreamWriterTelemetryTests(unittest.TestCase):
@@ -24,6 +25,10 @@ class StreamWriterTelemetryTests(unittest.TestCase):
                 raw_pred=1,
                 model_revision=2,
                 label_event_id="cue-000001",
+                quality_accepted=False,
+                quality_peak_abs_uv=420.0,
+                quality_clip_fraction=0.02,
+                quality_bad_channel_fraction=0.25,
             )
             writer.stop()
             writer.update_manifest({"online_adaptation": {"update_count": 2}})
@@ -32,8 +37,82 @@ class StreamWriterTelemetryTests(unittest.TestCase):
                 self.assertEqual(payload["predictions_raw"].tolist(), [1])
                 self.assertEqual(payload["model_revisions"].tolist(), [2])
                 self.assertEqual(payload["label_event_ids"].tolist(), ["cue-000001"])
+                self.assertEqual(payload["quality_accepted"].tolist(), [False])
+                self.assertEqual(payload["quality_peak_abs_uv"].tolist(), [420.0])
             manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["online_adaptation"]["update_count"], 2)
+            self.assertEqual(manifest["quality_rejected_windows"], 1)
+            self.assertEqual(manifest["quality_accepted_windows"], 0)
+
+    def test_final_manifest_contains_recomputable_scientific_metrics_and_checksums(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            writer = StreamWriter(root, chunk_size=3)
+            writer.start({"mode": "realtime", "n_classes": 3})
+            for index, (truth, raw, operational) in enumerate(
+                [(0, 0, 0), (1, 1, -1), (2, 1, 1)]
+            ):
+                writer.append_event(
+                    "scene_start",
+                    timestamp_monotonic=10.0 + (index * 5.0),
+                    scene_index=index,
+                    label_id=truth,
+                )
+                probabilities = np.full(3, 0.05, dtype=np.float32)
+                probabilities[raw] = 0.9
+                writer.put(
+                    np.full((2, 8), index, dtype=np.float32),
+                    y_true=truth,
+                    y_pred=operational,
+                    raw_pred=raw,
+                    confidence=float(probabilities[raw]),
+                    probabilities=probabilities,
+                    uncertainty=0.1,
+                    model_revision=index,
+                    label_event_id=f"scene-{index:06d}",
+                    window_start_monotonic=10.5 + (index * 5.0),
+                    window_end_monotonic=12.5 + (index * 5.0),
+                    scene_index=index,
+                    scene_label=truth,
+                    mapped_command="STOP" if operational < 0 else str(operational),
+                    quality_reasons=(),
+                    quality_bad_channel_indices=(),
+                )
+                writer.append_event(
+                    "scene_end",
+                    timestamp_monotonic=15.0 + (index * 5.0),
+                    scene_index=index,
+                    outcome="failed" if index == 2 else "success",
+                )
+            writer.stop()
+            writer.finalize_manifest()
+
+            with np.load(root / "chunks" / "chunk_000000.npz") as payload:
+                self.assertEqual(payload["probabilities"].shape, (3, 3))
+                self.assertEqual(payload["scene_indices"].tolist(), [0, 1, 2])
+                self.assertTrue(np.all(np.isfinite(payload["window_start_monotonic"])))
+                self.assertEqual(payload["mapped_commands"].tolist(), ["0", "STOP", "1"])
+
+            manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+            metrics = manifest["scientific_metrics"]
+            self.assertAlmostEqual(metrics["raw_window"]["accuracy"], 2.0 / 3.0)
+            self.assertAlmostEqual(
+                metrics["raw_window"]["balanced_accuracy"],
+                2.0 / 3.0,
+            )
+            self.assertAlmostEqual(
+                metrics["operational_window"]["coverage"],
+                2.0 / 3.0,
+            )
+            self.assertEqual(metrics["car_task"]["completed_scenes"], 3)
+            self.assertAlmostEqual(metrics["car_task"]["success_rate"], 2.0 / 3.0)
+            self.assertEqual(manifest["integrity"]["status"], "complete")
+            checksum_paths = {
+                item["path"] for item in manifest["integrity"]["checksums"]
+            }
+            self.assertIn("events.jsonl", checksum_paths)
+            self.assertIn("chunks/chunk_000000.npz", checksum_paths)
+            self.assertTrue(verify_bundle(root)["ok"])
 
 
 if __name__ == "__main__":

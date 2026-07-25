@@ -9,7 +9,7 @@ _CUE_SYMBOLS = {"left": "←", "right": "→", "idle": "○"}
 
 
 def render_online_cue_panel(status: dict[str, Any] | None, *, ui: Any) -> None:
-    """Render the automatic experiment cue source."""
+    """Render the continuous car-scene source of truth."""
 
     if not isinstance(status, dict) or status.get("source") != "cued-protocol":
         return
@@ -18,35 +18,38 @@ def render_online_cue_panel(status: dict[str, Any] | None, *, ui: Any) -> None:
     remaining = float(status.get("phase_remaining_sec", 0.0))
     phase_text = {
         "preparing": "准备",
-        "fixation": "注视",
-        "cue": "提示",
         "control": "运动想象 / 小车控制",
-        "iti": "间隔休息",
-        "done": "实验完成",
     }.get(phase, phase)
-    if phase in {"cue", "control"}:
+    if phase == "control":
         prompt = f"{_CUE_SYMBOLS.get(label_name, '○')}  {label_name.upper()}"
-    elif phase == "fixation":
-        prompt = "+"
-    elif phase == "done":
-        prompt = "✓"
     else:
         prompt = "·"
-    ui.markdown("### 连续自动 Cue")
-    columns = ui.columns(4)
+    ui.markdown("### 连续统一场景")
+    columns = ui.columns(6)
     columns[0].metric("阶段", phase_text)
-    if bool(status.get("continuous", False)):
-        trial_label = "累计 Trial"
-        trial_text: str | int = int(status.get("trial_number", 0))
-    else:
-        trial_label = "Trial"
-        trial_text = f"{int(status.get('trial_number', 0))}/{int(status.get('total_trials', 0))}"
-    columns[1].metric(
-        trial_label,
-        trial_text,
+    columns[1].metric("累计 Scene", int(status.get("scene_number", 0)))
+    columns[2].metric("空路", label_name.upper())
+    columns[3].metric("Unity 同步", "已同步" if status.get("scene_synced") else "等待")
+    columns[4].metric("场景剩余", f"{remaining:.1f}s")
+    columns[5].metric("本Scene结果", "已失败" if status.get("scene_failed") else "进行中")
+    sync_error = status.get("scene_sync_error")
+    if sync_error:
+        ui.error(f"Unity 场景同步失败：{sync_error}")
+    timing = status.get("timing_alignment")
+    if isinstance(timing, dict) and timing:
+        jitter_ms = float(timing.get("queueing_jitter_sec", 0.0)) * 1000.0
+        compensation_ms = (
+            float(timing.get("transport_delay_compensation_sec", 0.0)) * 1000.0
+        )
+        ui.caption(
+            "脑电源时钟已对齐："
+            f"当前排队抖动 {jitter_ms:.1f} ms，"
+            f"固定延迟补偿 {compensation_ms:.1f} ms。"
+        )
+    ui.caption(
+        "模型始终持续控制；只有完整位于 Unity ACK 场景边界保护区内的 EEG 窗口"
+        "参与训练和准确率。"
     )
-    columns[2].metric("目标", label_name.upper())
-    columns[3].metric("剩余", f"{remaining:.1f}s")
     ui.markdown(f"<div style='text-align:center;font-size:5rem'>{prompt}</div>", unsafe_allow_html=True)
 
 
@@ -89,13 +92,19 @@ def _render_periodic_head(adaptation: dict[str, Any], *, ui: Any) -> None:
 def _render_neuroonline(adaptation: dict[str, Any], *, ui: Any) -> None:
     ui.markdown("### NeuroOnline 在线适配")
     prequential = adaptation.get("prequential", {}) or {}
+    operational = adaptation.get("operational_prequential", {}) or {}
     last_result = adaptation.get("last_result") or {}
-    top = ui.columns(5)
+    top = ui.columns(7)
     top[0].metric("状态", str(adaptation.get("state", "-")))
     top[1].metric("更新次数", int(adaptation.get("update_count", 0)))
     top[2].metric("缓冲窗口", int(adaptation.get("buffered_windows", 0)))
-    top[3].metric("在线 Bal.Acc.", f"{float(prequential.get('balanced_accuracy', 0.0)):.3f}")
-    top[4].metric("最近更新耗时", f"{float(last_result.get('duration_sec', 0.0)):.2f}s")
+    top[3].metric("原始 Acc.", f"{float(prequential.get('accuracy', 0.0)):.3f}")
+    top[4].metric("原始 Bal.Acc.", f"{float(prequential.get('balanced_accuracy', 0.0)):.3f}")
+    top[5].metric("控制覆盖率", f"{float(operational.get('coverage', 0.0)):.3f}")
+    top[6].metric("选择性 Acc.", f"{float(operational.get('selective_accuracy', 0.0)):.3f}")
+    ui.caption(f"最近更新耗时 {float(last_result.get('duration_sec', 0.0)):.2f}s")
+    if not bool(prequential.get("all_classes_observed", False)):
+        ui.info("三类尚未全部出现；固定三类 Bal.Acc. 将未出现类别的召回率按 0 计。")
 
     progress = float(adaptation.get("progress", 0.0))
     ui.progress(min(max(progress, 0.0), 1.0))
