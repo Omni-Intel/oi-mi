@@ -6,6 +6,7 @@ import logging
 import pickle
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import torch
@@ -92,6 +93,7 @@ class BaseModelAdapter(ABC):
         patience: int,
         head_only: bool = False,
         groups: np.ndarray | None = None,
+        progress_callback: Callable[[int, int, dict[str, float]], None] | None = None,
     ) -> dict[str, float]:
         """Train the model and return summary metrics."""
 
@@ -142,6 +144,7 @@ class TorchModelAdapter(BaseModelAdapter):
         patience: int,
         head_only: bool = False,
         groups: np.ndarray | None = None,
+        progress_callback: Callable[[int, int, dict[str, float]], None] | None = None,
     ) -> dict[str, float]:
         self._configure_trainable_layers(head_only=head_only)
         train_indices, validation_indices = split_train_validation_indices(
@@ -197,6 +200,16 @@ class TorchModelAdapter(BaseModelAdapter):
                 val_loss,
                 val_acc,
             )
+            if progress_callback is not None:
+                progress_callback(
+                    epoch + 1,
+                    epochs,
+                    {
+                        "train_loss": train_loss / max(len(loader), 1),
+                        "val_loss": val_loss,
+                        "val_acc": val_acc,
+                    },
+                )
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_val_acc = val_acc
@@ -323,6 +336,7 @@ class RiemannMDMAdapter(BaseModelAdapter):
         patience: int,
         head_only: bool = False,
         groups: np.ndarray | None = None,
+        progress_callback: Callable[[int, int, dict[str, float]], None] | None = None,
     ) -> dict[str, float]:
         del epochs, batch_size, learning_rate, patience, head_only, groups
         covs = self._covariances.fit_transform(X)
@@ -337,6 +351,8 @@ class RiemannMDMAdapter(BaseModelAdapter):
         self._classifier.fit(covs, y)
         predictions = self._classifier.predict(covs)
         accuracy = float(np.mean(predictions == y))
+        if progress_callback is not None:
+            progress_callback(1, 1, {"val_loss": 0.0, "val_acc": accuracy})
         return {"val_loss": 0.0, "val_acc": accuracy}
 
     def predict_proba(self, X: np.ndarray, mc_dropout_passes: int = 1) -> np.ndarray:

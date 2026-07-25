@@ -4,6 +4,7 @@ The default profile follows the parts of CBraMod's motor-imagery
 preprocessing that are compatible with a sliding-window decoder:
 
 * microvolt input
+* per-channel robust DC removal
 * common-average reference
 * 0.3--40 Hz band-pass
 * 200 Hz model rate (resampling is performed by the acquirer)
@@ -32,6 +33,7 @@ LOGGER = logging.getLogger(__name__)
 class PreprocessingConfig:
     """Parameters for the experiment's deterministic EEG transform."""
 
+    dc_removal: str = "per_channel_median"
     low_hz: float = 0.3
     high_hz: float = 40.0
     filter_order: int = 5
@@ -185,6 +187,14 @@ def _sanitize_and_repair_channels(
         )
         sanitized[channel_index, ~channel_finite] = replacement
 
+    # Neuracle/JellyFish may forward physically meaningful EEG in microvolts
+    # while retaining a large, channel-specific electrode DC offset.  Applying
+    # a zero-phase high-pass directly to an isolated two-second window turns
+    # that offset into a large boundary transient.  Robustly center each channel
+    # before CAR/filtering.  This removes one constant per window; unlike
+    # z-scoring it does not normalize or suppress MI amplitude information.
+    if config.dc_removal != "per_channel_median":
+        raise ValueError(f"Unsupported EEG DC-removal method: {config.dc_removal}")
     centered = sanitized - np.median(sanitized, axis=-1, keepdims=True)
     channel_std = np.std(centered, axis=-1)
     channel_scale = 1.4826 * np.median(np.abs(centered), axis=-1)
@@ -205,11 +215,11 @@ def _sanitize_and_repair_channels(
         # Montage coordinates are not available from the realtime forwarding
         # API.  The point-wise median of good channels is robust and preserves
         # shape/channel order without inventing a spatial neighbourhood.
-        spatial_replacement = np.median(sanitized[good_mask], axis=0)
-        sanitized[bad_mask] = spatial_replacement
+        spatial_replacement = np.median(centered[good_mask], axis=0)
+        centered[bad_mask] = spatial_replacement
 
     bad_indices = tuple(int(index) for index in np.flatnonzero(bad_mask))
-    return sanitized, bad_indices, nonfinite_fraction
+    return centered, bad_indices, nonfinite_fraction
 
 
 def preprocess_eeg_window(

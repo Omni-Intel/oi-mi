@@ -261,6 +261,7 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         patience: int,
         head_only: bool = False,
         groups: np.ndarray | None = None,
+        progress_callback: Callable[[int, int, dict[str, float]], None] | None = None,
     ) -> dict[str, float]:
         del epochs, batch_size, learning_rate, patience, head_only
         from sklearn.metrics import cohen_kappa_score
@@ -316,6 +317,16 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
                 kappa = -1.0
             accuracy = float(np.mean(predictions == truth))
             epochs_completed = epoch_index + 1
+            if progress_callback is not None:
+                progress_callback(
+                    epochs_completed,
+                    self.config.offline_epochs,
+                    {
+                        **metrics,
+                        "val_acc": accuracy,
+                        "val_kappa": kappa,
+                    },
+                )
             if kappa > best_kappa + 1e-6:
                 best_kappa = kappa
                 best_accuracy = accuracy

@@ -1009,9 +1009,11 @@ def _sleep_preview_stage(
     console.set_stage_progress(stage_name="", elapsed_sec=total, duration_sec=total)
 
 
-def run_calibration_session(config: dict, protocol: ProtocolConfig) -> None:
+def run_calibration_session(config: dict, protocol: ProtocolConfig) -> dict[str, object]:
     """Run real calibration in the subject-facing experiment view."""
 
+    console: StreamlitConsole | None = None
+    refresh = None
     try:
         subject_id = str(config["subject_id"])
         model_name = str(config["model_name"])
@@ -1073,15 +1075,23 @@ def run_calibration_session(config: dict, protocol: ProtocolConfig) -> None:
             )
 
         refresh()
-        st.success("校准完成。")
-        st.write(f"- 采集窗口数: **{result.windows_collected}**")
-        st.write(f"- 模型保存位置: `{result.model_path}`")
-        if result.calibration_data_path is not None:
-            st.write(f"- 校准数据保存位置: `{result.calibration_data_path}`")
-        if result.session_dir is not None:
-            st.write(f"- session 保存位置: `{result.session_dir}`")
+        return {
+            "ok": True,
+            "windows_collected": int(result.windows_collected),
+            "model_path": str(result.model_path),
+            "calibration_data_path": (
+                str(result.calibration_data_path)
+                if result.calibration_data_path is not None
+                else None
+            ),
+            "session_dir": str(result.session_dir) if result.session_dir is not None else None,
+            "metrics": dict(result.metrics),
+        }
     except Exception as exc:  # noqa: BLE001
-        st.error(f"执行失败: {exc}")
+        if console is not None and refresh is not None:
+            console.print(f"[bold red]执行失败: {exc}[/bold red]")
+            refresh()
+        return {"ok": False, "error": str(exc)}
 
 
 def _format_impedance_value(impedance_kohm: float | None) -> str:
@@ -1422,14 +1432,36 @@ def render_calibration(config: dict) -> None:
             st.session_state.gui_nav_mode = "校准"
             st.rerun()
         elif calibration_view == "run":
-            run_calibration_session(
+            outcome = run_calibration_session(
                 config,
                 protocol,
             )
+            st.session_state.calibration_last_outcome = outcome
             st.session_state.pop("calibration_experiment_view", None)
+            st.session_state.gui_nav_mode = "校准"
+            st.rerun()
         return
 
     st.title("被试校准")
+    calibration_outcome = st.session_state.get("calibration_last_outcome")
+    if isinstance(calibration_outcome, dict):
+        if bool(calibration_outcome.get("ok", False)):
+            st.success("校准完成，模型与 CRM 已保存。")
+            st.write(f"- 采集窗口数: **{int(calibration_outcome.get('windows_collected', 0))}**")
+            st.write(f"- 模型保存位置: `{calibration_outcome.get('model_path', '-')}`")
+            if calibration_outcome.get("calibration_data_path"):
+                st.write(f"- 校准数据保存位置: `{calibration_outcome['calibration_data_path']}`")
+            if calibration_outcome.get("session_dir"):
+                st.write(f"- session 保存位置: `{calibration_outcome['session_dir']}`")
+            metrics = calibration_outcome.get("metrics")
+            if isinstance(metrics, dict):
+                st.write(f"- 训练指标: `{metrics}`")
+        else:
+            st.error(
+                "本次校准未生成模型："
+                f"{calibration_outcome.get('error', '未知错误')}。"
+                "原始 session 会保留，可在修复后离线恢复。"
+            )
     st.markdown("开始采集后，页面会显示提示与日志。")
     st.caption(
         f"主训练窗 {protocol.window_sec:.1f}s / 刷新 {protocol.stride_sec:.1f}s。"
@@ -1469,6 +1501,7 @@ def render_calibration(config: dict) -> None:
         st.rerun()
 
     if run_requested:
+        st.session_state.pop("calibration_last_outcome", None)
         st.session_state.calibration_experiment_view = "run"
         st.rerun()
 

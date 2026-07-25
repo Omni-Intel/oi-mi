@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import numpy as np
@@ -12,7 +14,7 @@ from acquisition.brainco_acquirer import BrainCoAcquirer
 from acquisition.neuracle_acquirer import NeuracleAcquirer
 from adaptation.session_recorder import SessionRecorder
 from decoder.real_time_decoder import RealTimeDecoder
-from tools.reprocess_calibration import build_windows
+from tools.reprocess_calibration import build_windows, promote_corrected_datasets
 from utils.preprocessing import (
     DEFAULT_PREPROCESSING,
     bandpass_filter,
@@ -57,6 +59,23 @@ class PreprocessingTests(unittest.TestCase):
         self.assertIn(3, result.quality.bad_channel_indices)
         self.assertFalse(np.allclose(result.data[3], 500.0))
         self.assertTrue(np.all(np.isfinite(result.data)))
+
+    def test_large_neuracle_dc_offsets_do_not_create_filter_edge_artifacts(self) -> None:
+        sfreq = 200.0
+        time = np.arange(400, dtype=np.float64) / sfreq
+        offsets = np.asarray(
+            [-16_000.0, -13_600.0, -12_400.0, 11_500.0],
+            dtype=np.float64,
+        )[:, None]
+        phases = np.asarray([0.0, 0.4, 0.8, 1.2], dtype=np.float64)[:, None]
+        eeg = offsets + 10.0 * np.sin(2.0 * np.pi * 10.0 * time[None, :] + phases)
+
+        result = preprocess_eeg_window(eeg, sfreq=sfreq)
+
+        self.assertTrue(result.quality.accepted)
+        self.assertEqual(result.quality.reasons, ())
+        self.assertLess(result.quality.peak_abs_uv, 50.0)
+        self.assertEqual(result.quality.clip_fraction, 0.0)
 
     def test_artifact_is_reported_instead_of_silently_called_rejected(self) -> None:
         sfreq = 200.0
@@ -164,6 +183,32 @@ class PreprocessingTests(unittest.TestCase):
         np.testing.assert_array_equal(payload["trial_ids"], np.repeat([0, 1], 5))
         np.testing.assert_array_equal(payload["labels"], np.repeat([0, 1], 5))
         np.testing.assert_array_equal(payload["window_indices"], np.tile(np.arange(5), 2))
+
+    def test_reprocessed_dataset_is_promoted_atomically_with_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = root / "training_windows_main.npz"
+            corrected = root / "training_windows_main_corrected.npz"
+            np.savez_compressed(
+                original,
+                processed_windows=np.empty((0, 2, 400), dtype=np.float32),
+                labels=np.empty((0,), dtype=np.int64),
+            )
+            np.savez_compressed(
+                corrected,
+                processed_windows=np.ones((3, 2, 400), dtype=np.float32),
+                labels=np.asarray([0, 1, 2], dtype=np.int64),
+            )
+
+            promoted = promote_corrected_datasets([corrected])
+
+            self.assertEqual(promoted, [original])
+            with np.load(original) as payload:
+                self.assertEqual(payload["processed_windows"].shape[0], 3)
+            backup = root / "training_windows_main.pre_reprocess.npz"
+            self.assertTrue(backup.exists())
+            with np.load(backup) as payload:
+                self.assertEqual(payload["processed_windows"].shape[0], 0)
 
     def test_neuracle_window_is_resampled_before_decode(self) -> None:
         class FakeServer:

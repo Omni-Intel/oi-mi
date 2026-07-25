@@ -144,6 +144,33 @@ class Calibrator:
             )
         if heartbeat is not None:
             heartbeat()
+        training_progress = getattr(self._console, "set_stage_progress", None)
+        if callable(training_progress):
+            training_progress(
+                stage_name="模型训练",
+                elapsed_sec=0.0,
+                duration_sec=float(
+                    self._neuroonline_config.offline_epochs
+                    if self._neuroonline_config.enabled
+                    else epochs
+                ),
+            )
+
+        def report_training_progress(
+            current_epoch: int,
+            total_epochs: int,
+            epoch_metrics: dict[str, float],
+        ) -> None:
+            del epoch_metrics
+            if callable(training_progress):
+                training_progress(
+                    stage_name=f"模型训练 epoch {current_epoch}/{total_epochs}",
+                    elapsed_sec=float(current_epoch),
+                    duration_sec=float(total_epochs),
+                )
+            if heartbeat is not None:
+                heartbeat()
+
         metrics = self._model.fit(
             processed_windows,
             labels,
@@ -153,6 +180,7 @@ class Calibrator:
             patience=patience,
             head_only=False,
             groups=trial_groups,
+            progress_callback=report_training_progress,
         )
         self._model_path.parent.mkdir(parents=True, exist_ok=True)
         self._model.save(self._model_path)

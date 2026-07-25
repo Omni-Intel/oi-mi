@@ -1478,6 +1478,21 @@ def train_from_records(
     if load_path is not None:
         model.load(load_path)
 
+    def report_training_progress(
+        current_epoch: int,
+        total_epochs: int,
+        epoch_metrics: dict[str, float],
+    ) -> None:
+        summary = " ".join(
+            f"{name}={float(value):.4f}"
+            for name, value in epoch_metrics.items()
+            if name in {"loss", "train_loss", "val_loss", "val_acc", "val_kappa"}
+        )
+        app.console.print(
+            f"[cyan]训练 epoch {current_epoch}/{total_epochs}[/cyan]"
+            + (f" {summary}" if summary else "")
+        )
+
     metrics = model.fit(
         X,
         y,
@@ -1487,9 +1502,27 @@ def train_from_records(
         patience=int(config["early_stopping_patience"]),
         head_only=head_only,
         groups=trial_groups,
+        progress_callback=report_training_progress,
     )
     model_path.parent.mkdir(parents=True, exist_ok=True)
     model.save(model_path)
+    metrics_path = model_path.with_suffix(".metrics.yaml")
+    temporary_metrics_path = metrics_path.with_suffix(metrics_path.suffix + ".tmp")
+    metrics_payload = {
+        "model_path": str(model_path),
+        "subject_id": subject_id,
+        "device_name": selected_device,
+        "model_name": selected_model,
+        "windows_collected": int(X.shape[0]),
+        "sessions": [path.name for path in used_sessions],
+        "training_source": "saved_calibration_records",
+        "metrics": {key: float(value) for key, value in metrics.items()},
+    }
+    with temporary_metrics_path.open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(metrics_payload, handle, allow_unicode=True, sort_keys=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary_metrics_path, metrics_path)
 
     label_ids, label_counts = np.unique(y, return_counts=True)
     distribution = ", ".join(f"{int(label)}:{int(count)}" for label, count in zip(label_ids, label_counts, strict=False))
@@ -1499,6 +1532,7 @@ def train_from_records(
     )
     if neuroonline_config.enabled:
         app.console.print(f"[bold green]CRM 已保存[/bold green] {model_path}.neuroonline.pt")
+    app.console.print(f"[bold green]训练指标已保存[/bold green] {metrics_path}")
 
 
 @cli.command("replay-test-mode")

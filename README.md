@@ -250,7 +250,7 @@ python download_datasets.py --dataset BNCI2014_001 --subject 1 --data-dir ./data
 
 Neuracle/JellyFish 原始数据以 `250 Hz` 转发。校准连续数据保留 250 Hz 源时间轴，切出完整源窗口后做带抗混叠滤波的 `250→200 Hz` 降采样；实时解码同样先取得 500 点的 2 秒源窗口，再降为模型使用的 400 点。后续预处理、模型输入和 NeuroOnline 更新统一使用 `200 Hz`。实时窗口不再把 `get_chunk()` 返回时刻当作脑电终点，而是利用 JellyFish 数据包的源时间戳，将样本时间映射到 Python 的单调时钟后再与 Unity Scene 对齐。`device.neuracle_transport_delay_sec` 用于补偿经 Trigger/回环实验测得的固定采集链路延迟；未测量前保持 `0.0`，系统仍会利用源时间戳消除排队和轮询抖动。
 
-模型输入预处理参考 CBraMod 的运动想象数据管线，统一采用微伏输入、坏导稳健修复、Common Average Reference、`0.3-40 Hz` 五阶 Butterworth SOS 零相位滤波和 `[-150, 150] uV` 数值保护。校准、离线重建和实时解码调用同一个实现；预处理不会做逐窗 z-score，避免抹掉运动想象的绝对幅值变化。非有限值、坏导比例过高、峰值超过 `300 uV` 或超幅占比超过 1% 的窗口不会进入校准训练或 NeuroOnline 更新，但实时控制仍会产生预测，并在记录文件中保存质量标志。
+模型输入预处理参考 CBraMod 的运动想象数据管线，统一采用微伏输入、逐通道中位数去直流、坏导稳健修复、Common Average Reference、`0.3-40 Hz` 五阶 Butterworth SOS 零相位滤波和 `[-150, 150] uV` 数值保护。逐通道去直流用于避免 Neuracle 电极基线偏置在短窗高通时形成边界瞬态；它只减去一个常数，不做逐窗 z-score，也不会归一化运动想象的幅值变化。校准、离线重建和实时解码调用同一个实现。非有限值、坏导比例过高、峰值超过 `300 uV` 或超幅占比超过 1% 的窗口不会进入校准训练或 NeuroOnline 更新，但实时控制仍会产生预测，并在记录文件中保存质量标志。
 
 200 Hz、2秒窗口对应模型输入长度为400点。旧的250 Hz/500点模型权重和 CRM sidecar
 不能继续使用；切换采样率后必须重新完成正式校准。
@@ -337,6 +337,30 @@ oi-mi train-from-records --subject S001 --model eegnet
 oi-mi train-from-records --subject S001 --model eegnet \
   --session 20260413_224710
 ```
+
+如果旧 session 因短窗直流边界瞬态生成了空的 `training_windows_main.npz`，可从原始连续 EEG 安全重切窗。下面的操作先生成并验证 `*_corrected.npz`，再原子提升为正式训练集；原空文件保留为 `*.pre_reprocess.npz`：
+
+```powershell
+$latest = Get-ChildItem .\records_storage\S001\calibration -Directory |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+
+.\.venv\Scripts\python.exe tools\reprocess_calibration.py `
+    $latest.FullName `
+    $latest.FullName `
+    --source-sfreq 250 `
+    --target-sfreq 200 `
+    --eeg-channel-count 59 `
+    --promote-main
+
+.\.venv\Scripts\python.exe cli.py train-from-records `
+    --subject S001 `
+    --model shallowconvnet `
+    --device neuracle `
+    --session $latest.Name
+```
+
+恢复训练必须明确输出 `训练完成`、`CRM 已保存` 和 `训练指标已保存`，并确认主模型、CRM sidecar 与 metrics 文件的修改时间均为本次运行时间。
 
 用 test_mode 保存的窗口做离线回放评估：
 

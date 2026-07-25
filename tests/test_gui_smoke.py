@@ -39,6 +39,9 @@ class GuiSmokeTests(unittest.TestCase):
 
         self.assertIn('render_experiment_return_button(disabled=is_running)', source)
         self.assertIn('is_running = calibration_view == "run"', source)
+        self.assertIn("st.session_state.calibration_last_outcome = outcome", source)
+        self.assertIn('st.session_state.gui_nav_mode = "校准"', source)
+        self.assertIn("st.rerun()", source)
 
 
 if __name__ == "__main__":

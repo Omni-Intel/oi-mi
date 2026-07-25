@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +72,8 @@ def build_windows(
     clip_fractions: list[float] = []
     peak_abs_uv: list[float] = []
     bad_channel_fractions: list[float] = []
+    bad_channel_indices: list[str] = []
+    rejection_reason_counts: dict[str, int] = {}
     rejected_windows = 0
     selected_channels = (
         np.arange(continuous_eeg.shape[0], dtype=np.int64)
@@ -107,12 +111,22 @@ def build_windows(
             result = preprocess_eeg_window(target_window, sfreq=target_sfreq)
             if not result.quality.accepted:
                 rejected_windows += 1
+                for reason in result.quality.reasons:
+                    rejection_reason_counts[reason] = (
+                        rejection_reason_counts.get(reason, 0) + 1
+                    )
                 continue
 
             raw_windows.append(target_window)
             clip_fractions.append(result.quality.clip_fraction)
             peak_abs_uv.append(result.quality.peak_abs_uv)
             bad_channel_fractions.append(result.quality.bad_channel_fraction)
+            bad_channel_indices.append(
+                json.dumps(
+                    list(result.quality.bad_channel_indices),
+                    separators=(",", ":"),
+                )
+            )
             processed_windows.append(result.data)
             labels.append(int(trial["label_id"]))
             trial_ids.append(trial_id)
@@ -141,7 +155,21 @@ def build_windows(
             bad_channel_fractions,
             dtype=np.float32,
         ),
+        "quality_bad_channel_indices": np.asarray(
+            bad_channel_indices,
+            dtype=np.str_,
+        ),
         "quality_rejected_windows": np.asarray([rejected_windows], dtype=np.int64),
+        "quality_rejection_reason_counts": np.asarray(
+            [
+                json.dumps(
+                    rejection_reason_counts,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            ],
+            dtype=np.str_,
+        ),
         "selected_channels": selected_channels,
         "source_sfreq": np.asarray([source_sfreq], dtype=np.float32),
         "sfreq": np.asarray([target_sfreq], dtype=np.float32),
@@ -152,7 +180,45 @@ def build_windows(
 
 def _save_dataset(path: Path, payload: dict[str, np.ndarray]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(path, **payload)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("wb") as handle:
+        np.savez_compressed(handle, **payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def promote_corrected_datasets(paths: list[Path]) -> list[Path]:
+    """Atomically promote verified corrected datasets while retaining originals."""
+
+    promoted: list[Path] = []
+    for corrected_path in paths:
+        if not corrected_path.name.endswith("_corrected.npz"):
+            raise ValueError(f"Not a corrected calibration dataset: {corrected_path}")
+        with np.load(corrected_path) as payload:
+            if "processed_windows" not in payload or "labels" not in payload:
+                raise ValueError(f"Corrected dataset is missing required arrays: {corrected_path}")
+            window_count = int(payload["processed_windows"].shape[0])
+            label_count = int(payload["labels"].shape[0])
+        if window_count <= 0 or label_count != window_count:
+            raise ValueError(
+                f"Refusing to promote unusable corrected dataset {corrected_path}: "
+                f"windows={window_count}, labels={label_count}."
+            )
+
+        canonical_name = corrected_path.name.replace("_corrected.npz", ".npz")
+        canonical_path = corrected_path.with_name(canonical_name)
+        backup_path = canonical_path.with_name(
+            f"{canonical_path.stem}.pre_reprocess{canonical_path.suffix}"
+        )
+        if canonical_path.exists() and not backup_path.exists():
+            shutil.copy2(canonical_path, backup_path)
+
+        temporary = canonical_path.with_suffix(canonical_path.suffix + ".promote.tmp")
+        shutil.copy2(corrected_path, temporary)
+        os.replace(temporary, canonical_path)
+        promoted.append(canonical_path)
+    return promoted
 
 
 def reprocess_session(
@@ -211,6 +277,7 @@ def reprocess_session(
         "source_sfreq": source_sfreq,
         "target_sfreq": target_sfreq,
         "resampling": "scipy.signal.resample_poly",
+        "dc_removal": DEFAULT_PREPROCESSING.dc_removal,
         "bandpass_hz": [
             DEFAULT_PREPROCESSING.low_hz,
             DEFAULT_PREPROCESSING.high_hz,
@@ -252,6 +319,14 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         help="Keep only the leading EEG channels; excludes trailing ECG/EOG auxiliaries.",
     )
+    parser.add_argument(
+        "--promote-main",
+        action="store_true",
+        help=(
+            "After validation, atomically promote *_corrected.npz for training and "
+            "retain each previous dataset as *.pre_reprocess.npz."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -265,7 +340,14 @@ def main() -> None:
         eeg_channel_count=args.eeg_channel_count,
     )
     for path in written:
-        print(path)
+        with np.load(path) as payload:
+            print(
+                f"corrected={path} windows={int(payload['processed_windows'].shape[0])} "
+                f"rejected={int(payload['quality_rejected_windows'][0])}"
+            )
+    if args.promote_main:
+        for path in promote_corrected_datasets(written):
+            print(f"promoted={path}")
 
 
 if __name__ == "__main__":

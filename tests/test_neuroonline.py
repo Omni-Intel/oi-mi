@@ -230,7 +230,9 @@ class NeuroOnlineTests(unittest.TestCase):
             model_path = root / "models" / "S001" / "neuracle" / "shallowconvnet.pt"
             self.assertTrue(model_path.exists())
             self.assertTrue(Path(f"{model_path}.neuroonline.pt").exists())
+            self.assertTrue(model_path.with_suffix(".metrics.yaml").exists())
             self.assertIn("CRM 已保存", result.output)
+            self.assertIn("训练指标已保存", result.output)
 
     def test_stream_updates_at_threshold_then_stride(self) -> None:
         calls: list[int] = []
