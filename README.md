@@ -25,6 +25,24 @@ winget install --id Python.Python.3.12 --exact --source winget --scope user
 unity相关/ARPrototype3D-windows-x64/ARPrototype3D.exe
 ```
 
+### 采集电脑强制更新（解决 `config.yaml` 冲突）
+
+不需要删除或重装 `.venv`。先停止当前实验并关闭 GUI，然后在采集电脑的项目目录执行：
+
+```powershell
+cd D:\oi-mi
+Copy-Item .\config.yaml .\config.local.backup.yaml -Force
+git fetch origin
+git reset --hard origin/main
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe tools\check_environment.py
+.\.venv\Scripts\python.exe cli.py gui
+```
+
+`git reset --hard origin/main` 会丢弃采集电脑上所有尚未提交的项目代码和已跟踪配置修改，包括产生冲突的 `config.yaml`；不会删除被 `.gitignore` 排除的 `.venv`、`models_storage` 和 `records_storage`。备份文件 `config.local.backup.yaml` 仅用于找回被试编号、设备地址等现场参数，不要把旧配置整份覆盖回来；正式 Neuracle 配置必须保留 `sfreq: 200` 和 `device.neuracle_source_sfreq: 250`。
+
+如果采集电脑的仓库不在 `D:\oi-mi`，只需要把第一行 `cd` 改成实际项目路径。
+
 现场电脑只运行这个打包结果，不调用其他 Unity 源码仓库，也不需要安装 Unity Editor。运行包必须包含 `oi-mi-runtime.json`；启动前会校验协议版本、必要功能和关键文件 SHA-256，旧版或混装的 Unity 会直接报错，不会继续产生不可信标签。
 
 点击网页左侧的“实时解码”或启动 dummy 测试时，如果 Unity 没有打开，程序会自动以窗口模式启动这个 exe，并等待 `127.0.0.1:5005` 可连接后再继续；随后直接进入小车场景。Windows 实验包会自动启用唯一支持的 Fixed Speed 控制模式，不依赖加载完成时刻不确定的菜单选择命令。实时解码运行期间关闭 Unity 窗口会让小车 TCP 连接断开，网页端实时解码也会停止。
