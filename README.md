@@ -19,7 +19,7 @@ winget install --id Python.Python.3.12 --exact --source winget --scope user
 
 安装完成后关闭并重新打开终端，再运行上面的命令。不要在 PowerShell/CMD 中运行 `source`；也不要直接运行全局的 `streamlit run gui.py`，否则容易调用到缺少 `yaml`、PyTorch 等依赖的系统 Python。直接使用 `.venv\Scripts\python.exe` 不需要激活虚拟环境。
 
-`setup_local.py` 会创建 `.venv`、安装项目及 PyYAML 等全部依赖、下载经过协议校验的 Unity Windows build，并把运行包安装到本地忽略目录：
+仓库已经包含经过协议校验的 Unity Windows 运行包。`setup_local.py` 会创建 `.venv`、安装项目及 PyYAML 等全部依赖，并校验随仓库提供的运行包；正常情况下不会再次下载：
 
 ```text
 unity相关/ARPrototype3D-windows-x64/ARPrototype3D.exe
@@ -39,11 +39,11 @@ git reset --hard origin/main
 .\.venv\Scripts\python.exe cli.py gui
 ```
 
-`git reset --hard origin/main` 会丢弃采集电脑上所有尚未提交的项目代码和已跟踪配置修改，包括产生冲突的 `config.yaml`；不会删除被 `.gitignore` 排除的 `.venv`、`models_storage` 和 `records_storage`。备份文件 `config.local.backup.yaml` 仅用于找回被试编号、设备地址等现场参数，不要把旧配置整份覆盖回来；正式 Neuracle 配置必须保留 `sfreq: 200` 和 `device.neuracle_source_sfreq: 250`。
+`git reset --hard origin/main` 会丢弃采集电脑上所有尚未提交的项目代码和已跟踪配置修改，包括产生冲突的 `config.yaml`，并把 Unity 运行包同步到仓库中的正式版本；不会删除被 `.gitignore` 排除的 `.venv`、`models_storage` 和 `records_storage`。备份文件 `config.local.backup.yaml` 仅用于找回被试编号、设备地址等现场参数，不要把旧配置整份覆盖回来；正式 Neuracle 配置必须保留 `sfreq: 200` 和 `device.neuracle_source_sfreq: 250`。
 
 如果采集电脑的仓库不在 `D:\oi-mi`，只需要把第一行 `cd` 改成实际项目路径。
 
-现场电脑只运行这个打包结果，不调用其他 Unity 源码仓库，也不需要安装 Unity Editor。运行包必须包含 `oi-mi-runtime.json`；启动前会校验协议版本、必要功能和关键文件 SHA-256，旧版或混装的 Unity 会直接报错，不会继续产生不可信标签。
+现场电脑只运行仓库内的这个打包结果，不调用其他 Unity 源码仓库，也不需要安装 Unity Editor。运行包必须包含 `oi-mi-runtime.json`；启动前会校验协议版本、必要功能和关键文件 SHA-256，旧版或混装的 Unity 会直接报错，不会继续产生不可信标签。`tools/download_unity_build.py --force` 仅作为运行包损坏时的备用恢复方式，日常更新直接同步 Git 仓库即可。
 
 点击网页左侧的“实时解码”或启动 dummy 测试时，如果 Unity 没有打开，程序会自动以窗口模式启动这个 exe，并等待 `127.0.0.1:5005` 可连接后再继续；随后直接进入小车场景。Windows 实验包会自动启用唯一支持的 Fixed Speed 控制模式，不依赖加载完成时刻不确定的菜单选择命令。实时解码运行期间关闭 Unity 窗口会让小车 TCP 连接断开，网页端实时解码也会停止。
 
