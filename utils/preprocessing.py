@@ -86,23 +86,39 @@ def resample_eeg(
     target_sfreq: float,
     axis: int = -1,
 ) -> np.ndarray:
-    """Anti-alias and resample EEG while preserving every non-time dimension."""
+    """Remove source-window DC, then anti-alias and resample EEG."""
 
     source = float(source_sfreq)
     target = float(target_sfreq)
     if source <= 0 or target <= 0:
         raise ValueError("Sampling frequencies must be positive.")
+    array = np.asarray(data, dtype=np.float32)
     if np.isclose(source, target):
-        return np.asarray(data, dtype=np.float32).copy()
+        return array.copy()
 
+    # Polyphase FIR resampling pads an isolated input window.  A large
+    # electrode DC offset (observed at roughly +/-16,000 uV on Neuracle) would
+    # otherwise ring at both boundaries before preprocess_eeg_window gets a
+    # chance to remove it.
+    centered = remove_channel_dc(array, axis=axis)
     ratio = Fraction(target / source).limit_denominator(10_000)
     resampled = resample_poly(
-        np.asarray(data, dtype=np.float32),
+        centered,
         up=ratio.numerator,
         down=ratio.denominator,
         axis=axis,
     )
     return np.asarray(resampled, dtype=np.float32)
+
+
+def remove_channel_dc(data: np.ndarray, *, axis: int = -1) -> np.ndarray:
+    """Subtract the per-channel median without normalizing signal amplitude."""
+
+    array = np.asarray(data, dtype=np.float64)
+    return np.asarray(
+        array - np.median(array, axis=axis, keepdims=True),
+        dtype=np.float32,
+    )
 
 
 def common_average_reference(data: np.ndarray) -> np.ndarray:
@@ -195,7 +211,7 @@ def _sanitize_and_repair_channels(
     # z-scoring it does not normalize or suppress MI amplitude information.
     if config.dc_removal != "per_channel_median":
         raise ValueError(f"Unsupported EEG DC-removal method: {config.dc_removal}")
-    centered = sanitized - np.median(sanitized, axis=-1, keepdims=True)
+    centered = remove_channel_dc(sanitized)
     channel_std = np.std(centered, axis=-1)
     channel_scale = 1.4826 * np.median(np.abs(centered), axis=-1)
     usable_scale = channel_scale[channel_scale >= config.flat_std_uv]

@@ -130,6 +130,26 @@ class PreprocessingTests(unittest.TestCase):
             0.01,
         )
 
+    def test_resample_removes_large_dc_before_polyphase_filtering(self) -> None:
+        source_time = np.arange(500, dtype=np.float64) / 250.0
+        source = (
+            -16_000.0 + 10.0 * np.sin(2.0 * np.pi * 10.0 * source_time)
+        )[None, :]
+
+        result = resample_eeg(
+            source,
+            source_sfreq=250.0,
+            target_sfreq=200.0,
+        )
+
+        target_time = np.arange(400, dtype=np.float64) / 200.0
+        expected = 10.0 * np.sin(2.0 * np.pi * 10.0 * target_time)
+        self.assertLess(float(np.max(np.abs(result))), 12.0)
+        self.assertLess(
+            float(np.mean(np.abs(result[:, 10:-10] - expected[None, 10:-10]))),
+            0.05,
+        )
+
     def test_brainco_window_is_resampled_from_250_hz_to_200_hz(self) -> None:
         acquirer = BrainCoAcquirer(
             sfreq=200.0,

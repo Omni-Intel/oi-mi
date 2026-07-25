@@ -137,7 +137,10 @@ def build_windows(
             starts_target.append(int(round(start_source * target_sfreq / source_sfreq)))
 
     if not raw_windows:
-        raise RuntimeError("No windows could be reconstructed from the supplied EEG and trial metadata.")
+        raise RuntimeError(
+            "No windows could be reconstructed from the supplied EEG and trial metadata: "
+            f"rejected={rejected_windows}, reasons={rejection_reason_counts}."
+        )
 
     return {
         "raw_windows": np.stack(raw_windows).astype(np.float32),
