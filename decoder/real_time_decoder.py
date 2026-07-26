@@ -33,7 +33,7 @@ from adaptation.neuroonline import (
 from adaptation.online_batch_adapter import BatchAdaptationConfig, OnlineBatchAdapter
 from models.factory import BaseModelAdapter, TorchModelAdapter
 from utils.markers import LSLCommandOutlet, MarkerBackend
-from utils.online_labels import OnlineLabelSource
+from utils.online_labels import CUED_PROTOCOL_VERSION, OnlineLabelSource
 from utils.preprocessing import DEFAULT_PREPROCESSING, preprocess_eeg_window
 from utils.stream_writer import StreamWriter
 
@@ -161,6 +161,7 @@ class RealTimeDecoder:
                 config=neuroonline_config,
                 state_path=model_save_path,
             )
+            neuroonline_config = self._model.config
             self._neuroonline_adapter = NeuroOnlineStreamAdapter(
                 config=neuroonline_config,
                 update_callback=self._run_neuroonline_update,
@@ -849,8 +850,6 @@ class RealTimeDecoder:
             label_scene_index = int(payload.get("scene_index", -1))
             if label_scene_index != getattr(self, "_scene_sent_scene_index", -1):
                 return None
-            if int(label.label_id) != getattr(self, "_scene_sent_label_id", None):
-                return None
             return label
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("Failed to read online label: %s", exc)
@@ -1206,7 +1205,7 @@ class RealTimeDecoder:
                     label_name=status.get("label_name"),
                     unity_command=command,
                     ack_confirmed=True,
-                    protocol_version="continuous-scene-v3-relative",
+                    protocol_version=CUED_PROTOCOL_VERSION,
                     start_lane=start_lane,
                     safe_lane=safe_lane,
                     applied_label=applied_label_name,
@@ -1245,7 +1244,11 @@ class RealTimeDecoder:
             return
 
         for event in events:
-            if str(event.get("event", "")).strip().upper() != "SCENE_FAILED":
+            event_name = str(event.get("event", "")).strip().upper()
+            if event_name == "LANE_SETTLED":
+                self._handle_lane_settled_event(event)
+                continue
+            if event_name != "SCENE_FAILED":
                 continue
             failed_scene_index = int(event.get("scene_number", 0)) - 1
             if failed_scene_index != self._scene_sent_scene_index:
@@ -1278,8 +1281,74 @@ class RealTimeDecoder:
                     )
                 self._console.print(
                     f"[bold yellow]Scene {failed_scene_index + 1} 避障失败；"
-                    "保持当前标签，到固定 Scene 边界再进入下一 Scene[/bold yellow]"
+                    "保持当前安全车道和动态标签规则，到固定 Scene 边界再进入下一 Scene[/bold yellow]"
                 )
+
+    def _handle_lane_settled_event(self, event: dict[str, Any]) -> None:
+        """Convert Unity's completed lane transition into a new truth segment."""
+
+        if str(event.get("protocol_version", "")).strip() != CUED_PROTOCOL_VERSION:
+            self._abort_scene_protocol(
+                f"invalid LANE_SETTLED protocol version: {event!r}"
+            )
+            return
+        scene_index = int(event.get("scene_number", 0)) - 1
+        if scene_index != self._scene_sent_scene_index:
+            LOGGER.warning(
+                "Ignored stale Unity LANE_SETTLED event scene_number=%s; current=%s",
+                event.get("scene_number"),
+                self._scene_sent_scene_index + 1,
+            )
+            return
+        try:
+            current_lane = int(event["current_lane"])
+            safe_lane = int(event["safe_lane"])
+        except (KeyError, TypeError, ValueError):
+            self._abort_scene_protocol(f"invalid LANE_SETTLED payload: {event!r}")
+            return
+        expected_safe_lane = self._scene_safe_lanes.get(scene_index)
+        if (
+            current_lane not in {-1, 0, 1}
+            or safe_lane not in {-1, 0, 1}
+            or expected_safe_lane != safe_lane
+        ):
+            self._abort_scene_protocol(
+                "Unity LANE_SETTLED event does not match active safe-lane truth: "
+                f"{event!r}"
+            )
+            return
+        update_current_lane = getattr(
+            self._online_label_source,
+            "update_current_lane",
+            None,
+        )
+        transition_time = time.monotonic()
+        if not callable(update_current_lane) or not update_current_lane(
+            scene_index=scene_index,
+            current_lane=current_lane,
+            safe_lane=safe_lane,
+            timestamp_monotonic=transition_time,
+        ):
+            self._abort_scene_protocol(
+                f"Rejected Unity LANE_SETTLED event: {event!r}"
+            )
+            return
+        writer = getattr(self, "_writer", None)
+        if writer is not None:
+            writer.append_event(
+                "lane_settled",
+                timestamp_monotonic=transition_time,
+                scene_index=scene_index,
+                scene_number=scene_index + 1,
+                current_lane=current_lane,
+                safe_lane=safe_lane,
+                dynamic_label_id=(
+                    0 if current_lane > safe_lane
+                    else 1 if current_lane < safe_lane
+                    else 2
+                ),
+                unity_event=dict(event),
+            )
 
     @staticmethod
     def _validate_unity_protocol_ack(
@@ -1292,10 +1361,10 @@ class RealTimeDecoder:
             raise ValueError(f"expected ACK {expected_ack}, received {response!r}")
         if (
             str(response.get("protocol_version", "")).strip()
-            != "continuous-scene-v3-relative"
+            != CUED_PROTOCOL_VERSION
         ):
             raise ValueError(
-                "Unity runtime does not implement continuous-scene-v3-relative"
+                f"Unity runtime does not implement {CUED_PROTOCOL_VERSION}"
             )
         if int(response.get("scene_number", -1)) != int(expected_scene_number):
             raise ValueError(

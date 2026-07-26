@@ -1,9 +1,11 @@
 {
   "schema_version": 1,
-  "build_id": "2026-07-26-relative-action-scene-v3-desktop",
-  "protocol_version": "continuous-scene-v3-relative",
+  "build_id": "2026-07-26-dynamic-label-scene-v4-desktop",
+  "protocol_version": "continuous-scene-v4-dynamic-label",
   "features": [
     "continuous_control",
+    "dynamic_action_truth",
+    "lane_settled_event",
     "lane_state_ack",
     "obstacle_truth",
     "relative_action_truth",
@@ -13,7 +15,7 @@
   "files": {
     "ARPrototype3D.exe": "47c6d9b4b0b26e0dd7ca8bd02a49859a8c338ce8fe8f1fcac00743aecd5d1ce7",
     "UnityPlayer.dll": "aad9b714608ecacad180a94eed703877f5bdc646ca69dc52c60af8914c9c1de4",
-    "ARPrototype3D_Data/Managed/Assembly-CSharp.dll": "3c5a062a476b7200bb81b1892344d940b0102e8effed8c88d211076599d6a279",
-    "ARPrototype3D_Data/Managed/ARPong.Runtime.dll": "e0479175aecc99ef3f0191ff77ab4abc94fb62c0752a022c06302281565c5545"
+    "ARPrototype3D_Data/Managed/Assembly-CSharp.dll": "dc91f7f9808bfed11073105526cd27bb92880fa46eee1627e368afbb41b764fe",
+    "ARPrototype3D_Data/Managed/ARPong.Runtime.dll": "e3797a50fa6006ef01470049b62a4f2f49cef8a5d38c3fea9f6168d6d085c009"
   }
 }

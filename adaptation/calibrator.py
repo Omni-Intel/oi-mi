@@ -22,6 +22,10 @@ import yaml
 from rich.console import Console
 
 from acquisition.base import AbstractAcquirer
+from adaptation.calibration_search import (
+    CalibrationSearchConfig,
+    run_calibration_search,
+)
 from adaptation.mi_protocol import (
     LABEL_DESCRIPTION,
     LABEL_DISPLAY,
@@ -54,6 +58,8 @@ class CalibrationResult:
     windows_collected: int
     calibration_data_path: Path | None = None
     session_dir: Path | None = None
+    hyperparameter_search_path: Path | None = None
+    selected_hyperparameters: dict[str, Any] | None = None
 
 
 class Calibrator:
@@ -77,6 +83,9 @@ class Calibrator:
     ) -> None:
         self._acquirer = acquirer
         self._neuroonline_config = NeuroOnlineConfig.from_mapping(online_adaptation_config)
+        self._calibration_search_config = CalibrationSearchConfig.from_mapping(
+            online_adaptation_config
+        )
         if self._neuroonline_config.enabled:
             if not isinstance(model, TorchModelAdapter):
                 raise ValueError("NeuroOnline calibration requires a PyTorch decoder model.")
@@ -135,6 +144,73 @@ class Calibrator:
             heartbeat=heartbeat,
         )
         self._console.print("[bold cyan]采集完成，正在保存和训练，请等待工作人员[/bold cyan]")
+        search_result = None
+        if self._neuroonline_config.enabled and self._calibration_search_config.enabled:
+            if not isinstance(self._model, NeuroOnlineModelAdapter):
+                raise RuntimeError("NeuroOnline search requires a NeuroOnline model adapter.")
+            self._console.print(
+                "[bold yellow]开始按 trial 分组搜索离线预训练参数。"
+                "搜索集与最终检验集严格按 trial 隔离；采集无需重做。[/bold yellow]"
+            )
+            base_template = self._model.base
+
+            def report_search_progress(
+                candidate_index: int,
+                total_candidates: int,
+                stage: str,
+                candidate_metrics: dict[str, float],
+            ) -> None:
+                del candidate_metrics
+                if callable(training_progress):
+                    training_progress(
+                        stage_name=(
+                            f"参数搜索 {candidate_index}/{total_candidates}: {stage}"
+                        ),
+                        elapsed_sec=float(candidate_index),
+                        duration_sec=float(total_candidates),
+                    )
+                if heartbeat is not None:
+                    heartbeat()
+
+            training_progress = getattr(self._console, "set_stage_progress", None)
+            search_result = run_calibration_search(
+                base_template=base_template,
+                base_config=self._neuroonline_config,
+                search_config=self._calibration_search_config,
+                X=processed_windows,
+                y=labels,
+                groups=trial_groups,
+                session_dir=session_dir,
+                progress_callback=report_search_progress,
+            )
+            self._neuroonline_config = search_result.best_config
+            self._model = NeuroOnlineModelAdapter(
+                copy.deepcopy(base_template),
+                config=self._neuroonline_config,
+                state_path=None,
+            )
+            session_metadata["hyperparameter_search"] = {
+                "report_path": (
+                    str(search_result.report_path)
+                    if search_result.report_path is not None
+                    else None
+                ),
+                "best_parameters": search_result.report["best_parameters"],
+                "untouched_holdout_metrics": search_result.report[
+                    "untouched_holdout_metrics"
+                ],
+            }
+            best = search_result.report["best_parameters"]
+            holdout = search_result.report["untouched_holdout_metrics"]
+            self._console.print(
+                "[bold green]参数搜索完成："
+                f"lr={best['offline_learning_rate']:.1e}, "
+                f"batch={best['offline_batch_size']}, "
+                f"mask={best['mask_ratio']:.2f}, "
+                f"lambda={best['consistency_weight']:.2f}; "
+                f"独立 trial 检验 Bal.Acc.={holdout['balanced_accuracy']:.3f}。"
+                "[/bold green]"
+            )
         if self._neuroonline_config.enabled:
             self._console.print(
                 "[bold yellow]正在执行 NeuroOnline 离线训练 "
@@ -182,6 +258,20 @@ class Calibrator:
             groups=trial_groups,
             progress_callback=report_training_progress,
         )
+        if search_result is not None:
+            holdout = search_result.report["untouched_holdout_metrics"]
+            metrics.update(
+                {
+                    "search_holdout_balanced_accuracy": float(
+                        holdout["balanced_accuracy"]
+                    ),
+                    "search_holdout_kappa": float(holdout["kappa"]),
+                    "search_holdout_macro_f1": float(holdout["macro_f1"]),
+                    "search_holdout_worst_class_accuracy": float(
+                        holdout["worst_class_accuracy"]
+                    ),
+                }
+            )
         self._model_path.parent.mkdir(parents=True, exist_ok=True)
         self._model.save(self._model_path)
         self._save_metadata(metrics=metrics, windows_collected=int(processed_windows.shape[0]), head_only=False)
@@ -196,6 +286,14 @@ class Calibrator:
             windows_collected=int(processed_windows.shape[0]),
             calibration_data_path=(session_dir / "training_windows_main.npz") if session_dir is not None else None,
             session_dir=session_dir,
+            hyperparameter_search_path=(
+                search_result.report_path if search_result is not None else None
+            ),
+            selected_hyperparameters=(
+                dict(search_result.report["best_parameters"])
+                if search_result is not None
+                else None
+            ),
         )
 
     def _collect_training_data(

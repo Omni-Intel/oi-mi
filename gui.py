@@ -149,6 +149,15 @@ def _validate_calibration_outcome(
         neuroonline_path = Path(f"{model_path}.neuroonline.pt")
         if not neuroonline_path.is_file() or neuroonline_path.stat().st_size <= 0:
             missing.append(f"CRM: {neuroonline_path}")
+    search_path_value = str(
+        outcome.get("hyperparameter_search_path", "") or ""
+    ).strip()
+    if search_path_value:
+        search_path = Path(search_path_value).expanduser()
+        if not search_path.is_absolute():
+            search_path = _GUI_ROOT / search_path
+        if not search_path.is_file() or search_path.stat().st_size <= 0:
+            missing.append(f"超参数搜索报告: {search_path}")
     session_dir = Path(str(outcome["session_dir"])).expanduser()
     if not session_dir.is_absolute():
         session_dir = _GUI_ROOT / session_dir
@@ -209,6 +218,7 @@ def _recover_completed_calibration(config: dict) -> dict[str, object] | None:
             continue
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            search_metadata = metadata.get("hyperparameter_search", {}) or {}
             outcome = {
                 "ok": True,
                 "windows_collected": int(metadata["windows_collected"]),
@@ -216,6 +226,8 @@ def _recover_completed_calibration(config: dict) -> dict[str, object] | None:
                 "calibration_data_path": str(session_dir / "training_windows_main.npz"),
                 "session_dir": str(session_dir),
                 "metrics": dict(metadata["metrics"]),
+                "hyperparameter_search_path": search_metadata.get("report_path"),
+                "selected_hyperparameters": search_metadata.get("best_parameters"),
                 "recovered_after_reconnect": True,
             }
             _validate_calibration_outcome(
@@ -1275,6 +1287,12 @@ def run_calibration_session(config: dict, protocol: ProtocolConfig) -> dict[str,
             ),
             "session_dir": str(result.session_dir) if result.session_dir is not None else None,
             "metrics": dict(result.metrics),
+            "hyperparameter_search_path": (
+                str(result.hyperparameter_search_path)
+                if result.hyperparameter_search_path is not None
+                else None
+            ),
+            "selected_hyperparameters": result.selected_hyperparameters,
         }
         _validate_calibration_outcome(
             outcome,
@@ -1676,6 +1694,16 @@ def render_calibration(config: dict) -> None:
                 st.write(f"- 校准数据保存位置: `{calibration_outcome['calibration_data_path']}`")
             if calibration_outcome.get("session_dir"):
                 st.write(f"- session 保存位置: `{calibration_outcome['session_dir']}`")
+            selected_hyperparameters = calibration_outcome.get(
+                "selected_hyperparameters"
+            )
+            if isinstance(selected_hyperparameters, dict):
+                st.write(f"- 搜索选定参数: `{selected_hyperparameters}`")
+            if calibration_outcome.get("hyperparameter_search_path"):
+                st.write(
+                    "- 搜索报告: "
+                    f"`{calibration_outcome['hyperparameter_search_path']}`"
+                )
             metrics = calibration_outcome.get("metrics")
             if isinstance(metrics, dict):
                 st.write(f"- 训练指标: `{metrics}`")

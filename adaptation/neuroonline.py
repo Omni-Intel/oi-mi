@@ -9,9 +9,10 @@ context modulator, and classifier are optimized together.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import logging
 from pathlib import Path
+import random
 import threading
 import time
 from typing import Any, Callable
@@ -147,7 +148,6 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
     ) -> None:
         self.base = base
         self.model_name = base.model_name
-        self.config = config
         self._device = base._device
         self._classifier = _find_classifier(base.model)
         self._modulator: ContextAwareRepresentationModulator | None = None
@@ -155,6 +155,7 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         self._optimizer: torch.optim.Optimizer | None = None
         self._state_path = state_path
         self._pending_state = _load_neuroonline_state(state_path, self._device)
+        self.config = _checkpoint_config(config, self._pending_state)
 
     def _prepare_training(self, example: torch.Tensor) -> ContextAwareRepresentationModulator:
         """Initialize CRM lazily and make the complete NeuroOnline stack trainable."""
@@ -264,13 +265,55 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         progress_callback: Callable[[int, int, dict[str, float]], None] | None = None,
     ) -> dict[str, float]:
         del epochs, batch_size, learning_rate, patience, head_only
-        from sklearn.metrics import cohen_kappa_score
-
         train_indices, validation_indices = split_train_validation_indices(
             y,
             groups=groups,
             random_state=self.config.random_seed,
         )
+        return self.fit_with_split(
+            X,
+            y,
+            train_indices=train_indices,
+            validation_indices=validation_indices,
+            groups=groups,
+            progress_callback=progress_callback,
+        )
+
+    def fit_with_split(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        *,
+        train_indices: np.ndarray,
+        validation_indices: np.ndarray,
+        groups: np.ndarray | None = None,
+        progress_callback: Callable[[int, int, dict[str, float]], None] | None = None,
+    ) -> dict[str, float]:
+        """Fit with an explicit split so every search candidate sees identical trials."""
+
+        from sklearn.metrics import (
+            balanced_accuracy_score,
+            cohen_kappa_score,
+            confusion_matrix,
+            f1_score,
+            log_loss,
+        )
+
+        train_indices = np.asarray(train_indices, dtype=np.int64)
+        validation_indices = np.asarray(validation_indices, dtype=np.int64)
+        if train_indices.size == 0 or validation_indices.size == 0:
+            raise ValueError("NeuroOnline training and validation splits must both be non-empty.")
+        if np.intersect1d(train_indices, validation_indices).size:
+            raise ValueError("NeuroOnline training and validation indices overlap.")
+        trial_groups = None if groups is None else np.asarray(groups, dtype=np.int64)
+        if trial_groups is not None and trial_groups.shape != np.asarray(y).shape:
+            raise ValueError("NeuroOnline trial groups must match the labels shape.")
+
+        random.seed(self.config.random_seed)
+        np.random.seed(self.config.random_seed)
+        torch.manual_seed(self.config.random_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.config.random_seed)
         generator = torch.Generator().manual_seed(self.config.random_seed)
         all_inputs = torch.as_tensor(X, dtype=torch.float32)
         time_views = _time_mask(all_inputs, self.config.mask_ratio, generator)
@@ -294,8 +337,16 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
             eta_min=1e-6,
         )
         criterion = nn.CrossEntropyLoss(label_smoothing=self.config.label_smoothing).to(self._device)
+        best_balanced_accuracy = float("-inf")
         best_kappa = float("-inf")
         best_accuracy = 0.0
+        best_macro_f1 = 0.0
+        best_worst_class_accuracy = 0.0
+        best_trial_balanced_accuracy = float("-inf")
+        best_trial_kappa = float("-inf")
+        best_trial_accuracy = 0.0
+        best_trial_macro_f1 = 0.0
+        best_trial_worst_class_accuracy = 0.0
         best_loss = float("inf")
         best_model_state: dict[str, torch.Tensor] | None = None
         best_modulator_state: dict[str, torch.Tensor] | None = None
@@ -316,6 +367,68 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
             if not np.isfinite(kappa):
                 kappa = -1.0
             accuracy = float(np.mean(predictions == truth))
+            validation_loss = float(
+                log_loss(
+                    truth,
+                    probabilities,
+                    labels=np.arange(probabilities.shape[1]),
+                )
+            )
+            balanced_accuracy = float(balanced_accuracy_score(truth, predictions))
+            macro_f1 = float(f1_score(truth, predictions, average="macro", zero_division=0))
+            matrix = confusion_matrix(
+                truth,
+                predictions,
+                labels=np.arange(int(np.max(y)) + 1),
+            )
+            class_totals = matrix.sum(axis=1)
+            class_accuracies = np.divide(
+                np.diag(matrix),
+                class_totals,
+                out=np.zeros_like(class_totals, dtype=np.float64),
+                where=class_totals > 0,
+            )
+            worst_class_accuracy = float(np.min(class_accuracies[class_totals > 0]))
+            if trial_groups is not None:
+                trial_truth, trial_probabilities = _aggregate_trial_probabilities(
+                    truth,
+                    probabilities,
+                    trial_groups[validation_indices],
+                )
+                trial_predictions = trial_probabilities.argmax(axis=1)
+            else:
+                trial_truth = truth
+                trial_predictions = predictions
+            trial_accuracy = float(np.mean(trial_predictions == trial_truth))
+            trial_balanced_accuracy = float(
+                balanced_accuracy_score(trial_truth, trial_predictions)
+            )
+            trial_kappa = float(cohen_kappa_score(trial_truth, trial_predictions))
+            if not np.isfinite(trial_kappa):
+                trial_kappa = -1.0
+            trial_macro_f1 = float(
+                f1_score(
+                    trial_truth,
+                    trial_predictions,
+                    average="macro",
+                    zero_division=0,
+                )
+            )
+            trial_matrix = confusion_matrix(
+                trial_truth,
+                trial_predictions,
+                labels=np.arange(int(np.max(y)) + 1),
+            )
+            trial_totals = trial_matrix.sum(axis=1)
+            trial_class_accuracies = np.divide(
+                np.diag(trial_matrix),
+                trial_totals,
+                out=np.zeros_like(trial_totals, dtype=np.float64),
+                where=trial_totals > 0,
+            )
+            trial_worst_class_accuracy = float(
+                np.min(trial_class_accuracies[trial_totals > 0])
+            )
             epochs_completed = epoch_index + 1
             if progress_callback is not None:
                 progress_callback(
@@ -323,14 +436,45 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
                     self.config.offline_epochs,
                     {
                         **metrics,
+                        "val_loss": validation_loss,
                         "val_acc": accuracy,
+                        "val_balanced_accuracy": balanced_accuracy,
                         "val_kappa": kappa,
+                        "val_macro_f1": macro_f1,
+                        "val_worst_class_accuracy": worst_class_accuracy,
+                        "val_trial_acc": trial_accuracy,
+                        "val_trial_balanced_accuracy": trial_balanced_accuracy,
+                        "val_trial_kappa": trial_kappa,
+                        "val_trial_macro_f1": trial_macro_f1,
+                        "val_trial_worst_class_accuracy": trial_worst_class_accuracy,
                     },
                 )
-            if kappa > best_kappa + 1e-6:
+            score = (
+                trial_balanced_accuracy,
+                trial_kappa,
+                trial_macro_f1,
+                balanced_accuracy,
+                -validation_loss,
+            )
+            best_score = (
+                best_trial_balanced_accuracy,
+                best_trial_kappa,
+                best_trial_macro_f1,
+                best_balanced_accuracy,
+                -best_loss,
+            )
+            if score > best_score:
+                best_balanced_accuracy = balanced_accuracy
                 best_kappa = kappa
                 best_accuracy = accuracy
-                best_loss = metrics["loss"]
+                best_macro_f1 = macro_f1
+                best_worst_class_accuracy = worst_class_accuracy
+                best_trial_balanced_accuracy = trial_balanced_accuracy
+                best_trial_kappa = trial_kappa
+                best_trial_accuracy = trial_accuracy
+                best_trial_macro_f1 = trial_macro_f1
+                best_trial_worst_class_accuracy = trial_worst_class_accuracy
+                best_loss = validation_loss
                 best_model_state = _copy_state_dict(self.base.model)
                 best_modulator_state = _copy_state_dict(modulator)
                 stagnant_epochs = 0
@@ -339,7 +483,7 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
                 if stagnant_epochs >= self.config.offline_patience:
                     LOGGER.info(
                         "NeuroOnline offline calibration stopped after %s epochs "
-                        "(no validation-kappa improvement for %s epochs).",
+                        "(no validation-score improvement for %s epochs).",
                         epochs_completed,
                         self.config.offline_patience,
                     )
@@ -351,7 +495,15 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         return {
             "val_loss": best_loss,
             "val_acc": best_accuracy,
+            "val_balanced_accuracy": best_balanced_accuracy,
             "val_kappa": best_kappa,
+            "val_macro_f1": best_macro_f1,
+            "val_worst_class_accuracy": best_worst_class_accuracy,
+            "val_trial_acc": best_trial_accuracy,
+            "val_trial_balanced_accuracy": best_trial_balanced_accuracy,
+            "val_trial_kappa": best_trial_kappa,
+            "val_trial_macro_f1": best_trial_macro_f1,
+            "val_trial_worst_class_accuracy": best_trial_worst_class_accuracy,
             "epochs_completed": float(epochs_completed),
         }
 
@@ -382,11 +534,7 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         torch.save(
             {
                 "feature_shape": self._feature_shape,
-                "config": {
-                    "prompt_count": self.config.prompt_count,
-                    "mask_ratio": self.config.mask_ratio,
-                    "consistency_weight": self.config.consistency_weight,
-                },
+                "config": asdict(self.config),
                 "modulator": self._modulator.state_dict(),
             },
             sidecar,
@@ -396,6 +544,7 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         self.base.load(path)
         self._state_path = _sidecar_path(path)
         self._pending_state = _load_neuroonline_state(self._state_path, self._device)
+        self.config = _checkpoint_config(self.config, self._pending_state)
 
     def update(
         self,
@@ -984,3 +1133,47 @@ def _load_neuroonline_state(path: Path | None, device: torch.device) -> dict[str
     if not sidecar.exists():
         return None
     return torch.load(sidecar, map_location=device, weights_only=True)
+
+
+def _checkpoint_config(
+    fallback: NeuroOnlineConfig,
+    payload: dict[str, Any] | None,
+) -> NeuroOnlineConfig:
+    """Restore model-coupled settings selected during calibration."""
+
+    saved = (payload or {}).get("config", {}) or {}
+    supported = {
+        field_name: saved[field_name]
+        for field_name in (
+            "mask_ratio",
+            "consistency_weight",
+            "weight_decay",
+            "label_smoothing",
+            "prompt_count",
+        )
+        if field_name in saved
+    }
+    return replace(fallback, **supported) if supported else fallback
+
+
+def _aggregate_trial_probabilities(
+    labels: np.ndarray,
+    probabilities: np.ndarray,
+    groups: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    trial_labels: list[int] = []
+    trial_probabilities: list[np.ndarray] = []
+    for group in np.unique(groups):
+        mask = groups == group
+        unique_labels = np.unique(labels[mask])
+        if unique_labels.size != 1:
+            raise ValueError(
+                f"Validation trial {int(group)} contains multiple labels: "
+                f"{unique_labels.tolist()}."
+            )
+        trial_labels.append(int(unique_labels[0]))
+        trial_probabilities.append(np.mean(probabilities[mask], axis=0))
+    return (
+        np.asarray(trial_labels, dtype=np.int64),
+        np.stack(trial_probabilities, axis=0),
+    )

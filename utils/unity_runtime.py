@@ -20,7 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BUILD_DIR = Path("unity相关") / "ARPrototype3D-windows-x64"
 DEFAULT_EXECUTABLE = DEFAULT_BUILD_DIR / "ARPrototype3D.exe"
 RUNTIME_MANIFEST_FILENAME = "oi-mi-runtime.json"
-REQUIRED_RUNTIME_PROTOCOL = "continuous-scene-v3-relative"
+REQUIRED_RUNTIME_PROTOCOL = "continuous-scene-v4-dynamic-label"
 REQUIRED_RUNTIME_FEATURES = frozenset(
     {
         "continuous_control",
@@ -29,6 +29,8 @@ REQUIRED_RUNTIME_FEATURES = frozenset(
         "scene_failure_event",
         "lane_state_ack",
         "relative_action_truth",
+        "dynamic_action_truth",
+        "lane_settled_event",
     }
 )
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}

@@ -131,6 +131,37 @@ online_adaptation:
     offline_patience: 6
     offline_batch_size: 16
     offline_learning_rate: 1.0e-4
+    calibration_search:
+      enabled: true
+      # Search every learning-rate/batch/mask/lambda combination. All candidates
+      # share one trial-grouped split, while a separate set of complete trials
+      # remains untouched until the winning configuration.
+      mode: full_grid
+      selection_epochs: 50
+      selection_patience: 8
+      learning_rates:
+      - 1.0e-5
+      - 3.0e-5
+      - 1.0e-4
+      - 3.0e-4
+      - 1.0e-3
+      batch_sizes:
+      - 32
+      - 64
+      - 128
+      - 256
+      mask_ratios:
+      - 0.1
+      - 0.3
+      - 0.5
+      - 0.7
+      consistency_weights:
+      - 0.1
+      - 0.3
+      - 0.5
+      - 0.7
+      - 1.0
+      - 1.5
   simulation:
     enabled: false
     trial_sec: 6.0

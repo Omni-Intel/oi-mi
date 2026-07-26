@@ -16,6 +16,7 @@ LOGGER = logging.getLogger(__name__)
 
 LABEL_NAME_TO_ID = {"left": 0, "right": 1, "idle": 2}
 LABEL_ID_TO_NAME = {value: key for key, value in LABEL_NAME_TO_ID.items()}
+CUED_PROTOCOL_VERSION = "continuous-scene-v4-dynamic-label"
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +186,9 @@ class CuedOnlineLabelSource(OnlineLabelSource):
         self._prepared_label_id: int | None = None
         self._prepared_start_lane: int | None = None
         self._confirmed_safe_lane: int | None = None
+        self._current_lane: int | None = None
+        self._label_segments: list[tuple[float, int, int]] = []
+        self._label_transition_count = 0
         self._pending_sequence = list(self._sequence)
         self._applied_label_counts = {label_id: 0 for label_id in LABEL_ID_TO_NAME}
         self._last_transition_reason = "start"
@@ -204,17 +208,43 @@ class CuedOnlineLabelSource(OnlineLabelSource):
         )
         if float(window_start) < valid_from or float(window_end) > valid_until:
             return None
-        label_id = int(state["label_id"])
-        scene_index = int(state["scene_index"])
-        return OnlineLabel(
-            label_id=label_id,
-            label_name=LABEL_ID_TO_NAME[label_id],
-            timestamp_monotonic=valid_from,
-            expires_at_monotonic=valid_until,
-            event_id=f"scene-{scene_index:06d}",
-            source="cued-protocol",
-            payload={"scene_index": scene_index},
-        )
+        with self._lock:
+            matching_index = -1
+            for index, (started_at, _label_id, _lane) in enumerate(
+                self._label_segments
+            ):
+                if started_at <= float(window_start):
+                    matching_index = index
+                else:
+                    break
+            if matching_index < 0:
+                return None
+            segment_start, label_id, current_lane = self._label_segments[
+                matching_index
+            ]
+            segment_end = valid_until
+            if matching_index + 1 < len(self._label_segments):
+                segment_end = min(
+                    segment_end,
+                    self._label_segments[matching_index + 1][0],
+                )
+            if float(window_end) > segment_end:
+                return None
+            scene_index = int(state["scene_index"])
+            return OnlineLabel(
+                label_id=label_id,
+                label_name=LABEL_ID_TO_NAME[label_id],
+                timestamp_monotonic=max(valid_from, segment_start),
+                expires_at_monotonic=segment_end,
+                event_id=f"scene-{scene_index:06d}-segment-{matching_index:03d}",
+                source="cued-protocol",
+                payload={
+                    "scene_index": scene_index,
+                    "segment_index": matching_index,
+                    "current_lane": current_lane,
+                    "safe_lane": self._confirmed_safe_lane,
+                },
+            )
 
     def prepare_scene(self, *, scene_index: int, start_lane: int) -> int:
         """Choose a balanced action that is reachable from Unity's actual lane."""
@@ -355,15 +385,64 @@ class CuedOnlineLabelSource(OnlineLabelSource):
             self._scene_started_at = max(self._scene_started_at, timestamp)
             self._confirmed_scene_index = self._scene_index
             self._confirmed_safe_lane = int(safe_lane)
+            self._current_lane = int(start_lane)
+            self._label_segments = [
+                (timestamp, int(applied_label_id), int(start_lane))
+            ]
             self._applied_label_counts[int(applied_label_id)] += 1
+            return True
+
+    def update_current_lane(
+        self,
+        *,
+        scene_index: int,
+        current_lane: int,
+        safe_lane: int,
+        timestamp_monotonic: float | None = None,
+    ) -> bool:
+        """Start a new truth segment after Unity confirms a completed lane change."""
+
+        timestamp = (
+            float(self._clock())
+            if timestamp_monotonic is None
+            else float(timestamp_monotonic)
+        )
+        lane = int(current_lane)
+        safe = int(safe_lane)
+        if lane not in {-1, 0, 1} or safe not in {-1, 0, 1}:
+            return False
+        with self._lock:
+            if (
+                int(scene_index) != self._scene_index
+                or self._confirmed_scene_index != self._scene_index
+                or self._confirmed_safe_lane != safe
+            ):
+                return False
+            if timestamp < self._scene_started_at:
+                return False
+            if timestamp > self._scene_started_at + self._scene_duration_sec:
+                return False
+            desired_label = _relative_action_label(
+                current_lane=lane,
+                safe_lane=safe,
+            )
+            if self._label_segments:
+                last_started_at, last_label, last_lane = self._label_segments[-1]
+                if last_label == desired_label and last_lane == lane:
+                    return True
+                timestamp = max(timestamp, last_started_at)
+            self._label_segments.append((timestamp, desired_label, lane))
+            self._current_lane = lane
+            self._label_transition_count += 1
+            self._last_transition_reason = "lane_settled"
             return True
 
     def metadata(self) -> dict[str, Any]:
         return {
             "source": "cued-protocol",
             "protocol_mode": "continuous-relative-action",
-            "protocol_version": "continuous-scene-v3-relative",
-            "label_semantics": "relative-action-from-unity-start-lane",
+            "protocol_version": CUED_PROTOCOL_VERSION,
+            "label_semantics": "dynamic-relative-action-to-fixed-safe-lane",
             "balance_pool_scenes": len(self._sequence),
             "sequence": [LABEL_ID_TO_NAME[label] for label in self._sequence],
             "applied_label_counts": {
@@ -372,6 +451,17 @@ class CuedOnlineLabelSource(OnlineLabelSource):
             },
             "prepared_start_lane": self._prepared_start_lane,
             "confirmed_safe_lane": self._confirmed_safe_lane,
+            "current_lane": self._current_lane,
+            "label_transition_count": self._label_transition_count,
+            "label_segments": [
+                {
+                    "started_at_monotonic": started_at,
+                    "label_id": label_id,
+                    "label_name": LABEL_ID_TO_NAME[label_id],
+                    "current_lane": current_lane,
+                }
+                for started_at, label_id, current_lane in self._label_segments
+            ],
             "scene_duration_sec": self._scene_duration_sec,
             "boundary_guard_sec": self._boundary_guard_sec,
             "confirmed_scene_index": self._confirmed_scene_index,
@@ -392,6 +482,8 @@ class CuedOnlineLabelSource(OnlineLabelSource):
             self._prepared_label_id = None
             self._prepared_start_lane = None
             self._confirmed_safe_lane = None
+            self._current_lane = None
+            self._label_segments = []
             self._active_scene_failed = False
             self._last_transition_reason = "timeout"
 
@@ -405,14 +497,19 @@ class CuedOnlineLabelSource(OnlineLabelSource):
         valid_until_monotonic: float | None = None,
     ) -> dict[str, Any]:
         label_id = (
-            self._prepared_label_id
+            self._label_segments[-1][1]
+            if (
+                scene_index == self._confirmed_scene_index
+                and self._label_segments
+            )
+            else self._prepared_label_id
             if scene_index == self._prepared_scene_index
             else None
         )
         return {
             "source": "cued-protocol",
             "protocol_mode": "continuous-relative-action",
-            "protocol_version": "continuous-scene-v3-relative",
+            "protocol_version": CUED_PROTOCOL_VERSION,
             "phase": phase,
             "scene_index": scene_index,
             "scene_number": 0 if phase == "preparing" else scene_index + 1,
@@ -422,12 +519,21 @@ class CuedOnlineLabelSource(OnlineLabelSource):
             ),
             "start_lane": self._prepared_start_lane,
             "safe_lane": self._confirmed_safe_lane,
+            "current_lane": self._current_lane,
             "phase_remaining_sec": float(phase_remaining_sec),
             "scene_confirmed": scene_index == self._confirmed_scene_index,
             "scene_failed": self._active_scene_failed,
             "valid_from_monotonic": valid_from_monotonic,
             "valid_until_monotonic": valid_until_monotonic,
         }
+
+
+def _relative_action_label(*, current_lane: int, safe_lane: int) -> int:
+    if current_lane > safe_lane:
+        return LABEL_NAME_TO_ID["left"]
+    if current_lane < safe_lane:
+        return LABEL_NAME_TO_ID["right"]
+    return LABEL_NAME_TO_ID["idle"]
 
 
 def build_cued_online_label_source(

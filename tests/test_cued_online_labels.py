@@ -29,7 +29,7 @@ class _GameOutlet:
         if command == "SCENE_STATE":
             return {
                 "ack": command,
-                "protocol_version": "continuous-scene-v3-relative",
+                "protocol_version": "continuous-scene-v4-dynamic-label",
                 "scene_number": self.next_scene_number,
                 "current_lane": self.current_lane,
             }
@@ -44,7 +44,7 @@ class _GameOutlet:
             raise RuntimeError("unreachable relative action")
         response = {
             "ack": command,
-            "protocol_version": "continuous-scene-v3-relative",
+            "protocol_version": "continuous-scene-v4-dynamic-label",
             "scene_number": self.next_scene_number,
             "start_lane": self.current_lane,
             "safe_lane": safe_lane,
@@ -115,7 +115,7 @@ class CuedOnlineLabelTests(unittest.TestCase):
         self.assertIsNotNone(label)
         assert label is not None
         self.assertEqual(label.label_name, "left")
-        self.assertEqual(label.event_id, "scene-000000")
+        self.assertEqual(label.event_id, "scene-000000-segment-000")
 
         clock.value = 105.5
         self.assertIsNone(source.get_label(window_start=103.5, window_end=105.5))
@@ -204,6 +204,77 @@ class CuedOnlineLabelTests(unittest.TestCase):
         self.assertIsNotNone(source.get_label(window_start=100.5, window_end=102.5))
         self.assertIsNotNone(source.get_label(window_start=102.5, window_end=104.5))
         self.assertIsNone(source.get_label(window_start=102.51, window_end=104.51))
+
+    def test_lane_settled_splits_truth_and_rejects_crossing_windows(self) -> None:
+        clock = _Clock(100.0)
+        source = CuedOnlineLabelSource(
+            ["left"],
+            scene_duration_sec=5.0,
+            start_delay_sec=0.0,
+            boundary_guard_sec=0.0,
+            clock=clock,
+        )
+        self.assertEqual(source.prepare_scene(scene_index=0, start_lane=0), 0)
+        self.assertTrue(source.confirm_scene_applied(
+            scene_index=0,
+            applied_label_id=0,
+            start_lane=0,
+            safe_lane=-1,
+            timestamp_monotonic=100.0,
+        ))
+        self.assertTrue(source.update_current_lane(
+            scene_index=0,
+            current_lane=-1,
+            safe_lane=-1,
+            timestamp_monotonic=102.0,
+        ))
+
+        left = source.get_label(window_start=100.0, window_end=102.0)
+        crossing = source.get_label(window_start=101.0, window_end=103.0)
+        idle = source.get_label(window_start=102.0, window_end=104.0)
+        self.assertIsNotNone(left)
+        self.assertEqual(left.label_name, "left")
+        self.assertIsNone(crossing)
+        self.assertIsNotNone(idle)
+        self.assertEqual(idle.label_name, "idle")
+        self.assertEqual(idle.payload["current_lane"], -1)
+        self.assertEqual(source.metadata()["label_transition_count"], 1)
+
+    def test_decoder_accepts_dynamic_lane_truth_from_unity_event(self) -> None:
+        clock = _Clock(100.0)
+        source = CuedOnlineLabelSource(
+            ["left"],
+            scene_duration_sec=5.0,
+            start_delay_sec=0.0,
+            boundary_guard_sec=0.0,
+            clock=clock,
+        )
+        outlet = _GameOutlet(current_lane=0)
+        decoder = _bare_decoder(source, outlet)
+
+        from unittest import mock
+
+        with mock.patch("decoder.real_time_decoder.time.monotonic", return_value=100.0):
+            decoder._sync_game_scene()
+        outlet.events.append(
+            {
+                "event": "LANE_SETTLED",
+                "protocol_version": "continuous-scene-v4-dynamic-label",
+                "scene_number": 1,
+                "current_lane": -1,
+                "safe_lane": -1,
+            }
+        )
+        clock.value = 102.0
+        with mock.patch("decoder.real_time_decoder.time.monotonic", return_value=102.0):
+            decoder._consume_game_scene_events()
+
+        self.assertIsNone(
+            decoder._get_online_label(window_start=101.0, window_end=103.0)
+        )
+        idle = decoder._get_online_label(window_start=102.0, window_end=104.0)
+        self.assertIsNotNone(idle)
+        self.assertEqual(idle.label_name, "idle")
 
     def test_collision_marks_failure_without_ending_fixed_scene(self) -> None:
         clock = _Clock(100.0)

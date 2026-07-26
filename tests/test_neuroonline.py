@@ -13,6 +13,10 @@ import torch
 from torch import nn
 from click.testing import CliRunner
 
+from adaptation.calibration_search import (
+    CalibrationSearchConfig,
+    run_calibration_search,
+)
 from adaptation.neuroonline import (
     NeuroOnlineConfig,
     NeuroOnlineModelAdapter,
@@ -162,7 +166,84 @@ class NeuroOnlineTests(unittest.TestCase):
         )
         self.assertIsNotNone(wrapped._modulator)
         self.assertIn("val_kappa", metrics)
+        self.assertIn("val_balanced_accuracy", metrics)
         self.assertGreaterEqual(metrics["val_acc"], 0.0)
+
+    def test_calibration_search_keeps_trial_holdout_and_saves_report(self) -> None:
+        inputs = np.random.randn(30, 2, 16).astype(np.float32)
+        labels = np.tile(np.arange(3, dtype=np.int64), 10)
+        trial_ids = np.arange(labels.size, dtype=np.int64)
+        base_config = NeuroOnlineConfig(
+            enabled=True,
+            prompt_count=4,
+            offline_epochs=2,
+            offline_patience=1,
+            offline_batch_size=6,
+            offline_learning_rate=1e-3,
+        )
+        search_config = CalibrationSearchConfig(
+            enabled=True,
+            selection_epochs=1,
+            selection_patience=1,
+            learning_rates=(1e-3,),
+            batch_sizes=(6,),
+            mask_ratios=(0.3,),
+            consistency_weights=(0.1,),
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            result = run_calibration_search(
+                base_template=TorchModelAdapter("tiny", _TinyDecoder()),
+                base_config=base_config,
+                search_config=search_config,
+                X=inputs,
+                y=labels,
+                groups=trial_ids,
+                session_dir=Path(tmp_dir),
+            )
+
+            self.assertTrue((Path(tmp_dir) / "hyperparameter_search.json").exists())
+            self.assertEqual(result.best_config.offline_epochs, 2)
+            self.assertEqual(len(result.report["candidates"]), 1)
+            split = result.report["split"]
+            self.assertEqual(
+                split["train_trials"]
+                + split["selection_validation_trials"]
+                + split["untouched_holdout_trials"],
+                30,
+            )
+            self.assertIn(
+                "balanced_accuracy",
+                result.report["untouched_holdout_metrics"],
+            )
+
+    def test_checkpoint_restores_selected_model_coupled_parameters(self) -> None:
+        selected = NeuroOnlineConfig(
+            enabled=True,
+            prompt_count=4,
+            mask_ratio=0.5,
+            consistency_weight=0.3,
+        )
+        wrapped = NeuroOnlineModelAdapter(
+            TorchModelAdapter("tiny", _TinyDecoder()),
+            config=selected,
+        )
+        inputs = np.random.randn(2, 2, 16).astype(np.float32)
+        wrapped.predict_proba(inputs)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model_path = Path(tmp_dir) / "tiny.pt"
+            wrapped.save(model_path)
+            restored = NeuroOnlineModelAdapter(
+                TorchModelAdapter("tiny", _TinyDecoder()),
+                config=NeuroOnlineConfig(
+                    enabled=True,
+                    prompt_count=4,
+                    mask_ratio=0.3,
+                    consistency_weight=0.1,
+                ),
+                state_path=model_path,
+            )
+            self.assertEqual(restored.config.mask_ratio, 0.5)
+            self.assertEqual(restored.config.consistency_weight, 0.3)
 
     def test_train_from_records_restores_neuroonline_main_and_crm_weights(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

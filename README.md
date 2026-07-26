@@ -54,7 +54,7 @@ git reset --hard origin/main
 1. 在“设置”页确认被试 ID、`shallowconvnet`、真实设备类型和设备地址，然后保存。
 2. 在“连通检测”页确认 EEG 数据可读取；需要时再做“阻抗检查”。
 3. 进入“校准”并点击“正式实验”；每次实验都会从头校准，不复用旧模型。
-4. 校准采集结束后不要返回、刷新或关闭页面；等待离线训练完成并明确显示模型保存路径。
+4. 校准采集结束后不要返回、刷新或关闭页面；程序会先按完整 trial 搜索离线预训练超参数，再训练正式模型。等待页面明确显示模型保存路径。
 5. 模型和 CRM 应分别出现在 `models_storage/<被试>/<设备>/shallowconvnet.pt` 与 `shallowconvnet.pt.neuroonline.pt`。
 6. 先进入“测试模式”验证模型和小车链路，再进入“实时解码”开始连续 NeuroOnline 实验。
 
@@ -173,8 +173,17 @@ oi-mi calibrate --subject S001 --model shallowconvnet
 
 每个 trial 通常产生 5 个 2 秒窗口，因此质量筛选前共有 300 个窗口、每类
 100 个。训练/验证按 `trial_ids` 分组，同一 trial 的重叠窗口不会跨集合。后续
-离线训练时间不计入这 12 分钟；训练上限为 50 epoch，验证 kappa 连续 6 个
-epoch 不提升时提前停止。
+离线训练时间不计入这 12 分钟。启用 `neuroonline.calibration_search` 后，程序先固定
+完整 trial 的训练集、选择验证集和独立检验集：同一 trial 的重叠窗口绝不会跨集合。
+搜索同时比较 5 个离线学习率、4 个 batch size、4 个 mask ratio 与 6 个一致性
+损失权重，完整笛卡尔网格共评估 480 个候选。每个候选最多训练 50 epoch，验证排名
+连续 8 个 epoch 不提升时提前停止。
+候选先把同一 trial 的窗口概率取平均，以 trial-level balanced accuracy 为首要依据，
+再依次比较 trial-level kappa、macro-F1、窗口 balanced accuracy 和交叉熵。最佳候选
+只在完全未参与调参的 trial 检验集上报告一次结果，随后用选定参数
+重新训练正式模型。正式训练上限为 50 epoch，验证分数连续 6 个 epoch 不提升时提前停止。
+完整候选、分组规模、最佳参数和独立检验指标保存在校准目录的
+`hyperparameter_search.json`，同时写入 `metadata.json`。
 
 实时运行：
 
@@ -212,7 +221,7 @@ python download_datasets.py --dataset BNCI2014_001 --subject 1 --data-dir ./data
 
 `config.yaml` 中将 `online_adaptation.strategy` 设为 `neuroonline` 后，实时解码采用严格的先预测、后更新流程。当前小车实验配置按 NeuroOnline 发布源码先累计 320 个有标签窗口完成第一次更新，之后每新增 64 个有标签窗口更新一次，并始终使用最近 320 个窗口。每个样本在进入缓冲区时生成固定的时间遮挡和频率遮挡视图，更新目标为三个视图的分类损失加两项表示一致性损失，并联合更新 backbone、CRM 和分类头。
 
-该模式仅支持 PyTorch 模型，不支持 `riemann-mdm`。CRM 以恒等门控初始化；更新后的 backbone 保存到原模型文件，CRM 状态保存到同目录的 `<model>.neuroonline.pt` sidecar 文件。将策略改回 `periodic_head` 可继续使用原有的十分钟候选分类头更新流程。
+该模式仅支持 PyTorch 模型，不支持 `riemann-mdm`。CRM 以恒等门控初始化；更新后的 backbone 保存到原模型文件，CRM 状态保存到同目录的 `<model>.neuroonline.pt` sidecar 文件。校准搜索选出的 mask ratio、一致性权重及其他模型耦合参数也写入 sidecar，重启 GUI 后实时更新会自动恢复这些参数；在线 `320/64/320` 触发策略、`1e-6` 学习率和控制置信度不参与这次离线搜索。将策略改回 `periodic_head` 可继续使用原有的十分钟候选分类头更新流程。
 
 实时解码页面配套显示 NeuroOnline 遥测：累计 Scene、累计有标签窗口、距离下一次 64 窗口触发的进度、缓冲区类别覆盖、原始 argmax prequential accuracy/fixed-three-class balanced accuracy、实际控制覆盖率、选择性准确率、逐类准确率、累计混淆矩阵，以及每次更新的总损失、分类损失、一致性损失、CRM gate 和耗时曲线。所有在线性能只使用“先预测、后更新”时产生的预测，不会用更新后的模型回算历史样本。三类尚未全部出现时，未出现类别召回率固定按 0 计，避免早期 balanced accuracy 虚高。
 
@@ -246,9 +255,9 @@ python download_datasets.py --dataset BNCI2014_001 --subject 1 --data-dir ./data
 
 只有输出 `"ok": true`、`integrity.status=complete`、`dropped_records=0` 且博瑞康原始文件编号对应时，才应将该会话纳入论文统计。
 
-正式小车实验启用 `online_adaptation.cued_labels` 后采用 `continuous-scene-v3-relative` 连续相对动作协议。每个 Scene 开始前，Python 先用 `SCENE_STATE` 查询 Unity 中小车的实际车道；`LEFT` 表示从该车道向左移动一条车道，`RIGHT` 表示向右移动一条车道，`IDLE` 表示保持当前车道。边界处不可执行的向外动作会被调度器跳过，绝不会静默改成另一类。Unity 根据相对动作计算唯一空车道，在同一帧、同一前向距离给另外两条路各布置一辆障碍车，并返回包含 `scene_number/start_lane/safe_lane/applied_label` 的结构化 ACK。Python 验证四项完全一致后才产生 EEG 真值标签；因此同一绝对空车道在小车已经到达时是 `IDLE`，小车避障失败仍留在旁边时则继续是相应的 `LEFT` 或 `RIGHT`。
+正式小车实验启用 `online_adaptation.cued_labels` 后采用 `continuous-scene-v4-dynamic-label` 连续动态动作协议。每个 Scene 开始前，Python 先用 `SCENE_STATE` 查询 Unity 中小车的实际车道，再选择一个可达且类别均衡的初始相对动作。Unity 固定本 Scene 的唯一空车道，在同一帧、同一前向距离给另外两条路各布置一辆障碍车，并返回包含 `scene_number/start_lane/safe_lane/applied_label` 的结构化 ACK。Scene 内固定的是 `safe_lane`，而不是动作标签：Unity 只有在车辆横向位置真正到达目标车道后才发送 `LANE_SETTLED`。Python 随即根据当前车道到安全车道的相对关系重新计算真值；位于安全车道时为 `IDLE`，仍在右侧时为 `LEFT`，仍在左侧时为 `RIGHT`。跨越标签切换时刻的 EEG 窗口不参与在线训练。
 
-碰撞只会炸掉被撞的障碍车，另一条路的障碍保持原位；Unity 上报 `SCENE_FAILED` 后，Python 只记录本 Scene 失败，不提前切换标签或障碍布局，到固定的 5 秒边界才同步下一 Scene。模型每 `step_sec` 持续预测并控制车辆，不再存在 fixation、cue、ITI 或面向被试的隐藏停止阶段。正式 Scene 时长固定为 `5.0` 秒，Unity 按相对速度 `(6.0 - 3.2) m/s` 将障碍放在约 `14.0 m` 前方：走错车道会因车身碰撞半径在约 4.7 秒判定失败，但剩余约 0.3 秒仍属于同一 Scene；走对空路则在第 5 秒通过障碍横截面并判定成功。在线训练与校准采用相同的有效控制区间，只接受 Scene 内 `0.5-4.5` 秒范围中完整的 EEG 窗口。跨越 ACK 或 5 秒切换边界的窗口均标为无标签。`events.jsonl` 和逐窗 NPZ 同时保存起始车道与空车道，保证标签可审计。
+碰撞只会炸掉被撞的障碍车，另一条路的障碍保持原位；Unity 上报 `SCENE_FAILED` 后，Python 只记录本 Scene 失败，不改变安全车道，到固定的 5 秒边界才同步下一 Scene。模型每 `step_sec` 持续预测并控制车辆，不再存在 fixation、cue、ITI 或面向被试的隐藏停止阶段。正式 Scene 时长固定为 `5.0` 秒，Unity 按相对速度 `(6.0 - 3.2) m/s` 将障碍放在约 `14.0 m` 前方：走错车道会因车身碰撞半径在约 4.7 秒判定失败，但剩余约 0.3 秒仍属于同一 Scene；走对空路则在第 5 秒通过障碍横截面并判定成功。在线训练与校准采用相同的有效控制区间，只接受 Scene 内 `0.5-4.5` 秒范围中完整、且完全落在同一个动态标签段内的 EEG 窗口。跨越 ACK、`LANE_SETTLED` 或 5 秒切换边界的窗口均标为无标签。`events.jsonl` 和逐窗 NPZ 同时保存起始车道、当前车道与空车道，保证标签可审计。
 
 Neuracle/JellyFish 原始数据以 `250 Hz` 转发。校准连续数据保留 250 Hz 源时间轴，切出完整源窗口后做带抗混叠滤波的 `250→200 Hz` 降采样；实时解码同样先取得 500 点的 2 秒源窗口，再降为模型使用的 400 点。后续预处理、模型输入和 NeuroOnline 更新统一使用 `200 Hz`。实时窗口不再把 `get_chunk()` 返回时刻当作脑电终点，而是利用 JellyFish 数据包的源时间戳，将样本时间映射到 Python 的单调时钟后再与 Unity Scene 对齐。`device.neuracle_transport_delay_sec` 用于补偿经 Trigger/回环实验测得的固定采集链路延迟；未测量前保持 `0.0`，系统仍会利用源时间戳消除排队和轮询抖动。
 
@@ -267,6 +276,7 @@ Neuracle/JellyFish 原始数据以 `250 Hz` 转发。校准连续数据保留 25
 | `calibrate`（统一从头校准）    | 是        | `records_storage/<subject_id>/calibration/<session_timestamp>/` | `continuous_eeg.npy` / `continuous_sample_timestamps.npy` | 会话期间连续原始 EEG 及逐样本源时钟；metadata保存环境、配置、模型和文件哈希。 |
 | `calibrate`（统一从头校准）    | 是        | 同上                                                              | `events.json` / `metadata.json`        | 事件时间轴、trial 元信息、协议参数等对齐信息。                                              |
 | `calibrate`（统一从头校准）    | 是        | 同上                                                              | `training_windows_main.npz`            | 质量筛选后的训练集、`trial_ids` 和逐窗质量指标；按 trial 分组验证。          |
+| `calibrate`（启用参数搜索）    | 是        | 同上                                                              | `hyperparameter_search.json`            | 全部候选参数/指标、trial 分组规模、最佳配置及未参与调参的独立检验结果。 |
 | `calibrate`（可选辅助窗） | 是        | 同上                                                              | `training_windows_aux_1p5s.npz`        | 若 `protocol.export_window_sec` 非空，会额外导出辅助窗长版本。                          |
 | `run --test-mode`（测试模式）        | 是        | `records_storage/<subject_id>/test_mode/`（内部按 chunk 写）          | `manifest.json` + `chunks/chunk_*.npz` | 每个推理步保存原始 `window`、`y_true`、`y_pred`、`confidence`；`manifest` 汇总窗口数和准确率。 |
 | `run`（实时解码）+ NeuroOnline        | 是（强制） | `records_storage/<subject_id>/realtime/<session_timestamp>/`    | `manifest.json` + `events.jsonl` + `chunks/` + `model_revisions/` | 保存完整逐窗概率/时间/质量/Scene/模型版本、事件、修订权重、独立重算指标与校验和。 |
