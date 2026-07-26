@@ -35,8 +35,8 @@ class _GameCommandProxy:
     def push(self, command: str) -> None:
         self._router.push(command, source=self._source)
 
-    def push_with_ack(self, command: str) -> None:
-        self._router.push_with_ack(command, source=self._source)
+    def push_with_ack(self, command: str) -> dict[str, Any]:
+        return self._router.push_with_ack(command, source=self._source)
 
     def poll_events(self) -> list[dict[str, Any]]:
         return self._router.poll_events()
@@ -76,7 +76,7 @@ class SharedGameCommandRouter:
 
             self._transport.push(command)
 
-    def push_with_ack(self, command: str, *, source: str) -> None:
+    def push_with_ack(self, command: str, *, source: str) -> dict[str, Any]:
         """Forward a scene command and require the Unity runtime to confirm it.
 
         Scene-layout commands are independent from steering, so a temporary
@@ -95,7 +95,12 @@ class SharedGameCommandRouter:
             )
 
         with self._lock:
-            push_with_ack(command)
+            response = push_with_ack(command)
+        if not isinstance(response, dict):
+            raise RuntimeError(
+                f"Unity returned an invalid structured ACK for {command}: {response!r}"
+            )
+        return response
 
     def poll_events(self) -> list[dict[str, Any]]:
         if self._transport is None:

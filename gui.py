@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import base64
 import html
+import json
+import os
 import re
 import sys
 import threading
@@ -46,6 +48,7 @@ from web_command_server import start_web_command_server
 _GUI_ROOT = Path(__file__).resolve().parent
 _PAGE_ICON_FILENAME = "OMNI_ICON.svg"
 _LOGO_FILENAME = "OMNI_LOGO_ENG_double_line.svg"
+_CALIBRATION_STATUS_SCHEMA = 1
 
 
 def _resolve_asset_path(filename: str) -> Path | None:
@@ -59,6 +62,182 @@ def _resolve_asset_path(filename: str) -> Path | None:
     for candidate in candidates:
         if candidate.exists():
             return candidate
+    return None
+
+
+def _calibration_status_path(config: dict) -> Path:
+    """Return the durable GUI status file for one subject's calibration."""
+
+    runtime_dir = Path(
+        str(config.get("storage", {}).get("runtime_dir", ".runtime"))
+    ).expanduser()
+    if not runtime_dir.is_absolute():
+        runtime_dir = _GUI_ROOT / runtime_dir
+    subject_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(config.get("subject_id", "unknown")))
+    return runtime_dir / f"calibration-{subject_id}.json"
+
+
+def _write_calibration_status(config: dict, payload: dict[str, object]) -> None:
+    """Atomically persist calibration state so a browser reconnect can recover it."""
+
+    path = _calibration_status_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    document = {
+        "schema_version": _CALIBRATION_STATUS_SCHEMA,
+        "subject_id": str(config.get("subject_id", "")),
+        "updated_at_unix": time.time(),
+        **payload,
+    }
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(document, handle, ensure_ascii=False, indent=2, default=str)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def _read_calibration_status(config: dict) -> dict[str, object] | None:
+    path = _calibration_status_path(config)
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if int(payload.get("schema_version", -1)) != _CALIBRATION_STATUS_SCHEMA:
+        return None
+    if str(payload.get("subject_id", "")) != str(config.get("subject_id", "")):
+        return None
+    return payload
+
+
+def _validate_calibration_outcome(
+    outcome: dict[str, object],
+    *,
+    require_neuroonline_sidecar: bool,
+) -> None:
+    """Refuse to report success until every experiment-critical artifact exists."""
+
+    required_paths: list[tuple[str, Path]] = []
+    for key, label in (
+        ("model_path", "模型"),
+        ("calibration_data_path", "训练窗口"),
+        ("session_dir", "校准 session"),
+    ):
+        value = str(outcome.get(key, "") or "").strip()
+        if not value:
+            raise RuntimeError(f"校准完成结果缺少{label}路径")
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = _GUI_ROOT / path
+        required_paths.append((label, path))
+
+    missing = [
+        f"{label}: {path}"
+        for label, path in required_paths
+        if not path.exists() or (path.is_file() and path.stat().st_size <= 0)
+    ]
+    model_path = Path(str(outcome["model_path"])).expanduser()
+    if not model_path.is_absolute():
+        model_path = _GUI_ROOT / model_path
+    metrics_path = model_path.with_suffix(".metrics.yaml")
+    if not metrics_path.is_file() or metrics_path.stat().st_size <= 0:
+        missing.append(f"训练指标: {metrics_path}")
+    if require_neuroonline_sidecar:
+        neuroonline_path = Path(f"{model_path}.neuroonline.pt")
+        if not neuroonline_path.is_file() or neuroonline_path.stat().st_size <= 0:
+            missing.append(f"CRM: {neuroonline_path}")
+    session_dir = Path(str(outcome["session_dir"])).expanduser()
+    if not session_dir.is_absolute():
+        session_dir = _GUI_ROOT / session_dir
+    session_metadata = session_dir / "metadata.json"
+    if not session_metadata.is_file() or session_metadata.stat().st_size <= 0:
+        missing.append(f"session 元数据: {session_metadata}")
+    if missing:
+        raise RuntimeError("校准产物校验失败；" + "；".join(missing))
+
+
+def _recover_completed_calibration(config: dict) -> dict[str, object] | None:
+    """Recover a completed run whose Streamlit page disconnected before rerun."""
+
+    status = _read_calibration_status(config)
+    if not isinstance(status, dict):
+        return None
+    persisted_outcome = status.get("outcome")
+    if status.get("state") == "completed" and isinstance(persisted_outcome, dict):
+        try:
+            _validate_calibration_outcome(
+                persisted_outcome,
+                require_neuroonline_sidecar=bool(
+                    config.get("online_adaptation", {}).get("enabled", False)
+                    and str(config.get("online_adaptation", {}).get("strategy", "")).lower()
+                    == "neuroonline"
+                ),
+            )
+        except RuntimeError:
+            return None
+        recovered = dict(persisted_outcome)
+        recovered["recovered_after_reconnect"] = True
+        return recovered
+    if status.get("state") == "failed" and isinstance(persisted_outcome, dict):
+        recovered = dict(persisted_outcome)
+        recovered["recovered_after_reconnect"] = True
+        return recovered
+
+    if status.get("state") != "running":
+        return None
+    started_at = float(status.get("started_at_unix", 0.0))
+    subject_id = str(config.get("subject_id", ""))
+    records_root = Path(
+        str(config.get("storage", {}).get("records_dir", "records_storage"))
+    ).expanduser()
+    if not records_root.is_absolute():
+        records_root = _GUI_ROOT / records_root
+    calibration_root = records_root / subject_id / "calibration"
+    if not calibration_root.is_dir():
+        return None
+
+    for session_dir in sorted(
+        (path for path in calibration_root.iterdir() if path.is_dir()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    ):
+        metadata_path = session_dir / "metadata.json"
+        if not metadata_path.is_file() or metadata_path.stat().st_mtime + 1.0 < started_at:
+            continue
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            outcome = {
+                "ok": True,
+                "windows_collected": int(metadata["windows_collected"]),
+                "model_path": str(metadata["model_path"]),
+                "calibration_data_path": str(session_dir / "training_windows_main.npz"),
+                "session_dir": str(session_dir),
+                "metrics": dict(metadata["metrics"]),
+                "recovered_after_reconnect": True,
+            }
+            _validate_calibration_outcome(
+                outcome,
+                require_neuroonline_sidecar=bool(
+                    config.get("online_adaptation", {}).get("enabled", False)
+                    and str(config.get("online_adaptation", {}).get("strategy", "")).lower()
+                    == "neuroonline"
+                ),
+            )
+        except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError, RuntimeError):
+            continue
+        _write_calibration_status(
+            config,
+            {
+                "state": "completed",
+                "started_at_unix": started_at,
+                "completed_at_unix": time.time(),
+                "outcome": outcome,
+            },
+        )
+        return outcome
     return None
 
 
@@ -299,7 +478,9 @@ def _resolve_cue_symbol(message: str, *, event_type: str) -> tuple[str, bool] | 
     if "校准完成" in message or "测试结束" in message:
         return _DISPLAY_SYMBOLS["DONE"], False
     if "采集完成" in message:
-        return _DISPLAY_SYMBOLS["TRANSITION"], False
+        # Do not leave the subject staring at the red ITI dot during a long
+        # offline fit.  The text and progress card are the training indicator.
+        return _DISPLAY_SYMBOLS["BLANK"], False
     if "执行失败" in message:
         return _DISPLAY_SYMBOLS["ERROR"], False
     if "开始按 MI game control protocol 采集" in message:
@@ -1014,6 +1195,14 @@ def run_calibration_session(config: dict, protocol: ProtocolConfig) -> dict[str,
 
     console: StreamlitConsole | None = None
     refresh = None
+    started_at_unix = time.time()
+    _write_calibration_status(
+        config,
+        {
+            "state": "running",
+            "started_at_unix": started_at_unix,
+        },
+    )
     try:
         subject_id = str(config["subject_id"])
         model_name = str(config["model_name"])
@@ -1075,7 +1264,7 @@ def run_calibration_session(config: dict, protocol: ProtocolConfig) -> dict[str,
             )
 
         refresh()
-        return {
+        outcome: dict[str, object] = {
             "ok": True,
             "windows_collected": int(result.windows_collected),
             "model_path": str(result.model_path),
@@ -1087,11 +1276,39 @@ def run_calibration_session(config: dict, protocol: ProtocolConfig) -> dict[str,
             "session_dir": str(result.session_dir) if result.session_dir is not None else None,
             "metrics": dict(result.metrics),
         }
+        _validate_calibration_outcome(
+            outcome,
+            require_neuroonline_sidecar=bool(
+                config.get("online_adaptation", {}).get("enabled", False)
+                and str(config.get("online_adaptation", {}).get("strategy", "")).lower()
+                == "neuroonline"
+            ),
+        )
+        _write_calibration_status(
+            config,
+            {
+                "state": "completed",
+                "started_at_unix": started_at_unix,
+                "completed_at_unix": time.time(),
+                "outcome": outcome,
+            },
+        )
+        return outcome
     except Exception as exc:  # noqa: BLE001
+        outcome = {"ok": False, "error": str(exc)}
+        _write_calibration_status(
+            config,
+            {
+                "state": "failed",
+                "started_at_unix": started_at_unix,
+                "failed_at_unix": time.time(),
+                "outcome": outcome,
+            },
+        )
         if console is not None and refresh is not None:
             console.print(f"[bold red]执行失败: {exc}[/bold red]")
             refresh()
-        return {"ok": False, "error": str(exc)}
+        return outcome
 
 
 def _format_impedance_value(impedance_kohm: float | None) -> str:
@@ -1443,10 +1660,16 @@ def render_calibration(config: dict) -> None:
         return
 
     st.title("被试校准")
+    if not isinstance(st.session_state.get("calibration_last_outcome"), dict):
+        recovered_outcome = _recover_completed_calibration(config)
+        if recovered_outcome is not None:
+            st.session_state.calibration_last_outcome = recovered_outcome
     calibration_outcome = st.session_state.get("calibration_last_outcome")
     if isinstance(calibration_outcome, dict):
         if bool(calibration_outcome.get("ok", False)):
             st.success("校准完成，模型与 CRM 已保存。")
+            if bool(calibration_outcome.get("recovered_after_reconnect", False)):
+                st.info("已从磁盘恢复校准完成状态；此前的页面刷新或断线没有丢失模型。")
             st.write(f"- 采集窗口数: **{int(calibration_outcome.get('windows_collected', 0))}**")
             st.write(f"- 模型保存位置: `{calibration_outcome.get('model_path', '-')}`")
             if calibration_outcome.get("calibration_data_path"):
@@ -1462,6 +1685,8 @@ def render_calibration(config: dict) -> None:
                 f"{calibration_outcome.get('error', '未知错误')}。"
                 "原始 session 会保留，可在修复后离线恢复。"
             )
+            if bool(calibration_outcome.get("recovered_after_reconnect", False)):
+                st.info("已从磁盘恢复失败状态；页面没有卡住，错误信息和原始数据仍然保留。")
     st.markdown("开始采集后，页面会显示提示与日志。")
     st.caption(
         f"主训练窗 {protocol.window_sec:.1f}s / 刷新 {protocol.stride_sec:.1f}s。"
@@ -1502,6 +1727,14 @@ def render_calibration(config: dict) -> None:
 
     if run_requested:
         st.session_state.pop("calibration_last_outcome", None)
+        _write_calibration_status(
+            config,
+            {
+                "state": "running",
+                "started_at_unix": time.time(),
+                "launch_requested": True,
+            },
+        )
         st.session_state.calibration_experiment_view = "run"
         st.rerun()
 

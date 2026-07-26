@@ -1193,8 +1193,9 @@ class CliHelperTests(unittest.TestCase):
             def push(self, command: str) -> None:
                 self.commands.append(command)
 
-            def push_with_ack(self, command: str) -> None:
+            def push_with_ack(self, command: str) -> dict[str, str]:
                 self.acked_commands.append(command)
+                return {"ack": command}
 
         config = {
             "output": {

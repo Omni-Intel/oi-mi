@@ -15,20 +15,80 @@ class _Clock:
 
 
 class _GameOutlet:
-    def __init__(self) -> None:
+    def __init__(self, *, current_lane: int = 0) -> None:
         self.commands: list[str] = []
         self.events: list[dict[str, object]] = []
+        self.current_lane = current_lane
+        self.next_scene_number = 1
 
     def push(self, command: str) -> None:
         self.commands.append(command)
 
-    def push_with_ack(self, command: str) -> None:
+    def push_with_ack(self, command: str) -> dict[str, object]:
         self.push(command)
+        if command == "SCENE_STATE":
+            return {
+                "ack": command,
+                "protocol_version": "continuous-scene-v3-relative",
+                "scene_number": self.next_scene_number,
+                "current_lane": self.current_lane,
+            }
+        label_by_command = {
+            "SCENE_LEFT": ("left", -1),
+            "SCENE_RIGHT": ("right", 1),
+            "SCENE_IDLE": ("idle", 0),
+        }
+        label, delta = label_by_command[command]
+        safe_lane = self.current_lane + delta
+        if safe_lane not in {-1, 0, 1}:
+            raise RuntimeError("unreachable relative action")
+        response = {
+            "ack": command,
+            "protocol_version": "continuous-scene-v3-relative",
+            "scene_number": self.next_scene_number,
+            "start_lane": self.current_lane,
+            "safe_lane": safe_lane,
+            "applied_label": label,
+        }
+        self.next_scene_number += 1
+        return response
 
     def poll_events(self) -> list[dict[str, object]]:
         events = list(self.events)
         self.events.clear()
         return events
+
+
+def _bare_decoder(
+    source: CuedOnlineLabelSource,
+    outlet: _GameOutlet,
+) -> RealTimeDecoder:
+    decoder = RealTimeDecoder.__new__(RealTimeDecoder)
+    decoder._online_label_source = source
+    decoder._game_command_outlet = outlet
+    decoder._last_game_transport_command = None
+    decoder._last_game_transport_error = None
+    decoder._last_game_transport_sent_at = 0.0
+    decoder._last_game_movement_sent_at = 0.0
+    decoder._stop_on_game_disconnect = True
+    decoder._scene_sent_scene_index = -1
+    decoder._scene_sent_label_id = None
+    decoder._scene_sync_error = None
+    decoder._game_disconnect_message = None
+    decoder._console = type(
+        "_Console",
+        (),
+        {"print": lambda self, *args, **kwargs: None},
+    )()
+    decoder._stop_event = type(
+        "_StopEvent",
+        (),
+        {
+            "__init__": lambda self: setattr(self, "was_set", False),
+            "set": lambda self: setattr(self, "was_set", True),
+        },
+    )()
+    return decoder
 
 
 class CuedOnlineLabelTests(unittest.TestCase):
@@ -41,7 +101,14 @@ class CuedOnlineLabelTests(unittest.TestCase):
             boundary_guard_sec=0.0,
             clock=clock,
         )
-        self.assertTrue(source.confirm_scene_applied(scene_index=0, timestamp_monotonic=100.0))
+        self.assertEqual(source.prepare_scene(scene_index=0, start_lane=0), 0)
+        self.assertTrue(source.confirm_scene_applied(
+            scene_index=0,
+            applied_label_id=0,
+            start_lane=0,
+            safe_lane=-1,
+            timestamp_monotonic=100.0,
+        ))
 
         clock.value = 102.0
         label = source.get_label(window_start=100.0, window_end=102.0)
@@ -66,10 +133,10 @@ class CuedOnlineLabelTests(unittest.TestCase):
         clock.value = 30.0
         status = source.status()
         self.assertEqual(status["phase"], "control")
-        self.assertEqual(status["protocol_mode"], "continuous-scene")
+        self.assertEqual(status["protocol_mode"], "continuous-relative-action")
         self.assertEqual(status["scene_index"], 6)
         self.assertEqual(status["scene_number"], 7)
-        self.assertEqual(status["label_name"], "left")
+        self.assertIsNone(status["label_name"])
         self.assertEqual(source.metadata()["balance_pool_scenes"], 3)
         self.assertNotIn("total_trials", status)
 
@@ -100,9 +167,13 @@ class CuedOnlineLabelTests(unittest.TestCase):
 
         self.assertIsNone(source.get_label(window_start=100.0, window_end=102.0))
         clock.value = 100.25
+        self.assertEqual(source.prepare_scene(scene_index=0, start_lane=0), 0)
         self.assertTrue(
             source.confirm_scene_applied(
                 scene_index=0,
+                applied_label_id=0,
+                start_lane=0,
+                safe_lane=-1,
                 timestamp_monotonic=100.25,
             )
         )
@@ -119,7 +190,14 @@ class CuedOnlineLabelTests(unittest.TestCase):
             boundary_guard_sec=0.5,
             clock=clock,
         )
-        self.assertTrue(source.confirm_scene_applied(scene_index=0, timestamp_monotonic=100.0))
+        self.assertEqual(source.prepare_scene(scene_index=0, start_lane=0), 0)
+        self.assertTrue(source.confirm_scene_applied(
+            scene_index=0,
+            applied_label_id=0,
+            start_lane=0,
+            safe_lane=-1,
+            timestamp_monotonic=100.0,
+        ))
 
         clock.value = 104.5
         self.assertIsNone(source.get_label(window_start=100.49, window_end=102.49))
@@ -136,7 +214,14 @@ class CuedOnlineLabelTests(unittest.TestCase):
             boundary_guard_sec=0.0,
             clock=clock,
         )
-        self.assertTrue(source.confirm_scene_applied(scene_index=0, timestamp_monotonic=100.0))
+        self.assertEqual(source.prepare_scene(scene_index=0, start_lane=0), 0)
+        self.assertTrue(source.confirm_scene_applied(
+            scene_index=0,
+            applied_label_id=0,
+            start_lane=0,
+            safe_lane=-1,
+            timestamp_monotonic=100.0,
+        ))
 
         clock.value = 104.0
         self.assertTrue(
@@ -160,7 +245,7 @@ class CuedOnlineLabelTests(unittest.TestCase):
         clock.value = 110.0
         status = source.status()
         self.assertEqual(status["scene_index"], 1)
-        self.assertEqual(status["label_name"], "right")
+        self.assertIsNone(status["label_name"])
         self.assertFalse(status["scene_failed"])
 
     def test_buffered_collision_is_recorded_then_scene_times_out_normally(self) -> None:
@@ -182,7 +267,7 @@ class CuedOnlineLabelTests(unittest.TestCase):
         )
         status = source.status()
         self.assertEqual(status["scene_index"], 1)
-        self.assertEqual(status["label_name"], "right")
+        self.assertIsNone(status["label_name"])
         self.assertEqual(source.metadata()["failed_scenes"], 1)
 
     def test_scene_truth_is_required_before_label_is_accepted(self) -> None:
@@ -214,7 +299,7 @@ class CuedOnlineLabelTests(unittest.TestCase):
 
         with mock.patch("decoder.real_time_decoder.time.monotonic", return_value=100.0):
             decoder._sync_game_scene()
-        self.assertEqual(outlet.commands, ["SCENE_RIGHT"])
+        self.assertEqual(outlet.commands, ["SCENE_STATE", "SCENE_RIGHT"])
         label = decoder._get_online_label(window_start=100.0, window_end=102.0)
         self.assertIsNotNone(label)
         assert label is not None
@@ -248,25 +333,165 @@ class CuedOnlineLabelTests(unittest.TestCase):
 
         with mock.patch("decoder.real_time_decoder.time.monotonic", return_value=100.0):
             decoder._sync_game_scene()
-        self.assertEqual(outlet.commands, ["SCENE_LEFT"])
+        self.assertEqual(outlet.commands, ["SCENE_STATE", "SCENE_LEFT"])
 
         clock.value = 103.0
         outlet.events.append({"event": "SCENE_FAILED", "scene_number": 1})
         with mock.patch("decoder.real_time_decoder.time.monotonic", return_value=103.0):
             decoder._sync_game_scene()
 
-        self.assertEqual(outlet.commands, ["SCENE_LEFT"])
+        self.assertEqual(outlet.commands, ["SCENE_STATE", "SCENE_LEFT"])
         self.assertEqual(source.status()["scene_index"], 0)
         self.assertTrue(source.status()["scene_failed"])
         self.assertEqual(source.metadata()["failed_scenes"], 1)
 
         clock.value = 110.0
+        outlet.current_lane = -1
         with mock.patch("decoder.real_time_decoder.time.monotonic", return_value=110.0):
             decoder._sync_game_scene()
 
-        self.assertEqual(outlet.commands, ["SCENE_LEFT", "SCENE_RIGHT"])
+        self.assertEqual(
+            outlet.commands,
+            ["SCENE_STATE", "SCENE_LEFT", "SCENE_STATE", "SCENE_RIGHT"],
+        )
         self.assertEqual(source.status()["scene_index"], 1)
         self.assertFalse(source.status()["scene_failed"])
+
+    def test_repeated_empty_direction_uses_actual_lane_after_failure(self) -> None:
+        clock = _Clock(0.0)
+        source = CuedOnlineLabelSource(
+            ["right", "right", "idle"],
+            scene_duration_sec=5.0,
+            start_delay_sec=0.0,
+            boundary_guard_sec=0.0,
+            clock=clock,
+        )
+        outlet = _GameOutlet(current_lane=-1)
+        decoder = RealTimeDecoder.__new__(RealTimeDecoder)
+        decoder._online_label_source = source
+        decoder._game_command_outlet = outlet
+        decoder._last_game_transport_command = None
+        decoder._last_game_transport_error = None
+        decoder._last_game_transport_sent_at = 0.0
+        decoder._last_game_movement_sent_at = 0.0
+        decoder._stop_on_game_disconnect = False
+        decoder._scene_sent_scene_index = -1
+        decoder._scene_sent_label_id = None
+        decoder._scene_sync_error = None
+        decoder._console = type("_Console", (), {"print": lambda self, *args, **kwargs: None})()
+        decoder._stop_event = type("_StopEvent", (), {"set": lambda self: None})()
+
+        from unittest import mock
+
+        with mock.patch("decoder.real_time_decoder.time.monotonic", return_value=0.0):
+            decoder._sync_game_scene()
+        self.assertEqual(decoder._scene_labels[0], 1)
+        self.assertEqual(decoder._scene_start_lanes[0], -1)
+        self.assertEqual(decoder._scene_safe_lanes[0], 0)
+
+        clock.value = 5.0
+        outlet.current_lane = -1  # The car failed and never left its lane.
+        with mock.patch("decoder.real_time_decoder.time.monotonic", return_value=5.0):
+            decoder._sync_game_scene()
+        self.assertEqual(decoder._scene_start_lanes[1], -1)
+        self.assertEqual(decoder._scene_labels[1], 1)
+        self.assertEqual(decoder._scene_safe_lanes[1], 0)
+
+    def test_96_scene_pool_stays_exactly_balanced_at_lane_boundaries(self) -> None:
+        for reaches_safe_lane in (False, True):
+            with self.subTest(reaches_safe_lane=reaches_safe_lane):
+                clock = _Clock(0.0)
+                source = CuedOnlineLabelSource(
+                    ["left"] * 32 + ["right"] * 32 + ["idle"] * 32,
+                    scene_duration_sec=5.0,
+                    start_delay_sec=0.0,
+                    boundary_guard_sec=0.0,
+                    clock=clock,
+                )
+                lane = 0
+                counts = {0: 0, 1: 0, 2: 0}
+                for scene_index in range(96):
+                    source.status()
+                    label = source.prepare_scene(
+                        scene_index=scene_index,
+                        start_lane=lane,
+                    )
+                    safe_lane = lane + {0: -1, 1: 1, 2: 0}[label]
+                    self.assertIn(safe_lane, {-1, 0, 1})
+                    self.assertTrue(
+                        source.confirm_scene_applied(
+                            scene_index=scene_index,
+                            applied_label_id=label,
+                            start_lane=lane,
+                            safe_lane=safe_lane,
+                            timestamp_monotonic=clock.value,
+                        )
+                    )
+                    counts[label] += 1
+                    if reaches_safe_lane:
+                        lane = safe_lane
+                    clock.value += 5.0
+
+                self.assertEqual(counts, {0: 32, 1: 32, 2: 32})
+
+    def test_wrong_unity_safe_lane_aborts_without_creating_training_label(self) -> None:
+        class _WrongSafeLaneOutlet(_GameOutlet):
+            def push_with_ack(self, command: str) -> dict[str, object]:
+                response = super().push_with_ack(command)
+                if command != "SCENE_STATE":
+                    response["safe_lane"] = 1
+                return response
+
+        clock = _Clock(0.0)
+        source = CuedOnlineLabelSource(
+            ["left"],
+            scene_duration_sec=5.0,
+            start_delay_sec=0.0,
+            boundary_guard_sec=0.0,
+            clock=clock,
+        )
+        decoder = _bare_decoder(source, _WrongSafeLaneOutlet(current_lane=0))
+
+        from unittest import mock
+
+        with mock.patch("decoder.real_time_decoder.time.monotonic", return_value=0.0):
+            decoder._sync_game_scene()
+
+        self.assertTrue(decoder._stop_event.was_set)
+        self.assertIn("safe", decoder._game_disconnect_message.lower())
+        self.assertIsNone(
+            decoder._get_online_label(window_start=0.0, window_end=2.0)
+        )
+
+    def test_old_or_wrong_unity_protocol_aborts_before_scene_command(self) -> None:
+        class _OldProtocolOutlet(_GameOutlet):
+            def push_with_ack(self, command: str) -> dict[str, object]:
+                response = super().push_with_ack(command)
+                response["protocol_version"] = "continuous-scene-v2"
+                return response
+
+        clock = _Clock(0.0)
+        source = CuedOnlineLabelSource(
+            ["right"],
+            scene_duration_sec=5.0,
+            start_delay_sec=0.0,
+            boundary_guard_sec=0.0,
+            clock=clock,
+        )
+        outlet = _OldProtocolOutlet(current_lane=0)
+        decoder = _bare_decoder(source, outlet)
+
+        from unittest import mock
+
+        with mock.patch("decoder.real_time_decoder.time.monotonic", return_value=0.0):
+            decoder._sync_game_scene()
+
+        self.assertEqual(outlet.commands, ["SCENE_STATE"])
+        self.assertTrue(decoder._stop_event.was_set)
+        self.assertEqual(decoder._scene_sent_scene_index, -1)
+        self.assertIsNone(
+            decoder._get_online_label(window_start=0.0, window_end=2.0)
+        )
 
 
 if __name__ == "__main__":

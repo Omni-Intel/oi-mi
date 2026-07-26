@@ -58,7 +58,7 @@ class GameCommandOutlet(Protocol):
 
     def push(self, command: str) -> None: ...
 
-    def push_with_ack(self, command: str) -> None: ...
+    def push_with_ack(self, command: str) -> dict[str, Any]: ...
 
     def close(self) -> None: ...
 
@@ -130,6 +130,8 @@ class RealTimeDecoder:
         self._failed_scene_indices: set[int] = set()
         self._scene_started_at: dict[int, float] = {}
         self._scene_labels: dict[int, int] = {}
+        self._scene_start_lanes: dict[int, int] = {}
+        self._scene_safe_lanes: dict[int, int] = {}
         self._scene_end_recorded: set[int] = set()
         self._timestamp_fallback_warned = False
         self._stop_on_game_disconnect = bool(stop_on_game_disconnect)
@@ -232,6 +234,8 @@ class RealTimeDecoder:
         self._failed_scene_indices.clear()
         self._scene_started_at.clear()
         self._scene_labels.clear()
+        self._scene_start_lanes.clear()
+        self._scene_safe_lanes.clear()
         self._scene_end_recorded.clear()
         self._model_revision_records.clear()
         if record and subject_id:
@@ -655,6 +659,16 @@ class RealTimeDecoder:
                         scene_label=(
                             -1 if online_label is None else int(online_label.label_id)
                         ),
+                        scene_start_lane=getattr(
+                            self,
+                            "_scene_start_lanes",
+                            {},
+                        ).get(scene_index, -9),
+                        scene_safe_lane=getattr(
+                            self,
+                            "_scene_safe_lanes",
+                            {},
+                        ).get(scene_index, -9),
                         scene_failed=scene_index in self._failed_scene_indices,
                         mapped_command=game_command or "STOP",
                         transport_command=self._last_game_transport_command or "",
@@ -1057,23 +1071,60 @@ class RealTimeDecoder:
         return None
 
     def _sync_game_scene(self) -> None:
-        """Send the current label as Unity's obstacle-layout source of truth."""
+        """Negotiate a reachable relative-action scene with authoritative Unity truth."""
 
         self._consume_game_scene_events()
         status = self._online_label_source_status()
         if not status or status.get("source") != "cued-protocol":
             return
-        if status.get("protocol_mode") != "continuous-scene":
+        if status.get("protocol_mode") != "continuous-relative-action":
             return
         if status.get("phase") == "preparing":
             return
         scene_index = int(status.get("scene_index", -1))
-        label_id = int(status.get("label_id", -1))
+        label_value = status.get("label_id")
+        label_id = -1 if label_value is None else int(label_value)
         if (
             scene_index == getattr(self, "_scene_sent_scene_index", -1)
             and label_id == getattr(self, "_scene_sent_label_id", None)
         ):
             return
+
+        if label_id < 0:
+            state_ack = self._push_game_scene_transport_command("SCENE_STATE")
+            if state_ack is None:
+                self._scene_sync_error = (
+                    self._last_game_transport_error
+                    or "Unity lane-state query failed"
+                )
+                return
+            try:
+                self._validate_unity_protocol_ack(
+                    state_ack,
+                    expected_ack="SCENE_STATE",
+                    expected_scene_number=scene_index + 1,
+                )
+                start_lane = int(state_ack["current_lane"])
+                prepare_scene = getattr(
+                    self._online_label_source,
+                    "prepare_scene",
+                    None,
+                )
+                if not callable(prepare_scene):
+                    raise RuntimeError(
+                        "Relative-action label source does not support scene preparation."
+                    )
+                label_id = int(
+                    prepare_scene(
+                        scene_index=scene_index,
+                        start_lane=start_lane,
+                    )
+                )
+                status = self._online_label_source_status() or {}
+            except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+                self._abort_scene_protocol(f"invalid Unity lane-state ACK: {exc}")
+                return
+
         command_by_label = {0: "SCENE_LEFT", 1: "SCENE_RIGHT", 2: "SCENE_IDLE"}
         command = command_by_label.get(label_id)
         if command is None:
@@ -1091,7 +1142,27 @@ class RealTimeDecoder:
                 ),
                 reason="fixed_boundary",
             )
-        if self._push_game_scene_transport_command(command):
+        scene_ack = self._push_game_scene_transport_command(command)
+        if scene_ack is not None:
+            try:
+                self._validate_unity_protocol_ack(
+                    scene_ack,
+                    expected_ack=command,
+                    expected_scene_number=scene_index + 1,
+                )
+                applied_label_name = str(scene_ack["applied_label"]).strip().lower()
+                applied_label_id = {"left": 0, "right": 1, "idle": 2}[
+                    applied_label_name
+                ]
+                start_lane = int(scene_ack["start_lane"])
+                safe_lane = int(scene_ack["safe_lane"])
+                if applied_label_id != label_id:
+                    raise ValueError(
+                        f"requested label {label_id}, Unity applied {applied_label_id}"
+                    )
+            except (KeyError, TypeError, ValueError) as exc:
+                self._abort_scene_protocol(f"invalid Unity scene ACK: {exc}")
+                return
             confirm_scene = getattr(
                 self._online_label_source,
                 "confirm_scene_applied",
@@ -1099,10 +1170,15 @@ class RealTimeDecoder:
             )
             if callable(confirm_scene) and not confirm_scene(
                 scene_index=scene_index,
+                applied_label_id=applied_label_id,
+                start_lane=start_lane,
+                safe_lane=safe_lane,
                 timestamp_monotonic=self._last_game_transport_sent_at,
             ):
-                self._scene_sync_error = (
-                    f"Unity ACK arrived after scene {scene_index + 1} was no longer active"
+                self._abort_scene_protocol(
+                    "Unity scene ACK did not match the prepared relative-action truth "
+                    f"for scene {scene_index + 1}: label={applied_label_name}, "
+                    f"start_lane={start_lane}, safe_lane={safe_lane}"
                 )
                 return
             self._scene_sent_scene_index = scene_index
@@ -1111,8 +1187,14 @@ class RealTimeDecoder:
                 self._scene_started_at = {}
             if not hasattr(self, "_scene_labels"):
                 self._scene_labels = {}
+            if not hasattr(self, "_scene_start_lanes"):
+                self._scene_start_lanes = {}
+            if not hasattr(self, "_scene_safe_lanes"):
+                self._scene_safe_lanes = {}
             self._scene_started_at[scene_index] = self._last_game_transport_sent_at
             self._scene_labels[scene_index] = label_id
+            self._scene_start_lanes[scene_index] = start_lane
+            self._scene_safe_lanes[scene_index] = safe_lane
             writer = getattr(self, "_writer", None)
             if writer is not None:
                 writer.append_event(
@@ -1124,6 +1206,10 @@ class RealTimeDecoder:
                     label_name=status.get("label_name"),
                     unity_command=command,
                     ack_confirmed=True,
+                    protocol_version="continuous-scene-v3-relative",
+                    start_lane=start_lane,
+                    safe_lane=safe_lane,
+                    applied_label=applied_label_name,
                     planned_duration_sec=float(
                         self._online_label_source_metadata().get(
                             "scene_duration_sec",
@@ -1195,26 +1281,63 @@ class RealTimeDecoder:
                     "保持当前标签，到固定 Scene 边界再进入下一 Scene[/bold yellow]"
                 )
 
-    def _push_game_scene_transport_command(self, command: str) -> bool:
+    @staticmethod
+    def _validate_unity_protocol_ack(
+        response: dict[str, Any],
+        *,
+        expected_ack: str,
+        expected_scene_number: int,
+    ) -> None:
+        if str(response.get("ack", "")).strip().upper() != expected_ack:
+            raise ValueError(f"expected ACK {expected_ack}, received {response!r}")
+        if (
+            str(response.get("protocol_version", "")).strip()
+            != "continuous-scene-v3-relative"
+        ):
+            raise ValueError(
+                "Unity runtime does not implement continuous-scene-v3-relative"
+            )
+        if int(response.get("scene_number", -1)) != int(expected_scene_number):
+            raise ValueError(
+                f"expected scene {expected_scene_number}, "
+                f"received {response.get('scene_number')}"
+            )
+
+    def _abort_scene_protocol(self, message: str) -> None:
+        self._scene_sync_error = message
+        self._last_game_transport_error = message
+        LOGGER.error("Unity relative-action scene protocol failed: %s", message)
+        if self._stop_on_game_disconnect:
+            self._game_disconnect_message = message
+            self._stop_event.set()
+
+    def _push_game_scene_transport_command(
+        self,
+        command: str,
+    ) -> dict[str, Any] | None:
         if self._game_command_outlet is None:
-            return False
+            return None
         push_with_ack = getattr(self._game_command_outlet, "push_with_ack", None)
         if not callable(push_with_ack):
             self._last_game_transport_error = "AR transport does not support Unity scene ACK"
-            return False
+            return None
         try:
-            push_with_ack(command)
+            response = push_with_ack(command)
+            if not isinstance(response, dict):
+                raise RuntimeError(
+                    f"Unity returned no structured ACK for {command}"
+                )
             self._last_game_transport_command = command
             self._last_game_transport_error = None
             self._last_game_transport_sent_at = time.monotonic()
-            return True
+            return response
         except Exception as exc:  # noqa: BLE001
             self._last_game_transport_error = str(exc)
             LOGGER.warning("Failed to synchronize Unity scene '%s': %s", command, exc)
             if self._stop_on_game_disconnect:
                 self._game_disconnect_message = f"Unity scene synchronization failed: {exc}"
                 self._stop_event.set()
-            return False
+            return None
 
     def _push_game_command(self, command: str | None) -> None:
         if self._game_command_outlet is None:
@@ -1299,6 +1422,8 @@ class RealTimeDecoder:
                 scene_index=index,
                 scene_number=index + 1,
                 label_id=getattr(self, "_scene_labels", {}).get(index, -1),
+                start_lane=getattr(self, "_scene_start_lanes", {}).get(index),
+                safe_lane=getattr(self, "_scene_safe_lanes", {}).get(index),
                 outcome=str(outcome),
                 reason=str(reason),
                 collision_recorded=index in failed_scene_indices,
@@ -1513,10 +1638,12 @@ class RealTimeDecoder:
             return None
         result = dict(payload)
         if result.get("source") == "cued-protocol":
+            label_value = result.get("label_id")
             result["scene_synced"] = (
                 int(result.get("scene_index", -1))
                 == getattr(self, "_scene_sent_scene_index", -1)
-                and int(result.get("label_id", -1)) == getattr(self, "_scene_sent_label_id", None)
+                and label_value is not None
+                and int(label_value) == getattr(self, "_scene_sent_label_id", None)
             )
             result["scene_sync_error"] = getattr(self, "_scene_sync_error", None)
         return result

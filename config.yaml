@@ -6,7 +6,7 @@ sfreq: 200
 n_classes: 3
 window_sec: 2.0
 step_sec: 0.5
-confidence_threshold: 0.7
+confidence_threshold: 0.5
 mc_dropout_passes: 8
 calibration_epochs: 50
 batch_size: 32
@@ -119,7 +119,7 @@ online_adaptation:
     update_batch_size: 16
     epochs: 3
     update_stride: 64
-    history_threshold: 64
+    history_threshold: 320
     recent_samples: 320
     weight_decay: 5.0e-2
     mask_ratio: 0.3
@@ -139,6 +139,8 @@ online_adaptation:
     enabled: true
     # The car never enters a hidden STOP phase.  Unity holds one obstacle
     # layout for this epoch while decoding/control continues every step.
+    # LEFT/RIGHT are one-lane actions relative to Unity's actual lane at scene
+    # start; IDLE keeps that lane. Unity ACK is the authoritative truth.
     # Every scene keeps the same label/layout for exactly 5 s. A collision only
     # records failure; the next scene still starts at the fixed 5 s boundary.
     scene_duration_sec: 5.0

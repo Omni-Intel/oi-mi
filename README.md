@@ -210,7 +210,7 @@ python download_datasets.py --dataset BNCI2014_001 --subject 1 --data-dir ./data
 
 ### NeuroOnline 算法复现与小车在线应用
 
-`config.yaml` 中将 `online_adaptation.strategy` 设为 `neuroonline` 后，实时解码采用严格的先预测、后更新流程。当前小车实验配置在累计 64 个有标签窗口后开始第一次更新，之后每新增 64 个有标签窗口更新一次；训练数据逐步增长到 320 个，此后始终使用最近 320 个窗口。每个样本在进入缓冲区时生成固定的时间遮挡和频率遮挡视图，更新目标为三个视图的分类损失加两项表示一致性损失，并联合更新 backbone、CRM 和分类头。
+`config.yaml` 中将 `online_adaptation.strategy` 设为 `neuroonline` 后，实时解码采用严格的先预测、后更新流程。当前小车实验配置按 NeuroOnline 发布源码先累计 320 个有标签窗口完成第一次更新，之后每新增 64 个有标签窗口更新一次，并始终使用最近 320 个窗口。每个样本在进入缓冲区时生成固定的时间遮挡和频率遮挡视图，更新目标为三个视图的分类损失加两项表示一致性损失，并联合更新 backbone、CRM 和分类头。
 
 该模式仅支持 PyTorch 模型，不支持 `riemann-mdm`。CRM 以恒等门控初始化；更新后的 backbone 保存到原模型文件，CRM 状态保存到同目录的 `<model>.neuroonline.pt` sidecar 文件。将策略改回 `periodic_head` 可继续使用原有的十分钟候选分类头更新流程。
 
@@ -246,7 +246,9 @@ python download_datasets.py --dataset BNCI2014_001 --subject 1 --data-dir ./data
 
 只有输出 `"ok": true`、`integrity.status=complete`、`dropped_records=0` 且博瑞康原始文件编号对应时，才应将该会话纳入论文统计。
 
-正式小车实验启用 `online_adaptation.cued_labels` 后采用连续统一场景协议。每个 scene epoch 只有一个真值：`LEFT` 表示左路为空、`RIGHT` 表示右路为空、`IDLE` 表示小车当前道路为空；Unity 会在同一帧、同一前向距离给另外两条路各布置一辆障碍车，并在小车 HUD 显示空路。碰撞只会炸掉被撞的障碍车，另一条路的障碍保持原位；Unity 上报 `SCENE_FAILED` 后，Python 只记录本 Scene 失败，不提前切换标签或障碍布局，到固定的 5 秒边界才同步下一 Scene。模型每 `step_sec` 持续预测并控制车辆，不再存在 fixation、cue、ITI 或面向被试的隐藏 `STOP`。正式 Scene 时长固定为 `5.0` 秒，Unity 按相对速度 `(6.0 - 3.2) m/s` 将障碍放在约 `14.0 m` 前方：走错车道会因车身碰撞半径在约 4.7 秒判定失败，但剩余约 0.3 秒仍属于同一 Scene；走对空路则在第 5 秒通过障碍横截面并判定成功。在线训练与校准采用相同的有效控制区间，只接受 Scene 内 `0.5-4.5` 秒范围中完整的 EEG 窗口。Python 收到 Unity 对 `SCENE_LEFT/RIGHT/IDLE` 的 ACK 后，才以 ACK 接收时刻作为该 Scene 的真实起点；跨越 ACK 或 5 秒切换边界的窗口均标为无标签。
+正式小车实验启用 `online_adaptation.cued_labels` 后采用 `continuous-scene-v3-relative` 连续相对动作协议。每个 Scene 开始前，Python 先用 `SCENE_STATE` 查询 Unity 中小车的实际车道；`LEFT` 表示从该车道向左移动一条车道，`RIGHT` 表示向右移动一条车道，`IDLE` 表示保持当前车道。边界处不可执行的向外动作会被调度器跳过，绝不会静默改成另一类。Unity 根据相对动作计算唯一空车道，在同一帧、同一前向距离给另外两条路各布置一辆障碍车，并返回包含 `scene_number/start_lane/safe_lane/applied_label` 的结构化 ACK。Python 验证四项完全一致后才产生 EEG 真值标签；因此同一绝对空车道在小车已经到达时是 `IDLE`，小车避障失败仍留在旁边时则继续是相应的 `LEFT` 或 `RIGHT`。
+
+碰撞只会炸掉被撞的障碍车，另一条路的障碍保持原位；Unity 上报 `SCENE_FAILED` 后，Python 只记录本 Scene 失败，不提前切换标签或障碍布局，到固定的 5 秒边界才同步下一 Scene。模型每 `step_sec` 持续预测并控制车辆，不再存在 fixation、cue、ITI 或面向被试的隐藏停止阶段。正式 Scene 时长固定为 `5.0` 秒，Unity 按相对速度 `(6.0 - 3.2) m/s` 将障碍放在约 `14.0 m` 前方：走错车道会因车身碰撞半径在约 4.7 秒判定失败，但剩余约 0.3 秒仍属于同一 Scene；走对空路则在第 5 秒通过障碍横截面并判定成功。在线训练与校准采用相同的有效控制区间，只接受 Scene 内 `0.5-4.5` 秒范围中完整的 EEG 窗口。跨越 ACK 或 5 秒切换边界的窗口均标为无标签。`events.jsonl` 和逐窗 NPZ 同时保存起始车道与空车道，保证标签可审计。
 
 Neuracle/JellyFish 原始数据以 `250 Hz` 转发。校准连续数据保留 250 Hz 源时间轴，切出完整源窗口后做带抗混叠滤波的 `250→200 Hz` 降采样；实时解码同样先取得 500 点的 2 秒源窗口，再降为模型使用的 400 点。后续预处理、模型输入和 NeuroOnline 更新统一使用 `200 Hz`。实时窗口不再把 `get_chunk()` 返回时刻当作脑电终点，而是利用 JellyFish 数据包的源时间戳，将样本时间映射到 Python 的单调时钟后再与 Unity Scene 对齐。`device.neuracle_transport_delay_sec` 用于补偿经 Trigger/回环实验测得的固定采集链路延迟；未测量前保持 `0.0`，系统仍会利用源时间戳消除排队和轮询抖动。
 
@@ -255,7 +257,7 @@ Neuracle/JellyFish 原始数据以 `250 Hz` 转发。校准连续数据保留 25
 200 Hz、2秒窗口对应模型输入长度为400点。旧的250 Hz/500点模型权重和 CRM sidecar
 不能继续使用；切换采样率后必须重新完成正式校准。
 
-连续模式没有“大轮完成”或固定 trial 停止点，GUI 显示累计 Scene、当前空路和 Unity 同步状态，NeuroOnline 只按累计有效窗口触发。`balance_pool_per_class: 32` 仅用于内部生成可复现的类别平衡场景池，不会清空缓存、重置计数或停止实验。运行持续到操作员切换页面、关闭 Unity 或停止 GUI。真实设备实验必须保持 `online_adaptation.simulation.enabled: false`。
+连续模式没有“大轮完成”或固定 trial 停止点，GUI 显示累计 Scene、相对动作真值、起始车道→空车道和 Unity 同步状态，NeuroOnline 只按累计有效窗口触发。`balance_pool_per_class: 32` 用于生成可复现的类别平衡候选池；若候选动作在边界车道不可执行，会保留到后续可执行 Scene，而不会伪造标签。运行持续到操作员切换页面、关闭 Unity 或停止 GUI。真实设备实验必须保持 `online_adaptation.simulation.enabled: false`。
 
 ## 各模式 EEG 保存逻辑
 
@@ -378,7 +380,7 @@ sfreq: 200
 n_classes: 3
 window_sec: 2.0
 step_sec: 0.5
-confidence_threshold: 0.7
+confidence_threshold: 0.5
 mc_dropout_passes: 8
 calibration_epochs: 50
 batch_size: 32

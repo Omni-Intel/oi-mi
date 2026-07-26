@@ -37,6 +37,8 @@ class RecordItem:
     window_end_unix: float = float("nan")
     scene_index: int = -1
     scene_label: int = -1
+    scene_start_lane: int = -9
+    scene_safe_lane: int = -9
     scene_failed: bool = False
     mapped_command: str = ""
     transport_command: str = ""
@@ -138,6 +140,8 @@ class StreamWriter:
         window_end_monotonic: float = float("nan"),
         scene_index: int = -1,
         scene_label: int = -1,
+        scene_start_lane: int = -9,
+        scene_safe_lane: int = -9,
         scene_failed: bool = False,
         mapped_command: str = "",
         transport_command: str = "",
@@ -180,6 +184,8 @@ class StreamWriter:
             window_end_unix=self._monotonic_to_unix(end_mono),
             scene_index=int(scene_index),
             scene_label=int(scene_label),
+            scene_start_lane=int(scene_start_lane),
+            scene_safe_lane=int(scene_safe_lane),
             scene_failed=bool(scene_failed),
             mapped_command=str(mapped_command),
             transport_command=str(transport_command),
@@ -385,6 +391,14 @@ class StreamWriter:
         )
         scene_indices = np.asarray([item.scene_index for item in buffer], dtype=np.int64)
         scene_labels = np.asarray([item.scene_label for item in buffer], dtype=np.int64)
+        scene_start_lanes = np.asarray(
+            [item.scene_start_lane for item in buffer],
+            dtype=np.int8,
+        )
+        scene_safe_lanes = np.asarray(
+            [item.scene_safe_lane for item in buffer],
+            dtype=np.int8,
+        )
         scene_failed = np.asarray([item.scene_failed for item in buffer], dtype=np.bool_)
         mapped_commands = np.asarray([item.mapped_command for item in buffer], dtype=np.str_)
         transport_commands = np.asarray(
@@ -459,6 +473,8 @@ class StreamWriter:
                 window_end_unix=window_end_unix,
                 scene_indices=scene_indices,
                 scene_labels=scene_labels,
+                scene_start_lanes=scene_start_lanes,
+                scene_safe_lanes=scene_safe_lanes,
                 scene_failed_at_prediction=scene_failed,
                 mapped_commands=mapped_commands,
                 transport_commands=transport_commands,

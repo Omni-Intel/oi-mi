@@ -74,6 +74,8 @@ class StreamWriterTelemetryTests(unittest.TestCase):
                     window_end_monotonic=12.5 + (index * 5.0),
                     scene_index=index,
                     scene_label=truth,
+                    scene_start_lane=(-1, 0, 1)[index],
+                    scene_safe_lane=(0, 0, 0)[index],
                     mapped_command="STOP" if operational < 0 else str(operational),
                     quality_reasons=(),
                     quality_bad_channel_indices=(),
@@ -90,6 +92,8 @@ class StreamWriterTelemetryTests(unittest.TestCase):
             with np.load(root / "chunks" / "chunk_000000.npz") as payload:
                 self.assertEqual(payload["probabilities"].shape, (3, 3))
                 self.assertEqual(payload["scene_indices"].tolist(), [0, 1, 2])
+                self.assertEqual(payload["scene_start_lanes"].tolist(), [-1, 0, 1])
+                self.assertEqual(payload["scene_safe_lanes"].tolist(), [0, 0, 0])
                 self.assertTrue(np.all(np.isfinite(payload["window_start_monotonic"])))
                 self.assertEqual(payload["mapped_commands"].tolist(), ["0", "STOP", "1"])
 

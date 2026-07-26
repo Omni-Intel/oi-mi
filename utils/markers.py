@@ -119,8 +119,8 @@ class ArTcpCommandSender:
                     f"Failed to send AR command to {self._host}:{self._port}: {exc}"
                 ) from exc
 
-    def push_with_ack(self, command: str) -> None:
-        """Send a scene command and require Unity to confirm it was applied."""
+    def push_with_ack(self, command: str) -> dict[str, Any]:
+        """Send a scene command and return Unity's structured confirmation."""
 
         payload = _encode_command_payload(command)
         with self._lock:
@@ -130,8 +130,9 @@ class ArTcpCommandSender:
                 self._sock.sendall(payload)
                 deadline = time.monotonic() + self._timeout_sec
                 while time.monotonic() < deadline:
-                    if self._drain_messages_locked(expected_ack=command):
-                        return
+                    response = self._drain_messages_locked(expected_ack=command)
+                    if response is not None:
+                        return response
                     chunk = self._sock.recv(4096)
                     if not chunk:
                         raise OSError("Unity closed the connection before scene ACK")
@@ -178,12 +179,16 @@ class ArTcpCommandSender:
         )
         self._sock.settimeout(self._timeout_sec)
 
-    def _drain_messages_locked(self, *, expected_ack: str | None = None) -> bool:
-        ack_received = False
+    def _drain_messages_locked(
+        self,
+        *,
+        expected_ack: str | None = None,
+    ) -> dict[str, Any] | None:
+        ack_response: dict[str, Any] | None = None
         while True:
             line_break = self._receive_buffer.find(b"\n")
             if line_break < 0:
-                return ack_received
+                return ack_response
             raw = bytes(self._receive_buffer[:line_break]).strip()
             del self._receive_buffer[: line_break + 1]
             if not raw:
@@ -193,9 +198,14 @@ class ArTcpCommandSender:
                 self._events.append(response)
             if (
                 expected_ack is not None
+                and str(response.get("nack", "")).upper() == expected_ack.upper()
+            ):
+                raise ValueError(f"Unity rejected {expected_ack}: {response}")
+            if (
+                expected_ack is not None
                 and str(response.get("ack", "")).upper() == expected_ack.upper()
             ):
-                ack_received = True
+                ack_response = response
 
     def _close_locked(self) -> None:
         if self._sock is None:

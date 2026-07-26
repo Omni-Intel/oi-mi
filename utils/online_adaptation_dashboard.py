@@ -14,24 +14,34 @@ def render_online_cue_panel(status: dict[str, Any] | None, *, ui: Any) -> None:
     if not isinstance(status, dict) or status.get("source") != "cued-protocol":
         return
     phase = str(status.get("phase", "preparing"))
-    label_name = str(status.get("label_name", "idle"))
+    raw_label_name = status.get("label_name")
+    label_name = (
+        "pending"
+        if raw_label_name is None
+        else str(raw_label_name).strip().lower()
+    )
     remaining = float(status.get("phase_remaining_sec", 0.0))
     phase_text = {
         "preparing": "准备",
         "control": "运动想象 / 小车控制",
     }.get(phase, phase)
     if phase == "control":
-        prompt = f"{_CUE_SYMBOLS.get(label_name, '○')}  {label_name.upper()}"
+        prompt = (
+            "·"
+            if label_name == "pending"
+            else f"{_CUE_SYMBOLS.get(label_name, '○')}  {label_name.upper()}"
+        )
     else:
         prompt = "·"
     ui.markdown("### 连续统一场景")
-    columns = ui.columns(6)
+    columns = ui.columns(7)
     columns[0].metric("阶段", phase_text)
     columns[1].metric("累计 Scene", int(status.get("scene_number", 0)))
-    columns[2].metric("空路", label_name.upper())
-    columns[3].metric("Unity 同步", "已同步" if status.get("scene_synced") else "等待")
-    columns[4].metric("场景剩余", f"{remaining:.1f}s")
-    columns[5].metric("本Scene结果", "已失败" if status.get("scene_failed") else "进行中")
+    columns[2].metric("相对真值", label_name.upper())
+    columns[3].metric("起始→空路", _lane_transition(status))
+    columns[4].metric("Unity 同步", "已同步" if status.get("scene_synced") else "等待")
+    columns[5].metric("场景剩余", f"{remaining:.1f}s")
+    columns[6].metric("本Scene结果", "已失败" if status.get("scene_failed") else "进行中")
     sync_error = status.get("scene_sync_error")
     if sync_error:
         ui.error(f"Unity 场景同步失败：{sync_error}")
@@ -47,10 +57,20 @@ def render_online_cue_panel(status: dict[str, Any] | None, *, ui: Any) -> None:
             f"固定延迟补偿 {compensation_ms:.1f} ms。"
         )
     ui.caption(
-        "模型始终持续控制；只有完整位于 Unity ACK 场景边界保护区内的 EEG 窗口"
-        "参与训练和准确率。"
+        "LEFT/RIGHT/IDLE 均以 Scene 开始时小车实际车道为参照；"
+        "只有 Unity ACK 同时确认起始车道、空路和相对动作后才产生训练标签。"
     )
     ui.markdown(f"<div style='text-align:center;font-size:5rem'>{prompt}</div>", unsafe_allow_html=True)
+
+
+def _lane_transition(status: dict[str, Any]) -> str:
+    names = {-1: "左", 0: "中", 1: "右"}
+    try:
+        start_lane = int(status.get("start_lane"))
+        safe_lane = int(status.get("safe_lane"))
+    except (TypeError, ValueError):
+        return "等待 ACK"
+    return f"{names.get(start_lane, '?')}→{names.get(safe_lane, '?')}"
 
 
 def render_online_adaptation_panel(adaptation: dict[str, Any] | None, *, ui: Any) -> None:
