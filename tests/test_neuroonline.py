@@ -43,6 +43,14 @@ class _TinyDecoder(nn.Module):
 
 
 class NeuroOnlineTests(unittest.TestCase):
+    def test_formal_defaults_update_from_latest_64_primary_windows(self) -> None:
+        config = NeuroOnlineConfig.from_mapping(
+            {"enabled": True, "strategy": "neuroonline"}
+        )
+        self.assertEqual(config.history_threshold, 64)
+        self.assertEqual(config.update_stride, 64)
+        self.assertEqual(config.recent_samples, 64)
+
     def setUp(self) -> None:
         torch.manual_seed(7)
         np.random.seed(7)
@@ -393,6 +401,46 @@ class NeuroOnlineTests(unittest.TestCase):
         allow_update.set()
         self.assertTrue(adapter.wait_for_idle(timeout_sec=2.0))
         self.assertEqual(adapter.status()["update_count"], 1)
+
+    def test_stream_rejects_duplicate_event_and_non_increasing_timestamp(self) -> None:
+        adapter = NeuroOnlineStreamAdapter(
+            config=NeuroOnlineConfig(
+                enabled=True,
+                history_threshold=64,
+                update_stride=64,
+                recent_samples=64,
+            ),
+            update_callback=lambda *_arrays: {"updated": 1.0},
+        )
+        window = np.zeros((2, 16), dtype=np.float32)
+        self.assertTrue(
+            adapter.add_window(
+                window,
+                0,
+                event_id="scene-000001-primary",
+                window_end_monotonic=10.0,
+            )
+        )
+        self.assertFalse(
+            adapter.add_window(
+                window,
+                0,
+                event_id="scene-000001-primary",
+                window_end_monotonic=10.5,
+            )
+        )
+        self.assertFalse(
+            adapter.add_window(
+                window,
+                1,
+                event_id="scene-000002-primary",
+                window_end_monotonic=9.5,
+            )
+        )
+        status = adapter.status()
+        self.assertEqual(status["seen_labeled_windows"], 1)
+        self.assertEqual(status["duplicate_windows_rejected"], 1)
+        self.assertEqual(status["stale_windows_rejected"], 1)
 
 
 if __name__ == "__main__":

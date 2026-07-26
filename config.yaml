@@ -119,8 +119,10 @@ online_adaptation:
     update_batch_size: 16
     epochs: 3
     update_stride: 64
-    history_threshold: 320
-    recent_samples: 320
+    # One causally clean primary decision window per Scene.  The first and
+    # every later background update use the latest 64 unique primary windows.
+    history_threshold: 64
+    recent_samples: 64
     weight_decay: 5.0e-2
     mask_ratio: 0.3
     consistency_weight: 0.1
@@ -168,14 +170,16 @@ online_adaptation:
     settle_sec: 2.0
   cued_labels:
     enabled: true
-    # The car never enters a hidden STOP phase.  Unity holds one obstacle
-    # layout for this epoch while decoding/control continues every step.
+    # Unity holds one obstacle layout for this epoch. Forward motion and
+    # decoding continue, but lateral commands are causally gated until the
+    # first clean current-Scene decision window has completed.
     # Unity ACK fixes the safe lane for five seconds. LEFT/RIGHT/IDLE truth is
     # recalculated whenever Unity confirms that the car has settled in a lane.
     # A collision only records failure; the next scene still starts at the
     # fixed 5 s boundary.
     scene_duration_sec: 5.0
-    # Match calibration: only the 0.5-4.5 s control interval enters training.
+    # The primary decision window is the first complete 2 s window beginning
+    # at or after 0.5 s. Later valid windows are recorded but do not adapt.
     boundary_guard_sec: 0.5
     # Windows touching the 0.5 s before or after an actual completed lane
     # transition remain decoded and recorded, but receive no training label.

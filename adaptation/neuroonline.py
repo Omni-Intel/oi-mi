@@ -41,8 +41,8 @@ class NeuroOnlineConfig:
     update_batch_size: int = 16
     epochs: int = 3
     update_stride: int = 64
-    history_threshold: int = 320
-    recent_samples: int = 320
+    history_threshold: int = 64
+    recent_samples: int = 64
     weight_decay: float = 5e-2
     mask_ratio: float = 0.3
     consistency_weight: float = 0.1
@@ -66,8 +66,8 @@ class NeuroOnlineConfig:
             update_batch_size=max(int(data.get("update_batch_size", 16)), 1),
             epochs=max(int(data.get("epochs", 3)), 1),
             update_stride=max(int(data.get("update_stride", 64)), 1),
-            history_threshold=max(int(data.get("history_threshold", 320)), 1),
-            recent_samples=max(int(data.get("recent_samples", 320)), 1),
+            history_threshold=max(int(data.get("history_threshold", 64)), 1),
+            recent_samples=max(int(data.get("recent_samples", 64)), 1),
             weight_decay=max(float(data.get("weight_decay", 5e-2)), 0.0),
             mask_ratio=min(max(float(data.get("mask_ratio", 0.3)), 0.0), 1.0),
             consistency_weight=max(float(data.get("consistency_weight", 0.1)), 0.0),
@@ -702,6 +702,10 @@ class NeuroOnlineStreamAdapter:
         self._state = "collecting"
         self._last_result: dict[str, Any] | None = None
         self._history: list[dict[str, Any]] = []
+        self._accepted_event_ids: set[str] = set()
+        self._last_window_end_monotonic: float | None = None
+        self._duplicate_windows_rejected = 0
+        self._stale_windows_rejected = 0
 
     def add_window(
         self,
@@ -713,26 +717,54 @@ class NeuroOnlineStreamAdapter:
         probabilities: np.ndarray | None = None,
         event_id: str = "",
         model_revision: int = 0,
-    ) -> None:
+        window_end_monotonic: float | None = None,
+    ) -> bool:
         del probabilities
         sample = torch.as_tensor(np.asarray(window, dtype=np.float32)).unsqueeze(0)
-        time_view = _time_mask(sample, self.config.mask_ratio, self._generator).squeeze(0).numpy()
-        frequency_view = _frequency_mask(
-            sample,
-            self.config.mask_ratio,
-            self._generator,
-        ).squeeze(0).numpy()
         with self._lock:
             if self._closed:
-                return
+                return False
+            stable_event_id = str(event_id).strip()
+            if stable_event_id and stable_event_id in self._accepted_event_ids:
+                self._duplicate_windows_rejected += 1
+                return False
+            end_timestamp = (
+                None
+                if window_end_monotonic is None
+                else float(window_end_monotonic)
+            )
+            if end_timestamp is not None:
+                if not np.isfinite(end_timestamp):
+                    self._stale_windows_rejected += 1
+                    return False
+                if (
+                    self._last_window_end_monotonic is not None
+                    and end_timestamp <= self._last_window_end_monotonic
+                ):
+                    self._stale_windows_rejected += 1
+                    return False
+            time_view = _time_mask(
+                sample,
+                self.config.mask_ratio,
+                self._generator,
+            ).squeeze(0).numpy()
+            frequency_view = _frequency_mask(
+                sample,
+                self.config.mask_ratio,
+                self._generator,
+            ).squeeze(0).numpy()
             self._original.append(sample.squeeze(0).numpy().copy())
             self._time.append(time_view)
             self._frequency.append(frequency_view)
             self._labels.append(int(label))
             self._seen += 1
             self._window_ids.append(self._seen)
-            self._event_ids.append(str(event_id))
+            self._event_ids.append(stable_event_id)
             self._model_revisions.append(int(model_revision))
+            if stable_event_id:
+                self._accepted_event_ids.add(stable_event_id)
+            if end_timestamp is not None:
+                self._last_window_end_monotonic = end_timestamp
             if (
                 predicted_label is not None
                 and 0 <= int(label) < self._n_classes
@@ -757,12 +789,13 @@ class NeuroOnlineStreamAdapter:
             if not should_update:
                 if self._worker is None:
                     self._state = "collecting"
-                return
+                return True
             if self._worker is not None:
                 self._pending_update = True
                 self._state = "training"
-                return
+                return True
             self._start_update_locked(self._snapshot_locked())
+            return True
 
     def close(self, *, timeout_sec: float = 60.0) -> None:
         with self._lock:
@@ -815,6 +848,8 @@ class NeuroOnlineStreamAdapter:
             "update_count": self._updates,
             "training_in_background": self._worker is not None,
             "pending_update": self._pending_update,
+            "duplicate_windows_rejected": self._duplicate_windows_rejected,
+            "stale_windows_rejected": self._stale_windows_rejected,
             "next_update_step": next_step,
             "samples_until_update": max(next_step - self._seen, 0),
             "progress": min(max(float(progress), 0.0), 1.0),

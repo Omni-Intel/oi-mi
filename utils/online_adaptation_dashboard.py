@@ -34,7 +34,7 @@ def render_online_cue_panel(status: dict[str, Any] | None, *, ui: Any) -> None:
     else:
         prompt = "·"
     ui.markdown("### 连续统一场景")
-    columns = ui.columns(7)
+    columns = ui.columns(8)
     columns[0].metric("阶段", phase_text)
     columns[1].metric("累计 Scene", int(status.get("scene_number", 0)))
     columns[2].metric("相对真值", label_name.upper())
@@ -42,6 +42,16 @@ def render_online_cue_panel(status: dict[str, Any] | None, *, ui: Any) -> None:
     columns[4].metric("Unity 同步", "已同步" if status.get("scene_synced") else "等待")
     columns[5].metric("场景剩余", f"{remaining:.1f}s")
     columns[6].metric("本Scene结果", "已失败" if status.get("scene_failed") else "进行中")
+    columns[7].metric(
+        "横向控制",
+        (
+            "等待 Scene"
+            if phase == "preparing"
+            else "采集主决策窗"
+            if status.get("lateral_control_gate_active")
+            else "已放行"
+        ),
+    )
     sync_error = status.get("scene_sync_error")
     if sync_error:
         ui.error(f"Unity 场景同步失败：{sync_error}")
@@ -58,7 +68,8 @@ def render_online_cue_panel(status: dict[str, Any] | None, *, ui: Any) -> None:
         )
     ui.caption(
         "LEFT/RIGHT/IDLE 均以 Scene 开始时小车实际车道为参照；"
-        "只有 Unity ACK 同时确认起始车道、空路和相对动作后才产生训练标签。"
+        "只有 Unity ACK 同时确认起始车道、空路和相对动作后才产生训练标签；"
+        "每个 Scene 只有首个主决策窗进入 NeuroOnline。"
     )
     ui.markdown(f"<div style='text-align:center;font-size:5rem'>{prompt}</div>", unsafe_allow_html=True)
 
@@ -117,7 +128,7 @@ def _render_neuroonline(adaptation: dict[str, Any], *, ui: Any) -> None:
     top = ui.columns(7)
     top[0].metric("状态", str(adaptation.get("state", "-")))
     top[1].metric("更新次数", int(adaptation.get("update_count", 0)))
-    top[2].metric("缓冲窗口", int(adaptation.get("buffered_windows", 0)))
+    top[2].metric("主决策窗口", int(adaptation.get("buffered_windows", 0)))
     top[3].metric("原始 Acc.", f"{float(prequential.get('accuracy', 0.0)):.3f}")
     top[4].metric("原始 Bal.Acc.", f"{float(prequential.get('balanced_accuracy', 0.0)):.3f}")
     top[5].metric("控制覆盖率", f"{float(operational.get('coverage', 0.0)):.3f}")
@@ -129,10 +140,17 @@ def _render_neuroonline(adaptation: dict[str, Any], *, ui: Any) -> None:
     progress = float(adaptation.get("progress", 0.0))
     ui.progress(min(max(progress, 0.0), 1.0))
     ui.caption(
-        f"累计有标签窗口 {int(adaptation.get('seen_labeled_windows', 0))} · "
+        f"累计主决策窗口 {int(adaptation.get('seen_labeled_windows', 0))} · "
         f"距下次更新 {int(adaptation.get('samples_until_update', 0))} 个样本 · "
         f"下一触发步 {int(adaptation.get('next_update_step', 0))}"
     )
+    duplicate_rejections = int(adaptation.get("duplicate_windows_rejected", 0))
+    stale_rejections = int(adaptation.get("stale_windows_rejected", 0))
+    if duplicate_rejections or stale_rejections:
+        ui.warning(
+            "已阻止重复/过期窗口进入在线训练："
+            f"重复 {duplicate_rejections}，时间戳非递增 {stale_rejections}。"
+        )
 
     labels = _labels_for(adaptation, prequential)
     detail_left, detail_right = ui.columns(2)
@@ -194,7 +212,7 @@ def _class_rows(
     return [
         {
             "类别": label,
-            "缓冲窗口": int(counts.get(str(index), 0)),
+            "主决策窗口": int(counts.get(str(index), 0)),
             "在线准确率": float(per_class.get(str(index), 0.0)),
         }
         for index, label in enumerate(labels)

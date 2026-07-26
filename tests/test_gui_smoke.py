@@ -25,7 +25,7 @@ class GuiSmokeTests(unittest.TestCase):
         metrics = {metric.label: metric.value for metric in app.metric}
         self.assertEqual(metrics.get("状态"), "等待启动")
         self.assertEqual(metrics.get("更新次数"), "0")
-        self.assertEqual(metrics.get("缓冲窗口"), "0")
+        self.assertEqual(metrics.get("主决策窗口"), "0")
 
         app.button(key="nav_btn_校准").click().run()
         self.assertEqual(list(app.exception), [])

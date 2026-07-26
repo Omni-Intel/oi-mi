@@ -194,6 +194,7 @@ class ArTcpCommandSender:
             if not raw:
                 continue
             response = json.loads(raw.decode("utf-8"))
+            response.setdefault("_received_at_monotonic", time.monotonic())
             if str(response.get("event", "")).strip():
                 self._events.append(response)
             if (

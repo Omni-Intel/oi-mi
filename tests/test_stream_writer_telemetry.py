@@ -25,6 +25,13 @@ class StreamWriterTelemetryTests(unittest.TestCase):
                 raw_pred=1,
                 model_revision=2,
                 label_event_id="cue-000001",
+                training_role="primary_decision",
+                adaptation_eligible=True,
+                adaptation_committed=False,
+                control_gate_active=False,
+                scene_current_lane=0,
+                instruction_label=1,
+                vehicle_required_action=1,
                 quality_accepted=False,
                 quality_peak_abs_uv=420.0,
                 quality_clip_fraction=0.02,
@@ -37,6 +44,12 @@ class StreamWriterTelemetryTests(unittest.TestCase):
                 self.assertEqual(payload["predictions_raw"].tolist(), [1])
                 self.assertEqual(payload["model_revisions"].tolist(), [2])
                 self.assertEqual(payload["label_event_ids"].tolist(), ["cue-000001"])
+                self.assertEqual(payload["training_roles"].tolist(), ["primary_decision"])
+                self.assertEqual(payload["adaptation_eligible"].tolist(), [True])
+                self.assertEqual(payload["adaptation_committed"].tolist(), [False])
+                self.assertEqual(payload["scene_current_lanes"].tolist(), [0])
+                self.assertEqual(payload["instruction_labels"].tolist(), [1])
+                self.assertEqual(payload["vehicle_required_actions"].tolist(), [1])
                 self.assertEqual(payload["quality_accepted"].tolist(), [False])
                 self.assertEqual(payload["quality_peak_abs_uv"].tolist(), [420.0])
             manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
@@ -76,6 +89,11 @@ class StreamWriterTelemetryTests(unittest.TestCase):
                     scene_label=truth,
                     scene_start_lane=(-1, 0, 1)[index],
                     scene_safe_lane=(0, 0, 0)[index],
+                    instruction_label=truth,
+                    vehicle_required_action=truth,
+                    training_role="primary_decision",
+                    adaptation_eligible=True,
+                    adaptation_committed=True,
                     mapped_command="STOP" if operational < 0 else str(operational),
                     quality_reasons=(),
                     quality_bad_channel_indices=(),
@@ -106,6 +124,12 @@ class StreamWriterTelemetryTests(unittest.TestCase):
             )
             self.assertAlmostEqual(
                 metrics["operational_window"]["coverage"],
+                2.0 / 3.0,
+            )
+            self.assertEqual(metrics["primary_decision_windows"], 3)
+            self.assertEqual(metrics["adaptation_committed_windows"], 3)
+            self.assertAlmostEqual(
+                metrics["primary_decision"]["raw"]["balanced_accuracy"],
                 2.0 / 3.0,
             )
             self.assertEqual(metrics["car_task"]["completed_scenes"], 3)

@@ -70,6 +70,10 @@ device:
 online_adaptation:
   enabled: true
   strategy: neuroonline
+  neuroonline:
+    history_threshold: 64
+    update_stride: 64
+    recent_samples: 64
   simulation:
     enabled: false
   cued_labels:
@@ -219,11 +223,11 @@ python download_datasets.py --dataset BNCI2014_001 --subject 1 --data-dir ./data
 
 ### NeuroOnline 算法复现与小车在线应用
 
-`config.yaml` 中将 `online_adaptation.strategy` 设为 `neuroonline` 后，实时解码采用严格的先预测、后更新流程。当前小车实验配置按 NeuroOnline 发布源码先累计 320 个有标签窗口完成第一次更新，之后每新增 64 个有标签窗口更新一次，并始终使用最近 320 个窗口。每个样本在进入缓冲区时生成固定的时间遮挡和频率遮挡视图，更新目标为三个视图的分类损失加两项表示一致性损失，并联合更新 backbone、CRM 和分类头。
+`config.yaml` 中将 `online_adaptation.strategy` 设为 `neuroonline` 后，实时解码采用严格的先预测、后更新流程。小车实验每个 Scene 只允许首个因果干净的主决策窗口进入在线训练：窗口必须完整位于当前 Scene、对应 Unity ACK 确认的初始指令，并且采集期间尚未放行本 Scene 的横向控制。首次及后续更新都在累计新增 64 个唯一主决策窗口时触发，并始终使用最近 64 个主决策窗口。每个训练样本在进入缓冲区时生成固定的时间遮挡和频率遮挡视图，更新目标为三个视图的分类损失加两项表示一致性损失，并联合更新 backbone、CRM 和分类头。
 
-该模式仅支持 PyTorch 模型，不支持 `riemann-mdm`。CRM 以恒等门控初始化；更新后的 backbone 保存到原模型文件，CRM 状态保存到同目录的 `<model>.neuroonline.pt` sidecar 文件。校准搜索选出的 mask ratio、一致性权重及其他模型耦合参数也写入 sidecar，重启 GUI 后实时更新会自动恢复这些参数；在线 `320/64/320` 触发策略、`1e-6` 学习率和控制置信度不参与这次离线搜索。将策略改回 `periodic_head` 可继续使用原有的十分钟候选分类头更新流程。
+该模式仅支持 PyTorch 模型，不支持 `riemann-mdm`。CRM 以恒等门控初始化；更新后的 backbone 保存到原模型文件，CRM 状态保存到同目录的 `<model>.neuroonline.pt` sidecar 文件。校准搜索选出的 mask ratio、一致性权重及其他模型耦合参数也写入 sidecar，重启 GUI 后实时更新会自动恢复这些参数；在线 `64/64/64`（首次阈值/更新步长/最近样本）策略、`1e-6` 学习率和控制置信度不参与这次离线搜索。将策略改回 `periodic_head` 可继续使用原有的十分钟候选分类头更新流程。
 
-实时解码页面配套显示 NeuroOnline 遥测：累计 Scene、累计有标签窗口、距离下一次 64 窗口触发的进度、缓冲区类别覆盖、原始 argmax prequential accuracy/fixed-three-class balanced accuracy、实际控制覆盖率、选择性准确率、逐类准确率、累计混淆矩阵，以及每次更新的总损失、分类损失、一致性损失、CRM gate 和耗时曲线。所有在线性能只使用“先预测、后更新”时产生的预测，不会用更新后的模型回算历史样本。三类尚未全部出现时，未出现类别召回率固定按 0 计，避免早期 balanced accuracy 虚高。
+实时解码页面配套显示 NeuroOnline 遥测：累计 Scene、累计主决策窗口、距离下一次 64 窗口触发的进度、缓冲区类别覆盖、重复/过期窗口拒绝数、原始 argmax prequential accuracy/fixed-three-class balanced accuracy、实际控制覆盖率、选择性准确率、逐类准确率、累计混淆矩阵，以及每次更新的总损失、分类损失、一致性损失、CRM gate 和耗时曲线。所有在线性能只使用“先预测、后更新”时产生的预测，不会用更新后的模型回算历史样本。三类尚未全部出现时，未出现类别召回率固定按 0 计，避免早期 balanced accuracy 虚高。
 
 在线更新在隔离的候选模型上后台执行，实时推理继续使用当前模型；候选训练完成后，在模型锁内一次性替换引用并递增 `model_revision`。每次成功更新都会保存主模型和 CRM sidecar。开启实时记录后，最终适配状态和完整更新历史写入 `manifest.json`，每个 chunk 额外保存原始 argmax 预测、阈值处理后的预测、模型 revision 和标签事件 ID。
 
@@ -234,15 +238,15 @@ python download_datasets.py --dataset BNCI2014_001 --subject 1 --data-dir ./data
 一次实时运行形成以下不可变实验包：
 
 - `manifest.json`：schema/run ID、完整配置快照及 SHA-256、Git commit/dirty 状态、Python/依赖版本、初始模型哈希、预处理参数、最终统计、文件校验和及丢弃记录数。manifest 采用临时文件加原子替换更新。
-- `chunks/chunk_*.npz`：逐窗原始 EEG、源时钟映射后的单调时钟与 Unix 起止时间、三类完整概率、原始 argmax、置信度阈值后的实际控制预测、置信度/不确定度、Scene ID/标签、模型 revision、质量判定/原因/坏导信息。chunk 先完整写入临时文件再原子替换。
+- `chunks/chunk_*.npz`：逐窗原始 EEG、源时钟映射后的单调时钟与 Unix 起止时间、三类完整概率、原始 argmax、置信度阈值后的实际控制预测、置信度/不确定度、Scene ID、初始 `instruction_label`、逐时刻 `vehicle_required_action`、当前/起始/安全车道、`training_role`、`adaptation_eligible`、模型 revision、质量判定/原因/坏导信息。chunk 先完整写入临时文件再原子替换。
 - `events.jsonl`：session、Unity Scene ACK、固定边界结束、碰撞失败、更新开始、模型原子切换、更新完成和模型快照事件；每项同时保存 monotonic、Unix 和 UTC 时间。JSONL 即使异常中断也可恢复到最后一条完整事件。
 - `model_revisions/revision_XXXX.pt` 及 CRM sidecar：revision 0 和每次在线切换后的实际模型，manifest 保存各版本哈希，使任一逐窗预测都能还原到对应权重。
 
 停止运行后，程序从落盘 chunk 和事件日志独立重算并写入 `scientific_metrics`：
 
-- `raw_window`：质量合格、有真值窗口的 test-then-train argmax Accuracy、固定三类 Balanced Accuracy、逐类召回和混淆矩阵；
-- `operational_window`：置信度阈值后的覆盖率、拒识数、选择性准确率及把拒识视为错误的控制准确率；
-- `scene_classification`：同一 Scene 内 prequential 概率取均值后再 argmax 的 Scene 级分类结果；
+- `primary_decision`：每个 Scene 唯一主决策窗的 test-then-train 原始与阈值后指标；这是模型在线可行性检验的主指标；
+- `continuous_dynamic`：Scene 内后续动态标签窗的描述性原始与阈值后指标，不进入 NeuroOnline 主训练缓冲区；
+- `scene_classification`：直接使用每个 Scene 唯一主决策窗，不再对 LEFT→IDLE 等不同真值阶段做不科学的 Scene 内平均；
 - `car_task`：以 `scene_end` 的碰撞/无碰撞结果计算避障成功率及 Wilson 95% 区间。
 
 2 秒窗以 0.5 秒步长滑动，窗口之间并不独立。因此窗口级指标用于描述在线轨迹，论文显著性检验应以 Scene、block、session 或 subject 为统计单位，不能直接对所有重叠窗口使用独立二项假设。
@@ -257,7 +261,9 @@ python download_datasets.py --dataset BNCI2014_001 --subject 1 --data-dir ./data
 
 正式小车实验启用 `online_adaptation.cued_labels` 后采用 `continuous-scene-v4-dynamic-label` 连续动态动作协议。每个 Scene 开始前，Python 先用 `SCENE_STATE` 查询 Unity 中小车的实际车道，再选择一个可达且类别均衡的初始相对动作。Unity 固定本 Scene 的唯一空车道，在同一帧、同一前向距离给另外两条路各布置一辆障碍车，并返回包含 `scene_number/start_lane/safe_lane/applied_label` 的结构化 ACK。Scene 内固定的是 `safe_lane`，而不是动作标签：Unity 只有在车辆横向位置真正到达目标车道后才发送 `LANE_SETTLED`。Python 随即根据当前车道到安全车道的相对关系重新计算真值；位于安全车道时为 `IDLE`，仍在右侧时为 `LEFT`，仍在左侧时为 `RIGHT`。
 
-碰撞只会炸掉被撞的障碍车，另一条路的障碍保持原位；Unity 上报 `SCENE_FAILED` 后，Python 只记录本 Scene 失败，不改变安全车道，到固定的 5 秒边界才同步下一 Scene。模型每 `step_sec` 持续预测并控制车辆，不再存在 fixation、cue、ITI 或面向被试的隐藏停止阶段。正式 Scene 时长固定为 `5.0` 秒，Unity 按相对速度 `(6.0 - 3.2) m/s` 将障碍放在约 `14.0 m` 前方：走错车道会因车身碰撞半径在约 4.7 秒判定失败，但剩余约 0.3 秒仍属于同一 Scene；走对空路则在第 5 秒通过障碍横截面并判定成功。在线训练仍使用 2 秒窗和 0.5 秒步长，只接受 Scene 内 `0.5-4.5` 秒范围中的完整窗口。以每次 `LANE_SETTLED` 为中心，其前 0.5 秒至后 0.5 秒是总长 1 秒的换道保护区；任何包含该区间样本的窗口均标为无训练标签。为保证切换前 0.5 秒不会先进入模型，候选标签延迟 0.5 秒确认后才送入 NeuroOnline，实时预测和小车控制不延迟。跨越 ACK、动态标签段或 5 秒边界的窗口同样无标签。原始窗口仍会落盘，`events.jsonl` 额外保存 `training_label_rejected` 及原因，逐窗 NPZ 同时保存起始车道、当前车道与空车道，保证标签可审计。
+碰撞只会炸掉被撞的障碍车，另一条路的障碍保持原位；Unity 上报 `SCENE_FAILED` 后，Python 只记录本 Scene 失败，不改变安全车道，到固定的 5 秒边界才同步下一 Scene。正式 Scene 时长保持 `5.0` 秒，Unity 按相对速度 `(6.0 - 3.2) m/s` 将障碍放在约 `14.0 m` 前方：走错车道会因车身碰撞半径在约 4.7 秒判定失败，走对空路则在第 5 秒通过障碍横截面并判定成功。模型输入仍是 2 秒窗、0.5 秒步长。新 Scene ACK 后，Python 会继续前向行驶和实时预测，但明确阻止横向命令，直至取得从 ACK 后至少 0.5 秒开始的首个完整 2 秒主决策窗（理想步相下为 `0.5-2.5` 秒）；该窗完成 test-then-train 预测后立即放行横向控制，因此上一 Scene 的脑电不可能提前改变新 Scene 的车道。这个可见的因果门控不是隐藏 STOP 阶段。
+
+主决策窗的 `instruction_label` 是唯一进入 NeuroOnline 的训练真值。后续窗口仍按小车当前位置到固定安全车道计算 `vehicle_required_action`，并完整落盘用于连续行为分析，但不再因成功者快速转成大量 IDLE、失败者持续产生 LEFT/RIGHT 而污染主训练缓冲区。后续动态窗仍执行 ACK/边界/换道保护校验；以 `LANE_SETTLED` 为中心前后各 0.5 秒的窗口不计动态真值。TCP 消息在接收解析时即记录单调时钟，重复事件 ID、非递增 EEG 窗口终点和重复源窗口都会被拒绝并写入日志。
 
 Neuracle/JellyFish 原始数据以 `250 Hz` 转发。校准连续数据保留 250 Hz 源时间轴，切出完整源窗口后做带抗混叠滤波的 `250→200 Hz` 降采样；实时解码同样先取得 500 点的 2 秒源窗口，再降为模型使用的 400 点。后续预处理、模型输入和 NeuroOnline 更新统一使用 `200 Hz`。实时窗口不再把 `get_chunk()` 返回时刻当作脑电终点，而是利用 JellyFish 数据包的源时间戳，将样本时间映射到 Python 的单调时钟后再与 Unity Scene 对齐。`device.neuracle_transport_delay_sec` 用于补偿经 Trigger/回环实验测得的固定采集链路延迟；未测量前保持 `0.0`，系统仍会利用源时间戳消除排队和轮询抖动。
 
@@ -266,7 +272,7 @@ Neuracle/JellyFish 原始数据以 `250 Hz` 转发。校准连续数据保留 25
 200 Hz、2秒窗口对应模型输入长度为400点。旧的250 Hz/500点模型权重和 CRM sidecar
 不能继续使用；切换采样率后必须重新完成正式校准。
 
-连续模式没有“大轮完成”或固定 trial 停止点，GUI 显示累计 Scene、相对动作真值、起始车道→空车道和 Unity 同步状态，NeuroOnline 只按累计有效窗口触发。`balance_pool_per_class: 32` 用于生成可复现的类别平衡候选池；若候选动作在边界车道不可执行，会保留到后续可执行 Scene，而不会伪造标签。运行持续到操作员切换页面、关闭 Unity 或停止 GUI。真实设备实验必须保持 `online_adaptation.simulation.enabled: false`。
+连续模式没有“大轮完成”或固定 trial 停止点，GUI 显示累计 Scene、相对动作真值、起始车道→空车道和 Unity 同步状态，NeuroOnline 每累计 64 个新的合格主决策窗，用最近 64 个主决策窗后台更新一次。`balance_pool_per_class: 32` 用于生成可复现的类别平衡候选池；若候选动作在边界车道不可执行，会保留到后续可执行 Scene，而不会伪造标签。运行持续到操作员切换页面、关闭 Unity 或停止 GUI。真实设备实验必须保持 `online_adaptation.simulation.enabled: false`。
 
 ## 各模式 EEG 保存逻辑
 

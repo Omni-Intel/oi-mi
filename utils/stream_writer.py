@@ -39,7 +39,14 @@ class RecordItem:
     scene_label: int = -1
     scene_start_lane: int = -9
     scene_safe_lane: int = -9
+    scene_current_lane: int = -9
+    instruction_label: int = -1
+    vehicle_required_action: int = -1
     scene_failed: bool = False
+    training_role: str = "unlabeled"
+    adaptation_eligible: bool = False
+    adaptation_committed: bool = False
+    control_gate_active: bool = False
     mapped_command: str = ""
     transport_command: str = ""
     transport_success: bool = False
@@ -142,7 +149,14 @@ class StreamWriter:
         scene_label: int = -1,
         scene_start_lane: int = -9,
         scene_safe_lane: int = -9,
+        scene_current_lane: int = -9,
+        instruction_label: int = -1,
+        vehicle_required_action: int = -1,
         scene_failed: bool = False,
+        training_role: str = "unlabeled",
+        adaptation_eligible: bool = False,
+        adaptation_committed: bool = False,
+        control_gate_active: bool = False,
         mapped_command: str = "",
         transport_command: str = "",
         transport_success: bool = False,
@@ -186,7 +200,14 @@ class StreamWriter:
             scene_label=int(scene_label),
             scene_start_lane=int(scene_start_lane),
             scene_safe_lane=int(scene_safe_lane),
+            scene_current_lane=int(scene_current_lane),
+            instruction_label=int(instruction_label),
+            vehicle_required_action=int(vehicle_required_action),
             scene_failed=bool(scene_failed),
+            training_role=str(training_role),
+            adaptation_eligible=bool(adaptation_eligible),
+            adaptation_committed=bool(adaptation_committed),
+            control_gate_active=bool(control_gate_active),
             mapped_command=str(mapped_command),
             transport_command=str(transport_command),
             transport_success=bool(transport_success),
@@ -399,7 +420,35 @@ class StreamWriter:
             [item.scene_safe_lane for item in buffer],
             dtype=np.int8,
         )
+        scene_current_lanes = np.asarray(
+            [item.scene_current_lane for item in buffer],
+            dtype=np.int8,
+        )
+        instruction_labels = np.asarray(
+            [item.instruction_label for item in buffer],
+            dtype=np.int64,
+        )
+        vehicle_required_actions = np.asarray(
+            [item.vehicle_required_action for item in buffer],
+            dtype=np.int64,
+        )
         scene_failed = np.asarray([item.scene_failed for item in buffer], dtype=np.bool_)
+        training_roles = np.asarray(
+            [item.training_role for item in buffer],
+            dtype=np.str_,
+        )
+        adaptation_eligible = np.asarray(
+            [item.adaptation_eligible for item in buffer],
+            dtype=np.bool_,
+        )
+        adaptation_committed = np.asarray(
+            [item.adaptation_committed for item in buffer],
+            dtype=np.bool_,
+        )
+        control_gate_active = np.asarray(
+            [item.control_gate_active for item in buffer],
+            dtype=np.bool_,
+        )
         mapped_commands = np.asarray([item.mapped_command for item in buffer], dtype=np.str_)
         transport_commands = np.asarray(
             [item.transport_command for item in buffer],
@@ -475,7 +524,14 @@ class StreamWriter:
                 scene_labels=scene_labels,
                 scene_start_lanes=scene_start_lanes,
                 scene_safe_lanes=scene_safe_lanes,
+                scene_current_lanes=scene_current_lanes,
+                instruction_labels=instruction_labels,
+                vehicle_required_actions=vehicle_required_actions,
                 scene_failed_at_prediction=scene_failed,
+                training_roles=training_roles,
+                adaptation_eligible=adaptation_eligible,
+                adaptation_committed=adaptation_committed,
+                control_gate_active=control_gate_active,
                 mapped_commands=mapped_commands,
                 transport_commands=transport_commands,
                 transport_success=transport_success,
@@ -521,6 +577,8 @@ class StreamWriter:
                     "probabilities",
                     "quality_accepted",
                     "scene_indices",
+                    "adaptation_eligible",
+                    "adaptation_committed",
                 ):
                     if key in chunk:
                         arrays.setdefault(key, []).append(np.asarray(chunk[key]))
@@ -533,6 +591,18 @@ class StreamWriter:
         quality = np.concatenate(arrays["quality_accepted"]).astype(np.bool_)
         scene_indices = np.concatenate(arrays.get("scene_indices", [])).astype(np.int64)
         probabilities = np.concatenate(arrays.get("probabilities", []), axis=0)
+        adaptation_eligible = np.concatenate(
+            arrays.get(
+                "adaptation_eligible",
+                [np.zeros(y_true.shape, dtype=np.bool_)],
+            )
+        ).astype(np.bool_)
+        adaptation_committed = np.concatenate(
+            arrays.get(
+                "adaptation_committed",
+                [np.zeros(y_true.shape, dtype=np.bool_)],
+            )
+        ).astype(np.bool_)
         class_count = max(
             probabilities.shape[1] if probabilities.ndim == 2 else 0,
             int(np.max(y_true[y_true >= 0]) + 1) if np.any(y_true >= 0) else 0,
@@ -561,10 +631,45 @@ class StreamWriter:
         )
         operational_metrics["abstained_windows"] = int(np.sum(valid & ~operational_valid))
 
+        primary_valid = valid & adaptation_eligible
+        primary_raw_valid = primary_valid & (y_raw >= 0)
+        primary_operational_valid = primary_valid & (y_operational >= 0)
+        primary_raw_metrics = self._classification_metrics(
+            y_true[primary_raw_valid],
+            y_raw[primary_raw_valid],
+            class_count,
+        )
+        primary_operational_metrics = self._classification_metrics(
+            y_true[primary_valid],
+            y_operational[primary_valid],
+            class_count,
+            abstain_value=-1,
+        )
+        primary_operational_metrics["coverage"] = (
+            float(np.sum(primary_operational_valid) / np.sum(primary_valid))
+            if np.any(primary_valid)
+            else 0.0
+        )
+        primary_operational_metrics["selective_accuracy"] = (
+            float(
+                np.mean(
+                    y_operational[primary_operational_valid]
+                    == y_true[primary_operational_valid]
+                )
+            )
+            if np.any(primary_operational_valid)
+            else 0.0
+        )
+        primary_operational_metrics["abstained_windows"] = int(
+            np.sum(primary_valid & ~primary_operational_valid)
+        )
+
         scene_truth: list[int] = []
         scene_prediction: list[int] = []
-        for scene_index in np.unique(scene_indices[valid & (scene_indices >= 0)]):
-            mask = valid & (scene_indices == scene_index)
+        for scene_index in np.unique(
+            scene_indices[primary_valid & (scene_indices >= 0)]
+        ):
+            mask = primary_valid & (scene_indices == scene_index)
             if not np.any(mask):
                 continue
             truth_values = y_true[mask]
@@ -596,16 +701,32 @@ class StreamWriter:
         return {
             "definitions": {
                 "evaluation_filter": "quality_accepted & labels_true>=0",
+                "primary_decision_filter": (
+                    "quality_accepted & labels_true>=0 & adaptation_eligible"
+                ),
                 "raw_window_prediction": "argmax(probabilities) before online update",
                 "operational_prediction": "confidence-thresholded command; abstention=-1",
                 "balanced_accuracy": "macro recall over the fixed class set; missing-class recall=0",
-                "scene_prediction": "argmax of mean prequential probability within each scene",
+                "scene_prediction": "the single causally clean primary decision window",
             },
             "evaluated_windows": int(np.sum(valid)),
+            "primary_decision_windows": int(np.sum(primary_valid)),
+            "primary_decision_quality_rejected": int(
+                np.sum(adaptation_eligible & ~quality)
+            ),
+            "adaptation_committed_windows": int(np.sum(adaptation_committed)),
             "excluded_unlabeled_windows": int(np.sum(y_true < 0)),
             "excluded_quality_windows": int(np.sum((y_true >= 0) & ~quality)),
             "raw_window": raw_metrics,
             "operational_window": operational_metrics,
+            "primary_decision": {
+                "raw": primary_raw_metrics,
+                "operational": primary_operational_metrics,
+            },
+            "continuous_dynamic": {
+                "raw": raw_metrics,
+                "operational": operational_metrics,
+            },
             "scene_classification": scene_metrics,
             "car_task": task_metrics,
         }

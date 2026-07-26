@@ -1898,7 +1898,7 @@ def _render_online_adaptation_notice(adaptation_cfg: dict) -> None:
         neuro_cfg = adaptation_cfg.get("neuroonline", {})
         st.info(
             "NeuroOnline 已开启："
-            f"累计 {int(neuro_cfg.get('history_threshold', 320))} 个标签窗口后，"
+            f"累计 {int(neuro_cfg.get('history_threshold', 64))} 个主决策窗口后，"
             f"每 {int(neuro_cfg.get('update_stride', 64))} 个样本全参数更新一次；"
             f"当前标签源为 {source_text}。"
         )
@@ -1917,7 +1917,7 @@ def _initial_online_adaptation_status(adaptation_cfg: dict) -> dict | None:
     strategy = str(adaptation_cfg.get("strategy", "periodic_head")).strip().lower()
     if strategy == "neuroonline":
         neuro_cfg = adaptation_cfg.get("neuroonline", {}) or {}
-        threshold = int(neuro_cfg.get("history_threshold", 320))
+        threshold = int(neuro_cfg.get("history_threshold", 64))
         return {
             "enabled": True,
             "strategy": "neuroonline",

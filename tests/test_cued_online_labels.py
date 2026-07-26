@@ -94,6 +94,55 @@ def _bare_decoder(
 
 
 class CuedOnlineLabelTests(unittest.TestCase):
+    def test_primary_window_releases_cued_lateral_control_once(self) -> None:
+        clock = _Clock(100.0)
+        source = CuedOnlineLabelSource(
+            ["left", "right", "idle"],
+            scene_duration_sec=5.0,
+            start_delay_sec=0.0,
+            boundary_guard_sec=0.5,
+            clock=clock,
+        )
+        outlet = _GameOutlet(current_lane=0)
+        decoder = _bare_decoder(source, outlet)
+        decoder._primary_decision_scenes = set()
+        decoder._primary_decision_window_bounds = {}
+        self.assertEqual(source.prepare_scene(scene_index=0, start_lane=0), 0)
+        self.assertTrue(
+            source.confirm_scene_applied(
+                scene_index=0,
+                applied_label_id=0,
+                start_lane=0,
+                safe_lane=-1,
+                timestamp_monotonic=100.0,
+            )
+        )
+        decoder._scene_sent_scene_index = 0
+        decoder._scene_sent_label_id = 0
+        self.assertTrue(decoder._is_cued_control_gate_active())
+
+        label = source.get_label(window_start=100.5, window_end=102.5)
+        self.assertIsNotNone(label)
+        self.assertTrue(
+            decoder._claim_primary_decision_window(
+                online_label=label,
+                window_start=100.5,
+                window_end=102.5,
+            )
+        )
+        self.assertFalse(decoder._is_cued_control_gate_active())
+        self.assertFalse(
+            decoder._claim_primary_decision_window(
+                online_label=label,
+                window_start=101.0,
+                window_end=103.0,
+            )
+        )
+        self.assertEqual(
+            decoder._primary_decision_window_bounds[0],
+            (100.5, 102.5),
+        )
+
     def test_only_windows_inside_one_scene_receive_labels(self) -> None:
         clock = _Clock(100.0)
         source = CuedOnlineLabelSource(
@@ -342,6 +391,8 @@ class CuedOnlineLabelTests(unittest.TestCase):
                 window_start=100.0,
                 window_end=101.2,
                 quality_accepted=True,
+                training_role="continuous_context",
+                adaptation_eligible=False,
                 record_payload={"window": np.zeros((2, 400), dtype=np.float32)},
             )
         ]
