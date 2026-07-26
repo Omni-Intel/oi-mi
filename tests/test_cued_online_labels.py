@@ -171,7 +171,7 @@ class CuedOnlineLabelTests(unittest.TestCase):
         clock.value = 105.5
         self.assertIsNone(source.get_label(window_start=103.5, window_end=105.5))
 
-    def test_scene_protocol_repeats_balanced_sequence_without_stopping(self) -> None:
+    def test_unconfirmed_scene_never_advances_from_local_time_alone(self) -> None:
         clock = _Clock(0.0)
         source = CuedOnlineLabelSource(
             ["left", "right", "idle"],
@@ -185,11 +185,37 @@ class CuedOnlineLabelTests(unittest.TestCase):
         status = source.status()
         self.assertEqual(status["phase"], "control")
         self.assertEqual(status["protocol_mode"], "continuous-relative-action")
-        self.assertEqual(status["scene_index"], 6)
-        self.assertEqual(status["scene_number"], 7)
+        self.assertEqual(status["scene_index"], 0)
+        self.assertEqual(status["scene_number"], 1)
         self.assertIsNone(status["label_name"])
         self.assertEqual(source.metadata()["balance_pool_scenes"], 3)
         self.assertNotIn("total_trials", status)
+
+    def test_confirmed_scene_advances_only_one_step_after_long_pause(self) -> None:
+        clock = _Clock(0.0)
+        source = CuedOnlineLabelSource(
+            ["left", "right", "idle"],
+            scene_duration_sec=5.0,
+            start_delay_sec=0.0,
+            boundary_guard_sec=0.0,
+            clock=clock,
+        )
+        self.assertEqual(source.prepare_scene(scene_index=0, start_lane=0), 0)
+        self.assertTrue(source.confirm_scene_applied(
+            scene_index=0,
+            applied_label_id=0,
+            start_lane=0,
+            safe_lane=-1,
+            timestamp_monotonic=0.0,
+        ))
+
+        clock.value = 30.0
+        status = source.status()
+        self.assertEqual(status["scene_index"], 1)
+        self.assertFalse(status["scene_confirmed"])
+
+        clock.value = 60.0
+        self.assertEqual(source.status()["scene_index"], 1)
 
     def test_start_delay_has_no_label_or_hidden_control_phase(self) -> None:
         clock = _Clock(10.0)
@@ -498,6 +524,14 @@ class CuedOnlineLabelTests(unittest.TestCase):
             boundary_guard_sec=0.0,
             clock=clock,
         )
+        self.assertEqual(source.prepare_scene(scene_index=0, start_lane=0), 0)
+        self.assertTrue(source.confirm_scene_applied(
+            scene_index=0,
+            applied_label_id=0,
+            start_lane=0,
+            safe_lane=-1,
+            timestamp_monotonic=0.0,
+        ))
 
         clock.value = 7.1
         self.assertTrue(

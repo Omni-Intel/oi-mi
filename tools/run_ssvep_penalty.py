@@ -182,7 +182,7 @@ def main() -> None:
         stability_windows=stability_windows,
         min_confidence=min_confidence,
     )
-    unity = ArTcpCommandSender(args.host, int(args.port), timeout_sec=1.0)
+    unity = ArTcpCommandSender(args.host, int(args.port), timeout_sec=3.0)
 
     print(f"Connecting Unity TCP {args.host}:{args.port}")
     if args.open_game:

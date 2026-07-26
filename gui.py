@@ -1538,7 +1538,7 @@ def render_settings(config: dict) -> None:
         st.number_input(
             "AR 游戏 TCP 超时 (秒)",
             min_value=0.1,
-            value=float(ar_game_cfg.get("timeout_sec", 1.0)),
+            value=float(ar_game_cfg.get("timeout_sec", 3.0)),
             step=0.1,
         )
     )

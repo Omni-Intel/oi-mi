@@ -36,8 +36,8 @@ oi-mi-runtime.json
 当前验证包：
 
 ```text
-build_id: 2026-07-26-dynamic-label-scene-v4-desktop
-zip SHA-256: 9A3A899719103D2BF7E70C0D80685C74FE86E5B330E0D997860AD3A7B85AF9F1
+build_id: 2026-07-26-scene-gate-v2-desktop
+zip SHA-256: D8B6A90CE332D51BC82F3A2F483D92FF285C428DC4E30900E94567C26419D9C2
 ```
 
 重新安装当前 Release：
@@ -57,7 +57,7 @@ zip SHA-256: 9A3A899719103D2BF7E70C0D80685C74FE86E5B330E0D997860AD3A7B85AF9F1
 将已经验证的小车运行目录打包：
 
 ```powershell
-.\.venv\Scripts\python.exe tools\package_unity_build.py --build-id 2026-07-26-dynamic-label-scene-v4-desktop
+.\.venv\Scripts\python.exe tools\package_unity_build.py --build-id 2026-07-26-scene-gate-v2-desktop
 ```
 
 输出文件固定为：
@@ -79,4 +79,6 @@ https://github.com/Omni-Intel/oi-mi/releases/latest/download/ARPrototype3D-windo
 - `SCENE_STATE` 返回小车实际车道；`SCENE_LEFT/RIGHT/IDLE` 表示相对当前车道的单步动作，Unity 必须返回含 `start_lane/safe_lane/applied_label` 的 ACK。
 - `LANE_SETTLED` 只在小车实际完成换道后发送；Python 根据固定 `safe_lane` 动态生成 LEFT/RIGHT/IDLE 真值。
 - `LEFT/RIGHT/STOP` 是车辆控制命令；模型每个解码步持续输出，协议内部不会插入隐藏停止阶段。
+- 等待 Scene 或同步失败时 Unity 不生成随机车辆；只有完整 Scene 命令成功后才同时生成两辆障碍车。
+- 当前 Scene 未收到完整 ACK 时 Python 保持该 Scene 编号，不允许本地计时器跳过并建立后续 Scene。
 - 关闭 Unity 或场景 ACK 失败时，标签和在线更新会停止，避免静默记录错误真值。

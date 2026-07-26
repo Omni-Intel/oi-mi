@@ -23,7 +23,7 @@ def _build_transport(config: dict[str, Any]) -> Any:
 
     host = str(game_output_cfg.get("host", "127.0.0.1")).strip() or "127.0.0.1"
     port = int(game_output_cfg.get("port", 5005))
-    timeout_sec = float(game_output_cfg.get("timeout_sec", 1.0))
+    timeout_sec = float(game_output_cfg.get("timeout_sec", 3.0))
     return ArTcpCommandSender(host=host, port=port, timeout_sec=timeout_sec)
 
 

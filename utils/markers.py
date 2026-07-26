@@ -97,7 +97,7 @@ class LSLCommandOutlet:
 class ArTcpCommandSender:
     """TCP client for the AR game command server."""
 
-    def __init__(self, host: str, port: int, *, timeout_sec: float = 1.0) -> None:
+    def __init__(self, host: str, port: int, *, timeout_sec: float = 3.0) -> None:
         self._host = host
         self._port = port
         self._timeout_sec = timeout_sec

@@ -108,7 +108,7 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
             "enabled": True,
             "host": "127.0.0.1",
             "port": 5005,
-            "timeout_sec": 1.0,
+            "timeout_sec": 3.0,
             "auto_launch": True,
             "executable_path": "unity相关/ARPrototype3D-windows-x64/ARPrototype3D.exe",
             "startup_timeout_sec": 15.0,
@@ -563,7 +563,7 @@ def _interactive_menu(ctx: click.Context, app: AppContext) -> None:
                     val = click.prompt("输入 AR 游戏端口", type=int, default=int(ar_game_cfg.get("port", 5005)))
                     ar_game_cfg["port"] = val
                 elif sub_choice == "18":
-                    val = click.prompt("输入 AR 游戏 TCP 超时(秒)", type=float, default=float(ar_game_cfg.get("timeout_sec", 1.0)))
+                    val = click.prompt("输入 AR 游戏 TCP 超时(秒)", type=float, default=float(ar_game_cfg.get("timeout_sec", 3.0)))
                     ar_game_cfg["timeout_sec"] = val
                 elif sub_choice == "19":
                     val = click.confirm("Enable local Unity exe auto-launch", default=bool(ar_game_cfg.get("auto_launch", False)))

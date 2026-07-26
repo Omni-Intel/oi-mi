@@ -71,7 +71,9 @@ output:
     enabled: true
     host: 127.0.0.1
     port: 5005
-    timeout_sec: 1.0
+    # Unity applies scene layouts on its main thread. Allow ordinary frame or
+    # Windows scheduling stalls without falsely abandoning a valid scene.
+    timeout_sec: 3.0
     auto_launch: true
     executable_path: unity相关/ARPrototype3D-windows-x64/ARPrototype3D.exe
     startup_timeout_sec: 15.0

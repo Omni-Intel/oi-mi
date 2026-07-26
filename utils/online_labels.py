@@ -487,11 +487,20 @@ class CuedOnlineLabelSource(OnlineLabelSource):
         }
 
     def _advance_timeouts_locked(self, timestamp: float) -> None:
+        # A local clock must never manufacture later scenes while the current
+        # layout is still waiting for Unity's authoritative ACK.  Advancing an
+        # unconfirmed scene used to make the GUI count upward after a transport
+        # timeout even though Unity had not applied any new obstacle wall.
+        if self._confirmed_scene_index != self._scene_index:
+            return
+
         elapsed = timestamp - self._scene_started_at
-        timeout_count = int(elapsed // self._scene_duration_sec)
-        if timeout_count > 0:
-            self._scene_started_at += timeout_count * self._scene_duration_sec
-            self._scene_index += timeout_count
+        if elapsed >= self._scene_duration_sec:
+            # Advance exactly one scene.  The new scene remains pending at this
+            # index until SCENE_STATE and SCENE_* both succeed; a delayed GUI
+            # refresh therefore cannot skip scene numbers or labels.
+            self._scene_started_at = timestamp
+            self._scene_index += 1
             self._confirmed_scene_index = -1
             self._prepared_scene_index = -1
             self._prepared_label_id = None
