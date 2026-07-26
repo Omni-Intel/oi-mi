@@ -170,13 +170,16 @@ online_adaptation:
     enabled: true
     # The car never enters a hidden STOP phase.  Unity holds one obstacle
     # layout for this epoch while decoding/control continues every step.
-    # LEFT/RIGHT are one-lane actions relative to Unity's actual lane at scene
-    # start; IDLE keeps that lane. Unity ACK is the authoritative truth.
-    # Every scene keeps the same label/layout for exactly 5 s. A collision only
-    # records failure; the next scene still starts at the fixed 5 s boundary.
+    # Unity ACK fixes the safe lane for five seconds. LEFT/RIGHT/IDLE truth is
+    # recalculated whenever Unity confirms that the car has settled in a lane.
+    # A collision only records failure; the next scene still starts at the
+    # fixed 5 s boundary.
     scene_duration_sec: 5.0
     # Match calibration: only the 0.5-4.5 s control interval enters training.
     boundary_guard_sec: 0.5
+    # Windows touching the 0.5 s before or after an actual completed lane
+    # transition remain decoded and recorded, but receive no training label.
+    lane_transition_guard_sec: 0.5
     balance_pool_per_class: 32
     start_delay_sec: 5.0
     random_seed: 17

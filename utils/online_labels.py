@@ -166,6 +166,7 @@ class CuedOnlineLabelSource(OnlineLabelSource):
         scene_duration_sec: float,
         start_delay_sec: float = 5.0,
         boundary_guard_sec: float = 0.5,
+        lane_transition_guard_sec: float = 0.0,
         clock: Any = time.monotonic,
     ) -> None:
         if not sequence:
@@ -175,6 +176,10 @@ class CuedOnlineLabelSource(OnlineLabelSource):
         self._boundary_guard_sec = min(
             max(float(boundary_guard_sec), 0.0),
             self._scene_duration_sec / 2.0,
+        )
+        self._lane_transition_guard_sec = max(
+            float(lane_transition_guard_sec),
+            0.0,
         )
         self._clock = clock
         self._started_at = float(clock()) + max(float(start_delay_sec), 0.0)
@@ -188,6 +193,7 @@ class CuedOnlineLabelSource(OnlineLabelSource):
         self._confirmed_safe_lane: int | None = None
         self._current_lane: int | None = None
         self._label_segments: list[tuple[float, int, int]] = []
+        self._lane_transition_events: list[tuple[int, float]] = []
         self._label_transition_count = 0
         self._pending_sequence = list(self._sequence)
         self._applied_label_counts = {label_id: 0 for label_id in LABEL_ID_TO_NAME}
@@ -432,6 +438,7 @@ class CuedOnlineLabelSource(OnlineLabelSource):
                     return True
                 timestamp = max(timestamp, last_started_at)
             self._label_segments.append((timestamp, desired_label, lane))
+            self._lane_transition_events.append((self._scene_index, timestamp))
             self._current_lane = lane
             self._label_transition_count += 1
             self._last_transition_reason = "lane_settled"
@@ -464,6 +471,14 @@ class CuedOnlineLabelSource(OnlineLabelSource):
             ],
             "scene_duration_sec": self._scene_duration_sec,
             "boundary_guard_sec": self._boundary_guard_sec,
+            "lane_transition_guard_sec": self._lane_transition_guard_sec,
+            "lane_transition_events": [
+                {
+                    "scene_index": scene_index,
+                    "timestamp_monotonic": timestamp,
+                }
+                for scene_index, timestamp in self._lane_transition_events
+            ],
             "confirmed_scene_index": self._confirmed_scene_index,
             "failed_scenes": self._failed_scenes,
             "active_scene_failed": self._active_scene_failed,
@@ -527,6 +542,34 @@ class CuedOnlineLabelSource(OnlineLabelSource):
             "valid_until_monotonic": valid_until_monotonic,
         }
 
+    @property
+    def lane_transition_guard_sec(self) -> float:
+        """Future-confirmation delay required for transition-safe labels."""
+
+        return self._lane_transition_guard_sec
+
+    def is_window_transition_guarded(
+        self,
+        *,
+        scene_index: int,
+        window_start: float,
+        window_end: float,
+    ) -> bool:
+        """Return whether a window touches a lane transition's guard interval."""
+
+        start = float(window_start)
+        end = float(window_end)
+        guard = self._lane_transition_guard_sec
+        if guard <= 0.0 or end < start:
+            return False
+        with self._lock:
+            return any(
+                event_scene_index == int(scene_index)
+                and start < transition_time + guard
+                and end > transition_time - guard
+                for event_scene_index, transition_time in self._lane_transition_events
+            )
+
 
 def _relative_action_label(*, current_lane: int, safe_lane: int) -> int:
     if current_lane > safe_lane:
@@ -563,6 +606,9 @@ def build_cued_online_label_source(
             cue_config.get("scene_duration_sec", timing.get("control_sec", 5.0))
         ),
         boundary_guard_sec=float(cue_config.get("boundary_guard_sec", 0.5)),
+        lane_transition_guard_sec=float(
+            cue_config.get("lane_transition_guard_sec", 0.5)
+        ),
         clock=clock,
     )
 

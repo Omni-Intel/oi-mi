@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import unittest
 
-from decoder.real_time_decoder import RealTimeDecoder
+import numpy as np
+
+from decoder.real_time_decoder import RealTimeDecoder, _PendingCuedWindow
 from utils.online_labels import CuedOnlineLabelSource
 
 
@@ -239,6 +241,123 @@ class CuedOnlineLabelTests(unittest.TestCase):
         self.assertEqual(idle.label_name, "idle")
         self.assertEqual(idle.payload["current_lane"], -1)
         self.assertEqual(source.metadata()["label_transition_count"], 1)
+
+    def test_lane_transition_guard_rejects_windows_touching_both_sides(self) -> None:
+        clock = _Clock(100.0)
+        source = CuedOnlineLabelSource(
+            ["left"],
+            scene_duration_sec=5.0,
+            start_delay_sec=0.0,
+            boundary_guard_sec=0.0,
+            lane_transition_guard_sec=0.5,
+            clock=clock,
+        )
+        self.assertEqual(source.prepare_scene(scene_index=0, start_lane=0), 0)
+        self.assertTrue(source.confirm_scene_applied(
+            scene_index=0,
+            applied_label_id=0,
+            start_lane=0,
+            safe_lane=-1,
+            timestamp_monotonic=100.0,
+        ))
+        self.assertTrue(source.update_current_lane(
+            scene_index=0,
+            current_lane=-1,
+            safe_lane=-1,
+            timestamp_monotonic=102.0,
+        ))
+
+        self.assertFalse(source.is_window_transition_guarded(
+            scene_index=0,
+            window_start=100.0,
+            window_end=101.5,
+        ))
+        self.assertTrue(source.is_window_transition_guarded(
+            scene_index=0,
+            window_start=101.25,
+            window_end=101.75,
+        ))
+        self.assertTrue(source.is_window_transition_guarded(
+            scene_index=0,
+            window_start=102.0,
+            window_end=103.0,
+        ))
+        self.assertFalse(source.is_window_transition_guarded(
+            scene_index=0,
+            window_start=102.5,
+            window_end=103.5,
+        ))
+        self.assertEqual(source.metadata()["lane_transition_guard_sec"], 0.5)
+
+    def test_decoder_delays_then_rejects_pre_transition_training_label(self) -> None:
+        clock = _Clock(100.0)
+        source = CuedOnlineLabelSource(
+            ["left"],
+            scene_duration_sec=5.0,
+            start_delay_sec=0.0,
+            boundary_guard_sec=0.0,
+            lane_transition_guard_sec=0.5,
+            clock=clock,
+        )
+        self.assertEqual(source.prepare_scene(scene_index=0, start_lane=0), 0)
+        self.assertTrue(source.confirm_scene_applied(
+            scene_index=0,
+            applied_label_id=0,
+            start_lane=0,
+            safe_lane=-1,
+            timestamp_monotonic=100.0,
+        ))
+        label = source.get_label(window_start=100.0, window_end=101.2)
+        self.assertIsNotNone(label)
+        assert label is not None
+        self.assertTrue(source.update_current_lane(
+            scene_index=0,
+            current_lane=-1,
+            safe_lane=-1,
+            timestamp_monotonic=101.5,
+        ))
+
+        class Writer:
+            def __init__(self) -> None:
+                self.records: list[dict] = []
+                self.events: list[tuple[str, dict]] = []
+
+            def put(self, **payload) -> None:
+                self.records.append(payload)
+
+            def append_event(self, event_type: str, **payload) -> None:
+                self.events.append((event_type, payload))
+
+        decoder = RealTimeDecoder.__new__(RealTimeDecoder)
+        decoder._online_label_source = source
+        decoder._lane_transition_guard_sec = 0.5
+        decoder._writer = Writer()
+        decoder._pending_cued_windows = [
+            _PendingCuedWindow(
+                processed=np.zeros((2, 400), dtype=np.float32),
+                probabilities=np.asarray([0.8, 0.1, 0.1], dtype=np.float32),
+                operational_prediction=0,
+                prediction_model_revision=0,
+                online_label=label,
+                window_start=100.0,
+                window_end=101.2,
+                quality_accepted=True,
+                record_payload={"window": np.zeros((2, 400), dtype=np.float32)},
+            )
+        ]
+        decoder._handle_online_label = lambda **_kwargs: self.fail(
+            "guarded label reached online adaptation"
+        )
+
+        decoder._flush_pending_cued_windows(now=101.6)
+        self.assertEqual(len(decoder._pending_cued_windows), 1)
+        decoder._flush_pending_cued_windows(now=101.7)
+        self.assertEqual(decoder._pending_cued_windows, [])
+        self.assertEqual(decoder._writer.records[0]["y_true"], -1)
+        self.assertEqual(
+            decoder._writer.events[0][1]["reason"],
+            "lane_transition_guard",
+        )
 
     def test_decoder_accepts_dynamic_lane_truth_from_unity_event(self) -> None:
         clock = _Clock(100.0)

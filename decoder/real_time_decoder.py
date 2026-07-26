@@ -53,6 +53,21 @@ class PredictionResult:
     class_id: int | None
 
 
+@dataclass(slots=True)
+class _PendingCuedWindow:
+    """One labeled window waiting for the future transition guard to close."""
+
+    processed: np.ndarray
+    probabilities: np.ndarray
+    operational_prediction: int | None
+    prediction_model_revision: int
+    online_label: Any
+    window_start: float
+    window_end: float
+    quality_accepted: bool
+    record_payload: dict[str, Any] | None
+
+
 class GameCommandOutlet(Protocol):
     """Command transport required by the continuous Unity driving protocol."""
 
@@ -111,6 +126,11 @@ class RealTimeDecoder:
         self._online_update_every = max(int(online_update_every), 1)
         self._model_save_path = model_save_path
         self._online_label_source = online_label_source
+        self._lane_transition_guard_sec = max(
+            float(getattr(online_label_source, "lane_transition_guard_sec", 0.0)),
+            0.0,
+        )
+        self._pending_cued_windows: list[_PendingCuedWindow] = []
         self._status_callback = status_callback
         self._online_update_count = 0
         self._online_seen_labeled_windows = 0
@@ -198,6 +218,7 @@ class RealTimeDecoder:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
         self._thread = None
+        self._flush_pending_cued_windows(force=True)
         self._acquirer.stop_stream()
         if self._game_command_outlet is not None:
             try:
@@ -239,6 +260,7 @@ class RealTimeDecoder:
         self._scene_safe_lanes.clear()
         self._scene_end_recorded.clear()
         self._model_revision_records.clear()
+        self._pending_cued_windows.clear()
         if record and subject_id:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             realtime_root = save_dir or Path("records_storage") / subject_id / "realtime"
@@ -616,16 +638,7 @@ class RealTimeDecoder:
                     window_start=window_start,
                     window_end=window_end,
                 )
-                if online_label is not None and preprocessing.quality.accepted:
-                    self._handle_online_label(
-                        processed=processed,
-                        probabilities=probabilities,
-                        operational_prediction=result.class_id,
-                        prediction_model_revision=model_revision,
-                        online_label=online_label,
-                        window_end=window_end,
-                    )
-                
+                record_payload = None
                 if hasattr(self, "_record") and self._record and hasattr(self, "_writer"):
                     pred_class = -1 if result.class_id is None else int(result.class_id)
                     timing_diagnostics = getattr(
@@ -644,79 +657,110 @@ class RealTimeDecoder:
                             getattr(self, "_scene_sent_scene_index", -1),
                         )
                     )
-                    self._writer.put(
-                        window=window.astype(np.float32),
-                        y_true=-1 if online_label is None else int(online_label.label_id),
-                        y_pred=pred_class,
-                        confidence=float(result.confidence),
-                        raw_pred=raw_prediction,
-                        model_revision=model_revision,
-                        label_event_id="" if online_label is None else str(online_label.event_id),
-                        probabilities=probabilities,
-                        uncertainty=float(result.uncertainty),
-                        window_start_monotonic=window_start,
-                        window_end_monotonic=window_end,
-                        scene_index=scene_index,
-                        scene_label=(
-                            -1 if online_label is None else int(online_label.label_id)
-                        ),
-                        scene_start_lane=getattr(
+                    record_payload = {
+                        "window": window.astype(np.float32),
+                        "y_pred": pred_class,
+                        "confidence": float(result.confidence),
+                        "raw_pred": raw_prediction,
+                        "model_revision": model_revision,
+                        "probabilities": probabilities,
+                        "uncertainty": float(result.uncertainty),
+                        "window_start_monotonic": window_start,
+                        "window_end_monotonic": window_end,
+                        "scene_index": scene_index,
+                        "scene_start_lane": getattr(
                             self,
                             "_scene_start_lanes",
                             {},
                         ).get(scene_index, -9),
-                        scene_safe_lane=getattr(
+                        "scene_safe_lane": getattr(
                             self,
                             "_scene_safe_lanes",
                             {},
                         ).get(scene_index, -9),
-                        scene_failed=scene_index in self._failed_scene_indices,
-                        mapped_command=game_command or "STOP",
-                        transport_command=self._last_game_transport_command or "",
-                        transport_success=(
+                        "scene_failed": scene_index in self._failed_scene_indices,
+                        "mapped_command": game_command or "STOP",
+                        "transport_command": self._last_game_transport_command or "",
+                        "transport_success": (
                             self._last_game_transport_error is None
                             and self._last_game_transport_sent_at > 0.0
                         ),
-                        transport_sent_at_monotonic=self._last_game_transport_sent_at,
-                        transport_error=self._last_game_transport_error or "",
-                        quality_accepted=preprocessing.quality.accepted,
-                        quality_peak_abs_uv=preprocessing.quality.peak_abs_uv,
-                        quality_clip_fraction=preprocessing.quality.clip_fraction,
-                        quality_bad_channel_fraction=(
+                        "transport_sent_at_monotonic": self._last_game_transport_sent_at,
+                        "transport_error": self._last_game_transport_error or "",
+                        "quality_accepted": preprocessing.quality.accepted,
+                        "quality_peak_abs_uv": preprocessing.quality.peak_abs_uv,
+                        "quality_clip_fraction": preprocessing.quality.clip_fraction,
+                        "quality_bad_channel_fraction": (
                             preprocessing.quality.bad_channel_fraction
                         ),
-                        quality_reasons=preprocessing.quality.reasons,
-                        quality_bad_channel_indices=(
+                        "quality_reasons": preprocessing.quality.reasons,
+                        "quality_bad_channel_indices": (
                             preprocessing.quality.bad_channel_indices
                         ),
-                        quality_nonfinite_fraction=(
+                        "quality_nonfinite_fraction": (
                             preprocessing.quality.nonfinite_fraction
                         ),
-                        timing_queueing_jitter_sec=float(
+                        "timing_queueing_jitter_sec": float(
                             timing_diagnostics.get("queueing_jitter_sec", 0.0)
                         ),
-                        timing_transport_delay_compensation_sec=float(
+                        "timing_transport_delay_compensation_sec": float(
                             timing_diagnostics.get(
                                 "transport_delay_compensation_sec",
                                 0.0,
                             )
                         ),
-                        timing_packet_arrival_monotonic=float(
+                        "timing_packet_arrival_monotonic": float(
                             timing_diagnostics.get(
                                 "packet_arrival_monotonic",
                                 float("nan"),
                             )
                         ),
-                        timing_received_packets=float(
+                        "timing_received_packets": float(
                             timing_diagnostics.get("received_packets", 0.0)
                         ),
-                        timing_packet_loss_count=float(
+                        "timing_packet_loss_count": float(
                             timing_diagnostics.get("packet_loss_count", 0.0)
                         ),
-                        timing_total_source_samples=float(
+                        "timing_total_source_samples": float(
                             timing_diagnostics.get("total_source_samples", 0.0)
                         ),
+                    }
+
+                if (
+                    online_label is not None
+                    and str(getattr(online_label, "source", "")) == "cued-protocol"
+                    and self._lane_transition_guard_sec > 0.0
+                ):
+                    self._pending_cued_windows.append(
+                        _PendingCuedWindow(
+                            processed=processed.copy(),
+                            probabilities=np.asarray(
+                                probabilities,
+                                dtype=np.float32,
+                            ).copy(),
+                            operational_prediction=result.class_id,
+                            prediction_model_revision=model_revision,
+                            online_label=online_label,
+                            window_start=window_start,
+                            window_end=window_end,
+                            quality_accepted=bool(
+                                preprocessing.quality.accepted
+                            ),
+                            record_payload=record_payload,
+                        )
                     )
+                else:
+                    self._finalize_realtime_window(
+                        processed=processed,
+                        probabilities=probabilities,
+                        operational_prediction=result.class_id,
+                        prediction_model_revision=model_revision,
+                        online_label=online_label,
+                        window_end=window_end,
+                        quality_accepted=bool(preprocessing.quality.accepted),
+                        record_payload=record_payload,
+                    )
+                self._flush_pending_cued_windows()
             except Exception as exc:  # noqa: BLE001
                 LOGGER.exception("Realtime decoding failed")
                 self._console.print(f"[red]解码失败：{exc}[/red]")
@@ -724,6 +768,106 @@ class RealTimeDecoder:
             elapsed = time.perf_counter() - started_at
             sleep_time = max(0.0, self._step_sec - elapsed)
             self._sleep_with_heartbeat(sleep_time, None)
+
+    def _flush_pending_cued_windows(
+        self,
+        *,
+        now: float | None = None,
+        force: bool = False,
+    ) -> None:
+        """Finalize delayed labels after future lane-transition events are known."""
+
+        pending = list(getattr(self, "_pending_cued_windows", []))
+        if not pending:
+            return
+        timestamp = time.monotonic() if now is None else float(now)
+        guard = max(float(getattr(self, "_lane_transition_guard_sec", 0.0)), 0.0)
+        source = getattr(self, "_online_label_source", None)
+        is_guarded = getattr(source, "is_window_transition_guarded", None)
+        remaining: list[_PendingCuedWindow] = []
+        for item in pending:
+            matured = timestamp >= item.window_end + guard
+            if not matured and not force:
+                remaining.append(item)
+                continue
+
+            label_payload = getattr(item.online_label, "payload", None) or {}
+            scene_index = int(label_payload.get("scene_index", -1))
+            transition_guarded = bool(
+                callable(is_guarded)
+                and is_guarded(
+                    scene_index=scene_index,
+                    window_start=item.window_start,
+                    window_end=item.window_end,
+                )
+            )
+            shutdown_unconfirmed = bool(force and not matured)
+            final_label = (
+                None
+                if transition_guarded or shutdown_unconfirmed
+                else item.online_label
+            )
+            self._finalize_realtime_window(
+                processed=item.processed,
+                probabilities=item.probabilities,
+                operational_prediction=item.operational_prediction,
+                prediction_model_revision=item.prediction_model_revision,
+                online_label=final_label,
+                window_end=item.window_end,
+                quality_accepted=item.quality_accepted,
+                record_payload=item.record_payload,
+            )
+            writer = getattr(self, "_writer", None)
+            if writer is not None and (transition_guarded or shutdown_unconfirmed):
+                writer.append_event(
+                    "training_label_rejected",
+                    timestamp_monotonic=timestamp,
+                    scene_index=scene_index,
+                    window_start_monotonic=item.window_start,
+                    window_end_monotonic=item.window_end,
+                    original_label_id=int(item.online_label.label_id),
+                    reason=(
+                        "lane_transition_guard"
+                        if transition_guarded
+                        else "session_stopped_before_guard_confirmation"
+                    ),
+                    lane_transition_guard_sec=guard,
+                )
+        self._pending_cued_windows = remaining
+
+    def _finalize_realtime_window(
+        self,
+        *,
+        processed: np.ndarray,
+        probabilities: np.ndarray,
+        operational_prediction: int | None,
+        prediction_model_revision: int,
+        online_label: Any | None,
+        window_end: float,
+        quality_accepted: bool,
+        record_payload: dict[str, Any] | None,
+    ) -> None:
+        """Commit one transition-safe window to adaptation and recording."""
+
+        if online_label is not None and quality_accepted:
+            self._handle_online_label(
+                processed=processed,
+                probabilities=probabilities,
+                operational_prediction=operational_prediction,
+                prediction_model_revision=prediction_model_revision,
+                online_label=online_label,
+                window_end=window_end,
+            )
+        if record_payload is None:
+            return
+        self._writer.put(
+            y_true=-1 if online_label is None else int(online_label.label_id),
+            label_event_id=(
+                "" if online_label is None else str(online_label.event_id)
+            ),
+            scene_label=-1 if online_label is None else int(online_label.label_id),
+            **record_payload,
+        )
 
     def _resolve_window_time_bounds(self, timestamps: np.ndarray) -> tuple[float, float]:
         """Resolve an EEG window on the same monotonic clock used by Unity."""

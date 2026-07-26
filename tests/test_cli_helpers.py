@@ -225,6 +225,12 @@ class CliHelperTests(unittest.TestCase):
     def test_default_config_matches_project_config_file(self) -> None:
         project_config = yaml.safe_load((Path(__file__).resolve().parents[1] / "config.yaml").read_text(encoding="utf-8"))
         self.assertEqual(default_config(), project_config)
+        self.assertEqual(
+            project_config["online_adaptation"]["cued_labels"][
+                "lane_transition_guard_sec"
+            ],
+            0.5,
+        )
 
     def test_protocol_block_randomizer_respects_constraints(self) -> None:
         sequence = generate_block_sequence({"left": 8, "right": 8, "idle": 8}, rng=random.Random(17))
