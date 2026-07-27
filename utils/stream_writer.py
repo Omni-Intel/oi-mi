@@ -707,10 +707,16 @@ class StreamWriter:
                 "raw_window_prediction": "argmax(probabilities) before online update",
                 "operational_prediction": "confidence-thresholded command; abstention=-1",
                 "balanced_accuracy": "macro recall over the fixed class set; missing-class recall=0",
-                "scene_prediction": "the single causally clean primary decision window",
+                "scene_prediction": (
+                    "mean probability across quality-accepted causally clean "
+                    "primary windows in the same Scene"
+                ),
             },
             "evaluated_windows": int(np.sum(valid)),
             "primary_decision_windows": int(np.sum(primary_valid)),
+            "primary_decision_scenes": int(
+                np.unique(scene_indices[primary_valid & (scene_indices >= 0)]).size
+            ),
             "primary_decision_quality_rejected": int(
                 np.sum(adaptation_eligible & ~quality)
             ),

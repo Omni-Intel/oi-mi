@@ -144,3 +144,59 @@ def test_runtime_manifest_requires_runtime_code_hash(tmp_path) -> None:
         assert "missing critical file hashes" in str(exc)
     else:
         raise AssertionError("Runtime manifest without code hash unexpectedly validated.")
+
+
+def test_scene_readiness_retries_until_authoritative_ack(monkeypatch) -> None:
+    class _Outlet:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def push_with_ack(self, command: str) -> dict[str, object]:
+            assert command == "SCENE_STATE"
+            self.calls += 1
+            if self.calls < 3:
+                raise RuntimeError("driving scene is still loading")
+            return {
+                "ack": "SCENE_STATE",
+                "protocol_version": unity_runtime.REQUIRED_RUNTIME_PROTOCOL,
+                "scene_number": 4,
+                "current_lane": -1,
+            }
+
+    monkeypatch.setattr(unity_runtime.time, "sleep", lambda _seconds: None)
+    outlet = _Outlet()
+
+    ack = unity_runtime.wait_for_unity_scene_ready(
+        outlet,
+        timeout_sec=1.0,
+        retry_interval_sec=0.01,
+    )
+
+    assert outlet.calls == 3
+    assert ack["scene_number"] == 4
+
+
+def test_scene_readiness_rejects_invalid_lane_state(monkeypatch) -> None:
+    class _Outlet:
+        def push_with_ack(self, _command: str) -> dict[str, object]:
+            return {
+                "ack": "SCENE_STATE",
+                "protocol_version": unity_runtime.REQUIRED_RUNTIME_PROTOCOL,
+                "scene_number": 1,
+                "current_lane": 9,
+            }
+
+    clock = iter([0.0, 0.0, 1.0])
+    monkeypatch.setattr(unity_runtime.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(unity_runtime.time, "sleep", lambda _seconds: None)
+
+    try:
+        unity_runtime.wait_for_unity_scene_ready(
+            _Outlet(),
+            timeout_sec=0.5,
+            retry_interval_sec=0.0,
+        )
+    except RuntimeError as exc:
+        assert "did not become ACK-ready" in str(exc)
+    else:
+        raise AssertionError("Invalid Unity lane state unexpectedly passed readiness.")

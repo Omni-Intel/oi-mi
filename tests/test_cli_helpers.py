@@ -597,6 +597,15 @@ class CliHelperTests(unittest.TestCase):
             def push(self, command: str) -> None:
                 self.commands.append(command)
 
+            def push_with_ack(self, command: str) -> dict[str, object]:
+                self.commands.append(command)
+                return {
+                    "ack": command,
+                    "protocol_version": "continuous-scene-v4-dynamic-label",
+                    "scene_number": 1,
+                    "current_lane": 0,
+                }
+
         fake_outlet = FakeOutlet()
 
         class FakeRouter:
@@ -628,7 +637,12 @@ class CliHelperTests(unittest.TestCase):
         self.assertEqual(fake_router.source, "decoder")
         self.assertEqual(
             fake_outlet.commands,
-            ["OPEN_LAUNCHER", "OPEN_3D_GAME", "LAUNCHER_SELECT"],
+            [
+                "OPEN_LAUNCHER",
+                "OPEN_3D_GAME",
+                "LAUNCHER_SELECT",
+                "SCENE_STATE",
+            ],
         )
 
     def test_build_game_command_outlet_can_disable_startup_scene(self) -> None:
@@ -883,10 +897,16 @@ class CliHelperTests(unittest.TestCase):
             decoder._model_lock = threading.RLock()
             decoder._model_save_path = Path(tmp_dir) / "S001" / "dummy" / "shallowconvnet.pt"
 
-            decoder._save_current_model()
+            decoder.save_current_model()
 
             self.assertIsNone(decoder._model.saved_path)
             self.assertTrue(decoder._model_save_path.parent.is_dir())
+
+    def test_realtime_decoder_model_save_is_noop_without_path(self) -> None:
+        decoder = RealTimeDecoder.__new__(RealTimeDecoder)
+        decoder._model_save_path = None
+
+        decoder.save_current_model()
 
     def test_manual_online_label_source_overlaps_decode_window(self) -> None:
         source = ManualOnlineLabelSource(default_ttl_sec=1.0)

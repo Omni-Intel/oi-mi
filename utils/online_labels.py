@@ -167,6 +167,8 @@ class CuedOnlineLabelSource(OnlineLabelSource):
         start_delay_sec: float = 5.0,
         boundary_guard_sec: float = 0.5,
         lane_transition_guard_sec: float = 0.0,
+        primary_windows_per_scene: int = 2,
+        primary_window_spacing_sec: float = 1.0,
         clock: Any = time.monotonic,
     ) -> None:
         if not sequence:
@@ -179,6 +181,14 @@ class CuedOnlineLabelSource(OnlineLabelSource):
         )
         self._lane_transition_guard_sec = max(
             float(lane_transition_guard_sec),
+            0.0,
+        )
+        self._primary_windows_per_scene = max(
+            int(primary_windows_per_scene),
+            1,
+        )
+        self._primary_window_spacing_sec = max(
+            float(primary_window_spacing_sec),
             0.0,
         )
         self._clock = clock
@@ -386,8 +396,10 @@ class CuedOnlineLabelSource(OnlineLabelSource):
                 or expected_safe_lane != int(safe_lane)
             ):
                 return False
-            if timestamp >= self._scene_started_at + self._scene_duration_sec:
-                return False
+            # An unconfirmed Scene has no authoritative start time yet.  Unity
+            # may need longer than one Scene duration to launch or render the
+            # first layout, so the local placeholder must never invalidate an
+            # otherwise exact ACK.  The fixed five-second clock begins here.
             self._scene_started_at = max(self._scene_started_at, timestamp)
             self._confirmed_scene_index = self._scene_index
             self._confirmed_safe_lane = int(safe_lane)
@@ -472,6 +484,8 @@ class CuedOnlineLabelSource(OnlineLabelSource):
             "scene_duration_sec": self._scene_duration_sec,
             "boundary_guard_sec": self._boundary_guard_sec,
             "lane_transition_guard_sec": self._lane_transition_guard_sec,
+            "primary_windows_per_scene": self._primary_windows_per_scene,
+            "primary_window_spacing_sec": self._primary_window_spacing_sec,
             "lane_transition_events": [
                 {
                     "scene_index": scene_index,
@@ -617,6 +631,12 @@ def build_cued_online_label_source(
         boundary_guard_sec=float(cue_config.get("boundary_guard_sec", 0.5)),
         lane_transition_guard_sec=float(
             cue_config.get("lane_transition_guard_sec", 0.5)
+        ),
+        primary_windows_per_scene=int(
+            cue_config.get("primary_windows_per_scene", 2)
+        ),
+        primary_window_spacing_sec=float(
+            cue_config.get("primary_window_spacing_sec", 1.0)
         ),
         clock=clock,
     )

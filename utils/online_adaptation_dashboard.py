@@ -69,7 +69,7 @@ def render_online_cue_panel(status: dict[str, Any] | None, *, ui: Any) -> None:
     ui.caption(
         "LEFT/RIGHT/IDLE 均以 Scene 开始时小车实际车道为参照；"
         "只有 Unity ACK 同时确认起始车道、空路和相对动作后才产生训练标签；"
-        "每个 Scene 只有首个主决策窗进入 NeuroOnline。"
+        "每个 Scene 采集两个因果干净的主决策窗，完成后才放行横向控制。"
     )
     ui.markdown(f"<div style='text-align:center;font-size:5rem'>{prompt}</div>", unsafe_allow_html=True)
 

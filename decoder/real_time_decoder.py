@@ -141,7 +141,21 @@ class RealTimeDecoder:
         )
         self._pending_cued_windows: list[_PendingCuedWindow] = []
         self._primary_decision_scenes: set[int] = set()
-        self._primary_decision_window_bounds: dict[int, tuple[float, float]] = {}
+        self._primary_decision_window_bounds: dict[
+            int,
+            list[tuple[float, float]],
+        ] = {}
+        self._primary_decision_probabilities: dict[int, list[np.ndarray]] = {}
+        source_metadata = getattr(online_label_source, "metadata", None)
+        cue_metadata = source_metadata() if callable(source_metadata) else {}
+        self._primary_windows_per_scene = max(
+            int((cue_metadata or {}).get("primary_windows_per_scene", 2)),
+            1,
+        )
+        self._primary_window_spacing_sec = max(
+            float((cue_metadata or {}).get("primary_window_spacing_sec", 1.0)),
+            self._step_sec,
+        )
         self._control_released_at: dict[int, float] = {}
         self._last_processed_window_end_monotonic: float | None = None
         self._stale_source_windows_rejected = 0
@@ -160,6 +174,9 @@ class RealTimeDecoder:
         self._game_disconnect_message: str | None = None
         self._scene_sent_scene_index = -1
         self._scene_sent_label_id: int | None = None
+        self._unity_scene_number_offset: int | None = None
+        self._unity_scene_numbers: dict[int, int] = {}
+        self._max_scenes: int | None = None
         self._scene_sync_error: str | None = None
         self._failed_scene_indices: set[int] = set()
         self._scene_started_at: dict[int, float] = {}
@@ -254,9 +271,13 @@ class RealTimeDecoder:
         save_dir: Path | None = None,
         record: bool = False,
         heartbeat: Callable[[], None] | None = None,
+        max_scenes: int | None = None,
     ) -> None:
+        if max_scenes is not None and int(max_scenes) < 1:
+            raise ValueError("max_scenes must be at least 1 when provided")
         self._record = record
         self._subject_id = subject_id
+        self._max_scenes = None if max_scenes is None else int(max_scenes)
         self._last_game_command = None
         self._last_game_transport_command = None
         self._last_game_transport_error = None
@@ -265,12 +286,15 @@ class RealTimeDecoder:
         self._game_session_started = False
         self._primary_decision_scenes.clear()
         self._primary_decision_window_bounds.clear()
+        self._primary_decision_probabilities.clear()
         self._control_released_at.clear()
         self._last_processed_window_end_monotonic = None
         self._stale_source_windows_rejected = 0
         self._game_disconnect_message = None
         self._scene_sent_scene_index = -1
         self._scene_sent_label_id = None
+        self._unity_scene_number_offset = None
+        self._unity_scene_numbers.clear()
         self._scene_sync_error = None
         self._failed_scene_indices.clear()
         self._scene_started_at.clear()
@@ -308,17 +332,25 @@ class RealTimeDecoder:
             )
             self._snapshot_model_revision(0, source="session_start")
 
-        self._push_game_session_command("START")
-        self.start()
+        run_status = "running"
+        run_error: str | None = None
         try:
+            self._push_game_session_command("START")
+            self.start()
             while not self._stop_event.is_set():
                 self._sleep_with_heartbeat(min(0.1, max(self._step_sec, 0.1)), heartbeat)
                 if heartbeat is not None:
                     heartbeat()
             if self._game_disconnect_message:
                 raise RuntimeError(self._game_disconnect_message)
+            run_status = "completed"
         except KeyboardInterrupt:
+            run_status = "interrupted"
             self._console.print("\n[bold red]停止实时解码[/bold red]")
+        except Exception as exc:
+            run_status = "failed"
+            run_error = str(exc)
+            raise
         finally:
             self.stop()
             self._record_active_scene_end(outcome="incomplete", reason="session_stop")
@@ -327,11 +359,15 @@ class RealTimeDecoder:
             if hasattr(self, "_writer"):
                 self._writer.append_event(
                     "session_stop",
+                    status=run_status,
+                    error=run_error,
                     model_revision=self._model_revision,
                 )
                 self._writer.stop()
                 self._writer.finalize_manifest(
                     {
+                        "status": run_status,
+                        "error": run_error,
                         "model_revision": self._model_revision,
                         "model_revisions": list(self._model_revision_records),
                         "online_adaptation": self._online_adaptation_status(),
@@ -674,26 +710,44 @@ class RealTimeDecoder:
                     window_start=window_start,
                     window_end=window_end,
                 )
-                primary_decision = self._claim_primary_decision_window(
+                primary_decision_slot = self._claim_primary_decision_window(
                     online_label=online_label,
                     window_start=window_start,
                     window_end=window_end,
                 )
-                game_command = self._to_game_command(result)
+                primary_decision = primary_decision_slot is not None
+                scene_index = int(
+                    (getattr(online_label, "payload", None) or {}).get(
+                        "scene_index",
+                        -1,
+                    )
+                )
+                if primary_decision and preprocessing.quality.accepted:
+                    self._primary_decision_probabilities.setdefault(
+                        scene_index,
+                        [],
+                    ).append(np.asarray(probabilities, dtype=np.float64).copy())
+                control_result = result
+                if (
+                    primary_decision
+                    and scene_index in self._primary_decision_scenes
+                ):
+                    control_result = self._aggregate_primary_control_result(
+                        scene_index
+                    )
+                game_command = self._to_game_command(control_result)
                 control_gate_active = self._is_cued_control_gate_active()
                 self._push_game_command(None if control_gate_active else game_command)
                 self._emit_status(
-                    result,
+                    control_result,
                     None if control_gate_active else game_command,
                 )
                 if primary_decision:
-                    scene_index = int(
-                        (getattr(online_label, "payload", None) or {}).get(
-                            "scene_index",
-                            -1,
-                        )
+                    lateral_control_released = (
+                        scene_index in self._primary_decision_scenes
                     )
-                    self._control_released_at[scene_index] = time.monotonic()
+                    if lateral_control_released:
+                        self._control_released_at[scene_index] = time.monotonic()
                     writer = getattr(self, "_writer", None)
                     if writer is not None:
                         writer.append_event(
@@ -701,6 +755,8 @@ class RealTimeDecoder:
                             timestamp_monotonic=window_end,
                             scene_index=scene_index,
                             scene_number=scene_index + 1,
+                            window_index=int(primary_decision_slot),
+                            windows_required=self._primary_windows_per_scene,
                             window_start_monotonic=window_start,
                             window_end_monotonic=window_end,
                             instruction_label_id=int(online_label.label_id),
@@ -710,7 +766,24 @@ class RealTimeDecoder:
                             ),
                             confidence=float(result.confidence),
                             quality_accepted=bool(preprocessing.quality.accepted),
-                            lateral_control_released=True,
+                            lateral_control_released=lateral_control_released,
+                            ensemble_window_count=len(
+                                self._primary_decision_probabilities.get(
+                                    scene_index,
+                                    [],
+                                )
+                            ),
+                            ensemble_prediction=(
+                                -1
+                                if not lateral_control_released
+                                or control_result.class_id is None
+                                else int(control_result.class_id)
+                            ),
+                            ensemble_confidence=(
+                                float(control_result.confidence)
+                                if lateral_control_released
+                                else float("nan")
+                            ),
                         )
                 record_payload = None
                 if hasattr(self, "_record") and self._record and hasattr(self, "_writer"):
@@ -1034,6 +1107,12 @@ class RealTimeDecoder:
         """Route one labeled window to the configured adaptation strategy."""
 
         label_id = int(online_label.label_id)
+        event_id = str(getattr(online_label, "event_id", ""))
+        if str(getattr(online_label, "source", "")) == "cued-protocol":
+            event_id = (
+                f"{event_id}-window-end-"
+                f"{int(round(float(window_end) * 1_000_000.0))}"
+            )
         if self._neuroonline_adapter is not None:
             accepted = self._neuroonline_adapter.add_window(
                 processed,
@@ -1041,7 +1120,7 @@ class RealTimeDecoder:
                 predicted_label=int(np.argmax(probabilities)),
                 operational_predicted_label=operational_prediction,
                 probabilities=probabilities,
-                event_id=str(getattr(online_label, "event_id", "")),
+                event_id=event_id,
                 model_revision=prediction_model_revision,
                 window_end_monotonic=window_end,
             )
@@ -1051,12 +1130,11 @@ class RealTimeDecoder:
                 self._console.print(
                     "[bold cyan]NeuroOnline 已在后台训练候选模型，实时预测继续使用当前模型[/bold cyan]"
                 )
-            return
+            return bool(accepted)
 
         if self._batch_adapter is not None:
-            event_id = str(
-                getattr(online_label, "event_id", "")
-                or f"label-{float(online_label.timestamp_monotonic):.6f}"
+            event_id = event_id or (
+                f"label-{float(online_label.timestamp_monotonic):.6f}"
             )
             self._batch_adapter.add_window(
                 processed,
@@ -1130,14 +1208,14 @@ class RealTimeDecoder:
         online_label: Any | None,
         window_start: float,
         window_end: float,
-    ) -> bool:
-        """Claim the first causally clean instruction window in one Unity Scene."""
+    ) -> int | None:
+        """Claim one of the fixed, causally clean training windows in a Scene."""
 
         if (
             online_label is None
             or str(getattr(online_label, "source", "")) != "cued-protocol"
         ):
-            return False
+            return None
         payload = getattr(online_label, "payload", None) or {}
         scene_index = int(payload.get("scene_index", -1))
         segment_index = int(payload.get("segment_index", -1))
@@ -1147,17 +1225,53 @@ class RealTimeDecoder:
             or scene_index != getattr(self, "_scene_sent_scene_index", -1)
             or scene_index in getattr(self, "_primary_decision_scenes", set())
         ):
-            return False
+            return None
         if not hasattr(self, "_primary_decision_scenes"):
             self._primary_decision_scenes = set()
         if not hasattr(self, "_primary_decision_window_bounds"):
             self._primary_decision_window_bounds = {}
-        self._primary_decision_scenes.add(scene_index)
-        self._primary_decision_window_bounds[scene_index] = (
+        if not hasattr(self, "_primary_windows_per_scene"):
+            self._primary_windows_per_scene = 2
+        if not hasattr(self, "_primary_window_spacing_sec"):
+            self._primary_window_spacing_sec = 1.0
+        bounds = self._primary_decision_window_bounds.setdefault(scene_index, [])
+        if bounds:
+            next_start = bounds[-1][0] + self._primary_window_spacing_sec
+            tolerance = max(self._step_sec * 0.25, 1.0 / self._sfreq)
+            if float(window_start) < next_start - tolerance:
+                return None
+        bounds.append((
             float(window_start),
             float(window_end),
+        ))
+        window_index = len(bounds)
+        if window_index >= self._primary_windows_per_scene:
+            self._primary_decision_scenes.add(scene_index)
+        return window_index
+
+    def _aggregate_primary_control_result(
+        self,
+        scene_index: int,
+    ) -> PredictionResult:
+        """Average quality-accepted primary-window probabilities for control."""
+
+        probability_rows = getattr(
+            self,
+            "_primary_decision_probabilities",
+            {},
+        ).get(int(scene_index), [])
+        if not probability_rows:
+            return PredictionResult(
+                label="静息",
+                confidence=0.0,
+                uncertainty=1.0,
+                class_id=None,
+            )
+        mean_probabilities = np.mean(
+            np.stack(probability_rows, axis=0),
+            axis=0,
         )
-        return True
+        return self._post_process(mean_probabilities)
 
     def _is_cued_control_gate_active(self) -> bool:
         """Hold lateral Unity commands until the current Scene has clean EEG."""
@@ -1260,7 +1374,7 @@ class RealTimeDecoder:
 
     def _save_current_model(self) -> None:
         if self._model_save_path is None:
-            return bool(accepted)
+            return
         with self._model_lock:
             model_snapshot = copy.deepcopy(self._model)
             revision = getattr(self, "_model_revision", 0)
@@ -1271,6 +1385,11 @@ class RealTimeDecoder:
             source="online_update",
             model_snapshot=model_snapshot,
         )
+
+    def save_current_model(self) -> None:
+        """Persist the decoder revision that is currently active under the model lock."""
+
+        self._save_current_model()
 
     def _swap_model(self, candidate: BaseModelAdapter) -> None:
         with self._model_lock:
@@ -1398,11 +1517,30 @@ class RealTimeDecoder:
         scene_index = int(status.get("scene_index", -1))
         label_value = status.get("label_id")
         label_id = -1 if label_value is None else int(label_value)
-        if (
-            scene_index == getattr(self, "_scene_sent_scene_index", -1)
-            and label_id == getattr(self, "_scene_sent_label_id", None)
-        ):
+        # A Unity obstacle layout is immutable for the full Scene. LANE_SETTLED
+        # may change the dynamic EEG truth (for example RIGHT -> IDLE), but that
+        # must never send another SCENE_* command or create another obstacle wall.
+        if scene_index == getattr(self, "_scene_sent_scene_index", -1):
             return
+        previous_scene = getattr(self, "_scene_sent_scene_index", -1)
+        if previous_scene >= 0:
+            failed_scene_indices = getattr(self, "_failed_scene_indices", set())
+            self._record_scene_end(
+                previous_scene,
+                outcome=(
+                    "failed"
+                    if previous_scene in failed_scene_indices
+                    else "success"
+                ),
+                reason="fixed_boundary",
+            )
+            max_scenes = getattr(self, "_max_scenes", None)
+            if (
+                max_scenes is not None
+                and len(getattr(self, "_scene_end_recorded", set())) >= max_scenes
+            ):
+                self._stop_event.set()
+                return
 
         if label_id < 0:
             state_ack = self._push_game_scene_transport_command("SCENE_STATE")
@@ -1416,8 +1554,26 @@ class RealTimeDecoder:
                 self._validate_unity_protocol_ack(
                     state_ack,
                     expected_ack="SCENE_STATE",
-                    expected_scene_number=scene_index + 1,
+                    expected_scene_number=None,
                 )
+                unity_scene_number = int(state_ack["scene_number"])
+                if unity_scene_number < 1:
+                    raise ValueError(
+                        f"Unity returned invalid next scene number {unity_scene_number}"
+                    )
+                if getattr(self, "_unity_scene_number_offset", None) is None:
+                    # Unity deliberately keeps its counter while the game window stays
+                    # open. Anchor this Python run to the first authoritative state ACK,
+                    # then validate every following ACK/event against the fixed offset.
+                    self._unity_scene_number_offset = (
+                        unity_scene_number - (scene_index + 1)
+                    )
+                expected_unity_scene_number = self._unity_scene_number(scene_index)
+                if unity_scene_number != expected_unity_scene_number:
+                    raise ValueError(
+                        f"expected Unity scene {expected_unity_scene_number}, "
+                        f"received {unity_scene_number}"
+                    )
                 start_lane = int(state_ack["current_lane"])
                 prepare_scene = getattr(
                     self._online_label_source,
@@ -1444,25 +1600,13 @@ class RealTimeDecoder:
         if command is None:
             self._scene_sync_error = f"unsupported scene label id: {label_id}"
             return
-        previous_scene = getattr(self, "_scene_sent_scene_index", -1)
-        if previous_scene >= 0 and previous_scene != scene_index:
-            failed_scene_indices = getattr(self, "_failed_scene_indices", set())
-            self._record_scene_end(
-                previous_scene,
-                outcome=(
-                    "failed"
-                    if previous_scene in failed_scene_indices
-                    else "success"
-                ),
-                reason="fixed_boundary",
-            )
         scene_ack = self._push_game_scene_transport_command(command)
         if scene_ack is not None:
             try:
                 self._validate_unity_protocol_ack(
                     scene_ack,
                     expected_ack=command,
-                    expected_scene_number=scene_index + 1,
+                    expected_scene_number=self._unity_scene_number(scene_index),
                 )
                 applied_label_name = str(scene_ack["applied_label"]).strip().lower()
                 applied_label_id = {"left": 0, "right": 1, "idle": 2}[
@@ -1511,10 +1655,13 @@ class RealTimeDecoder:
                 self._scene_start_lanes = {}
             if not hasattr(self, "_scene_safe_lanes"):
                 self._scene_safe_lanes = {}
+            if not hasattr(self, "_unity_scene_numbers"):
+                self._unity_scene_numbers = {}
             self._scene_started_at[scene_index] = scene_ack_time
             self._scene_labels[scene_index] = label_id
             self._scene_start_lanes[scene_index] = start_lane
             self._scene_safe_lanes[scene_index] = safe_lane
+            self._unity_scene_numbers[scene_index] = int(scene_ack["scene_number"])
             writer = getattr(self, "_writer", None)
             if writer is not None:
                 writer.append_event(
@@ -1522,6 +1669,8 @@ class RealTimeDecoder:
                     timestamp_monotonic=scene_ack_time,
                     scene_index=scene_index,
                     scene_number=scene_index + 1,
+                    unity_scene_number=int(scene_ack["scene_number"]),
+                    unity_scene_number_offset=self._unity_scene_number_offset,
                     label_id=label_id,
                     label_name=status.get("label_name"),
                     unity_command=command,
@@ -1571,12 +1720,22 @@ class RealTimeDecoder:
                 continue
             if event_name != "SCENE_FAILED":
                 continue
-            failed_scene_index = int(event.get("scene_number", 0)) - 1
+            unity_scene_number = int(event.get("scene_number", 0))
+            failed_scene_index = self._internal_scene_index_from_unity(
+                unity_scene_number
+            )
+            if failed_scene_index is None:
+                LOGGER.warning(
+                    "Ignored Unity SCENE_FAILED before scene-number mapping was established: %s",
+                    event,
+                )
+                continue
             if failed_scene_index != self._scene_sent_scene_index:
                 LOGGER.warning(
-                    "Ignored stale Unity SCENE_FAILED event scene_number=%s; current=%s",
-                    event.get("scene_number"),
-                    self._scene_sent_scene_index + 1,
+                    "Ignored stale Unity SCENE_FAILED event unity_scene_number=%s; "
+                    "current_unity_scene=%s",
+                    unity_scene_number,
+                    self._unity_scene_number(self._scene_sent_scene_index),
                 )
                 continue
             recorded = mark_scene_failed(
@@ -1598,6 +1757,7 @@ class RealTimeDecoder:
                         ),
                         scene_index=failed_scene_index,
                         scene_number=failed_scene_index + 1,
+                        unity_scene_number=unity_scene_number,
                         label_id=self._scene_labels.get(
                             failed_scene_index,
                             self._scene_sent_label_id,
@@ -1617,12 +1777,20 @@ class RealTimeDecoder:
                 f"invalid LANE_SETTLED protocol version: {event!r}"
             )
             return
-        scene_index = int(event.get("scene_number", 0)) - 1
+        unity_scene_number = int(event.get("scene_number", 0))
+        scene_index = self._internal_scene_index_from_unity(unity_scene_number)
+        if scene_index is None:
+            LOGGER.warning(
+                "Ignored Unity LANE_SETTLED before scene-number mapping was established: %s",
+                event,
+            )
+            return
         if scene_index != self._scene_sent_scene_index:
             LOGGER.warning(
-                "Ignored stale Unity LANE_SETTLED event scene_number=%s; current=%s",
-                event.get("scene_number"),
-                self._scene_sent_scene_index + 1,
+                "Ignored stale Unity LANE_SETTLED event unity_scene_number=%s; "
+                "current_unity_scene=%s",
+                unity_scene_number,
+                self._unity_scene_number(self._scene_sent_scene_index),
             )
             return
         try:
@@ -1650,6 +1818,45 @@ class RealTimeDecoder:
         transition_time = float(
             event.get("_received_at_monotonic", time.monotonic())
         )
+        scene_started_at = getattr(self, "_scene_started_at", {}).get(scene_index)
+        label_metadata = self._online_label_source_metadata() or {}
+        scene_duration_sec = float(label_metadata.get("scene_duration_sec", 0.0))
+        if (
+            scene_started_at is not None
+            and scene_duration_sec > 0.0
+            and transition_time > scene_started_at + scene_duration_sec
+        ):
+            # Unity events are timestamped when Python receives them. An event
+            # queued at the fixed boundary can therefore arrive a few
+            # milliseconds after the Scene is already over. It must not alter
+            # the next Scene's truth, but it is not a protocol failure either.
+            writer = getattr(self, "_writer", None)
+            if writer is not None:
+                writer.append_event(
+                    "lane_settled_ignored",
+                    timestamp_monotonic=transition_time,
+                    scene_index=scene_index,
+                    scene_number=scene_index + 1,
+                    unity_scene_number=unity_scene_number,
+                    reason="received_after_fixed_scene_boundary",
+                    scene_started_at_monotonic=scene_started_at,
+                    scene_duration_sec=scene_duration_sec,
+                    lateness_sec=(
+                        transition_time - (scene_started_at + scene_duration_sec)
+                    ),
+                    unity_event=dict(event),
+                )
+            LOGGER.info(
+                "Ignored late Unity LANE_SETTLED for completed Scene %s "
+                "(lateness=%.3f ms)",
+                scene_index + 1,
+                (
+                    transition_time
+                    - (scene_started_at + scene_duration_sec)
+                )
+                * 1000.0,
+            )
+            return
         if not callable(update_current_lane) or not update_current_lane(
             scene_index=scene_index,
             current_lane=current_lane,
@@ -1667,6 +1874,7 @@ class RealTimeDecoder:
                 timestamp_monotonic=transition_time,
                 scene_index=scene_index,
                 scene_number=scene_index + 1,
+                unity_scene_number=unity_scene_number,
                 current_lane=current_lane,
                 safe_lane=safe_lane,
                 dynamic_label_id=(
@@ -1682,7 +1890,7 @@ class RealTimeDecoder:
         response: dict[str, Any],
         *,
         expected_ack: str,
-        expected_scene_number: int,
+        expected_scene_number: int | None,
     ) -> None:
         if str(response.get("ack", "")).strip().upper() != expected_ack:
             raise ValueError(f"expected ACK {expected_ack}, received {response!r}")
@@ -1693,11 +1901,30 @@ class RealTimeDecoder:
             raise ValueError(
                 f"Unity runtime does not implement {CUED_PROTOCOL_VERSION}"
             )
-        if int(response.get("scene_number", -1)) != int(expected_scene_number):
+        if "scene_number" not in response:
+            raise ValueError(f"Unity ACK has no scene_number: {response!r}")
+        scene_number = int(response["scene_number"])
+        if (
+            expected_scene_number is not None
+            and scene_number != int(expected_scene_number)
+        ):
             raise ValueError(
                 f"expected scene {expected_scene_number}, "
-                f"received {response.get('scene_number')}"
+                f"received {scene_number}"
             )
+
+    def _unity_scene_number(self, scene_index: int) -> int:
+        offset = getattr(self, "_unity_scene_number_offset", None)
+        return int(scene_index) + 1 + (0 if offset is None else int(offset))
+
+    def _internal_scene_index_from_unity(
+        self,
+        unity_scene_number: int,
+    ) -> int | None:
+        offset = getattr(self, "_unity_scene_number_offset", None)
+        if offset is None:
+            return None
+        return int(unity_scene_number) - int(offset) - 1
 
     def _abort_scene_protocol(self, message: str) -> None:
         self._scene_sync_error = message
@@ -1817,6 +2044,9 @@ class RealTimeDecoder:
                 timestamp_monotonic=ended_at,
                 scene_index=index,
                 scene_number=index + 1,
+                unity_scene_number=getattr(self, "_unity_scene_numbers", {}).get(
+                    index
+                ),
                 label_id=getattr(self, "_scene_labels", {}).get(index, -1),
                 start_lane=getattr(self, "_scene_start_lanes", {}).get(index),
                 safe_lane=getattr(self, "_scene_safe_lanes", {}).get(index),
@@ -2039,12 +2269,22 @@ class RealTimeDecoder:
             label_value = result.get("label_id")
             result["scene_synced"] = (
                 scene_index == getattr(self, "_scene_sent_scene_index", -1)
-                and label_value is not None
-                and int(label_value) == getattr(self, "_scene_sent_label_id", None)
+                and getattr(self, "_scene_sync_error", None) is None
             )
             result["primary_decision_collected"] = (
                 scene_index
                 in getattr(self, "_primary_decision_scenes", set())
+            )
+            result["primary_decision_windows_collected"] = len(
+                getattr(self, "_primary_decision_window_bounds", {}).get(
+                    scene_index,
+                    [],
+                )
+            )
+            result["primary_decision_windows_required"] = getattr(
+                self,
+                "_primary_windows_per_scene",
+                2,
             )
             result["lateral_control_gate_active"] = (
                 scene_index
@@ -2056,6 +2296,16 @@ class RealTimeDecoder:
                 {},
             ).get(scene_index)
             result["scene_sync_error"] = getattr(self, "_scene_sync_error", None)
+            result["unity_scene_number_offset"] = getattr(
+                self,
+                "_unity_scene_number_offset",
+                None,
+            )
+            result["unity_scene_number"] = (
+                self._unity_scene_number(scene_index)
+                if getattr(self, "_unity_scene_number_offset", None) is not None
+                else None
+            )
         return result
 
     def _online_label_source_metadata(self) -> dict[str, Any] | None:

@@ -121,7 +121,7 @@ online_adaptation:
     update_batch_size: 16
     epochs: 3
     update_stride: 64
-    # One causally clean primary decision window per Scene.  The first and
+    # Two causally clean primary decision windows per Scene.  The first and
     # every later background update use the latest 64 unique primary windows.
     history_threshold: 64
     recent_samples: 64
@@ -136,7 +136,10 @@ online_adaptation:
     offline_batch_size: 16
     offline_learning_rate: 1.0e-4
     calibration_search:
-      enabled: true
+      # Reuse the newest successful search result from this subject's previous
+      # calibration session. This trains fresh weights and skips the grid search.
+      enabled: false
+      reuse_latest: true
       # Search every learning-rate/batch/mask/lambda combination. All candidates
       # share one trial-grouped split, while a separate set of complete trials
       # remains untouched until the winning configuration.
@@ -173,15 +176,17 @@ online_adaptation:
   cued_labels:
     enabled: true
     # Unity holds one obstacle layout for this epoch. Forward motion and
-    # decoding continue, but lateral commands are causally gated until the
-    # first clean current-Scene decision window has completed.
+    # decoding continue, but lateral commands are causally gated until both
+    # clean current-Scene decision windows have completed.
     # Unity ACK fixes the safe lane for five seconds. LEFT/RIGHT/IDLE truth is
     # recalculated whenever Unity confirms that the car has settled in a lane.
     # A collision only records failure; the next scene still starts at the
     # fixed 5 s boundary.
     scene_duration_sec: 5.0
-    # The primary decision window is the first complete 2 s window beginning
-    # at or after 0.5 s. Later valid windows are recorded but do not adapt.
+    # Collect 0.5-2.5 s and 1.5-3.5 s before releasing lateral control.
+    # This preserves 1.5 s for visible driving feedback in each 5 s Scene.
+    primary_windows_per_scene: 2
+    primary_window_spacing_sec: 1.0
     boundary_guard_sec: 0.5
     # Windows touching the 0.5 s before or after an actual completed lane
     # transition remain decoded and recorded, but receive no training label.

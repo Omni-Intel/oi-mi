@@ -1973,8 +1973,9 @@ def _build_online_label_source(
     cued_cfg = adaptation_cfg.get("cued_labels", {})
     if bool(cued_cfg.get("enabled", True)):
         st.info(
-            "在线适配使用与 Unity 障碍布局统一的连续场景真值；小车始终接受模型控制，"
-            "仅跨越场景切换边界的 EEG 窗口不进入训练和准确率。"
+            "在线适配使用与 Unity 障碍布局统一的连续场景真值；每个 Scene 先采集两个"
+            "因果干净的主决策窗，再放行模型横向控制。跨场景、换道保护区或质量不合格"
+            "的 EEG 窗口不进入训练和准确率。"
         )
         return build_cued_online_label_source(config), None
 

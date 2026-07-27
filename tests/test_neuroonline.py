@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,7 @@ from click.testing import CliRunner
 
 from adaptation.calibration_search import (
     CalibrationSearchConfig,
+    load_latest_calibration_search,
     run_calibration_search,
 )
 from adaptation.neuroonline import (
@@ -222,6 +224,73 @@ class NeuroOnlineTests(unittest.TestCase):
             self.assertIn(
                 "balanced_accuracy",
                 result.report["untouched_holdout_metrics"],
+            )
+
+    def test_latest_calibration_search_reuses_parameters_not_weights(self) -> None:
+        base_config = NeuroOnlineConfig(
+            enabled=True,
+            offline_learning_rate=1e-4,
+            offline_batch_size=16,
+            mask_ratio=0.3,
+            consistency_weight=0.1,
+        )
+        best_parameters = {
+            "offline_learning_rate": 3e-4,
+            "offline_batch_size": 128,
+            "mask_ratio": 0.7,
+            "consistency_weight": 1.5,
+            "weight_decay": 0.05,
+            "label_smoothing": 0.1,
+            "offline_epochs": 50,
+            "offline_patience": 8,
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            records_dir = Path(tmp_dir)
+            old_session = records_dir / "20260725_090000"
+            new_session = records_dir / "20260726_090000"
+            old_session.mkdir()
+            new_session.mkdir()
+            (old_session / "hyperparameter_search.json").write_text(
+                '{"best_parameters": {"invalid": true}}',
+                encoding="utf-8",
+            )
+            (new_session / "hyperparameter_search.json").write_text(
+                json.dumps(
+                    {
+                        "best_parameters": best_parameters,
+                        "untouched_holdout_metrics": {
+                            "balanced_accuracy": 0.5
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            reused_config, report, report_path = load_latest_calibration_search(
+                calibration_records_dir=records_dir,
+                base_config=base_config,
+            )
+
+            self.assertEqual(report_path.parent, new_session)
+            self.assertEqual(reused_config.offline_batch_size, 128)
+            self.assertEqual(reused_config.mask_ratio, 0.7)
+            self.assertEqual(reused_config.consistency_weight, 1.5)
+            self.assertEqual(
+                report["untouched_holdout_metrics"]["balanced_accuracy"],
+                0.5,
+            )
+
+    def test_calibration_search_rejects_search_and_reuse_together(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cannot be enabled"):
+            CalibrationSearchConfig.from_mapping(
+                {
+                    "neuroonline": {
+                        "calibration_search": {
+                            "enabled": True,
+                            "reuse_latest": True,
+                        }
+                    }
+                }
             )
 
     def test_checkpoint_restores_selected_model_coupled_parameters(self) -> None:

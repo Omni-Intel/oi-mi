@@ -270,6 +270,72 @@ def ensure_unity_game_running(
     )
 
 
+def wait_for_unity_scene_ready(
+    outlet: Any,
+    *,
+    timeout_sec: float,
+    retry_interval_sec: float = 0.25,
+    console: Any | None = None,
+) -> dict[str, Any]:
+    """Wait for the driving scene's authoritative, non-mutating state ACK.
+
+    Opening the Unity TCP port only proves that the Game Hub is alive. The
+    driving controller registers ``SCENE_STATE`` after the 3D scene has loaded,
+    so this handshake removes the fixed-sleep startup race without creating an
+    obstacle layout or advancing Unity's scene counter.
+    """
+
+    push_with_ack = getattr(outlet, "push_with_ack", None)
+    if not callable(push_with_ack):
+        raise RuntimeError("Unity command outlet does not support scene readiness ACK.")
+
+    timeout = max(float(timeout_sec), 0.1)
+    retry_interval = max(float(retry_interval_sec), 0.0)
+    deadline = time.monotonic() + timeout
+    attempts = 0
+    last_error: Exception | None = None
+    while True:
+        attempts += 1
+        try:
+            response = push_with_ack("SCENE_STATE")
+            if not isinstance(response, dict):
+                raise ValueError(f"invalid SCENE_STATE response: {response!r}")
+            if str(response.get("ack", "")).strip().upper() != "SCENE_STATE":
+                raise ValueError(f"unexpected SCENE_STATE ACK: {response!r}")
+            if (
+                str(response.get("protocol_version", "")).strip()
+                != REQUIRED_RUNTIME_PROTOCOL
+            ):
+                raise ValueError(
+                    "Unity driving scene returned an incompatible protocol: "
+                    f"{response!r}"
+                )
+            scene_number = int(response.get("scene_number", -1))
+            current_lane = int(response.get("current_lane", -9))
+            if scene_number < 1 or current_lane not in {-1, 0, 1}:
+                raise ValueError(f"invalid Unity lane-state ACK: {response!r}")
+            _notify(
+                console,
+                "Unity driving scene ready: "
+                f"next_scene={scene_number}, current_lane={current_lane}, "
+                f"attempts={attempts}",
+            )
+            return response
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if retry_interval > 0:
+            time.sleep(min(retry_interval, remaining))
+
+    raise RuntimeError(
+        "Unity TCP opened, but the driving scene did not become ACK-ready within "
+        f"{timeout:.1f}s after {attempts} attempt(s): {last_error}"
+    ) from last_error
+
+
 def _launch_process(executable: Path, ar_game_cfg: dict[str, Any]) -> subprocess.Popen[Any]:
     creationflags = 0
     if os.name == "nt":

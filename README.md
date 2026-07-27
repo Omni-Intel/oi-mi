@@ -45,7 +45,7 @@ git reset --hard origin/main
 
 现场电脑只运行仓库内的这个打包结果，不调用其他 Unity 源码仓库，也不需要安装 Unity Editor。运行包必须包含 `oi-mi-runtime.json`；启动前会校验协议版本、必要功能和关键文件 SHA-256，旧版或混装的 Unity 会直接报错，不会继续产生不可信标签。`tools/download_unity_build.py --force` 仅作为运行包损坏时的备用恢复方式，日常更新直接同步 Git 仓库即可。
 
-点击网页左侧的“实时解码”或启动 dummy 测试时，如果 Unity 没有打开，程序会自动以窗口模式启动这个 exe，并等待 `127.0.0.1:5005` 可连接后再继续；随后直接进入小车场景。Windows 实验包会自动启用唯一支持的 Fixed Speed 控制模式，不依赖加载完成时刻不确定的菜单选择命令。实时解码运行期间关闭 Unity 窗口会让小车 TCP 连接断开，网页端实时解码也会停止。
+点击网页左侧的“实时解码”或启动 dummy 测试时，如果 Unity 没有打开，程序会自动以窗口模式启动这个 exe。TCP 端口打开只表示 Game Hub 已启动，程序还会发送 `OPEN_3D_GAME`，随后重复执行无副作用的 `SCENE_STATE` 就绪握手；只有收到正确协议版本、有效 Scene 编号和实际车道后，才启动 EEG 流与 Scene 计时。小车场景最长等待 15 秒，普通 Unity ACK 的单次超时为 3 秒。Windows 实验包会自动启用唯一支持的 Fixed Speed 控制模式，不依赖固定加载时长。实时解码运行期间关闭 Unity 窗口会让小车 TCP 连接断开，网页端实时解码也会停止。
 
 启动成功后浏览器进入 `http://localhost:8501`。实验期间保持启动终端开启，不要重复启动第二个 GUI。
 
@@ -54,7 +54,9 @@ git reset --hard origin/main
 1. 在“设置”页确认被试 ID、`shallowconvnet`、真实设备类型和设备地址，然后保存。
 2. 在“连通检测”页确认 EEG 数据可读取；需要时再做“阻抗检查”。
 3. 进入“校准”并点击“正式实验”；每次实验都会从头校准，不复用旧模型。
-4. 校准采集结束后不要返回、刷新或关闭页面；程序会先按完整 trial 搜索离线预训练超参数，再训练正式模型。等待页面明确显示模型保存路径。
+4. 若该被试已经完成过参数搜索，程序会在采集开始前读取最近一次
+   `records_storage/<被试>/calibration/<时间>/hyperparameter_search.json`，
+   跳过搜索并用其中的最佳参数训练全新的正式模型。等待页面明确显示模型保存路径。
 5. 模型和 CRM 应分别出现在 `models_storage/<被试>/<设备>/shallowconvnet.pt` 与 `shallowconvnet.pt.neuroonline.pt`。
 6. 先进入“测试模式”验证模型和小车链路，再进入“实时解码”开始连续 NeuroOnline 实验。
 
@@ -189,6 +191,14 @@ oi-mi calibrate --subject S001 --model shallowconvnet
 完整候选、分组规模、最佳参数和独立检验指标保存在校准目录的
 `hyperparameter_search.json`，同时写入 `metadata.json`。
 
+参数搜索只需在需要重新选参时运行一次。将
+`online_adaptation.neuroonline.calibration_search.enabled` 设为 `true`、将
+`reuse_latest` 设为 `false` 会执行新搜索；正式重复实验使用
+`enabled: false`、`reuse_latest: true`。此时程序在开始采集前读取同一被试最近一次
+有效报告，复用 `best_parameters`，但不会加载旧模型权重。新会话的
+`metadata.json` 会记录源报告路径和实际使用的参数。若找不到报告，程序会在采集前
+直接报错，防止无意使用默认参数。
+
 实时运行：
 
 ```bash
@@ -223,7 +233,7 @@ python download_datasets.py --dataset BNCI2014_001 --subject 1 --data-dir ./data
 
 ### NeuroOnline 算法复现与小车在线应用
 
-`config.yaml` 中将 `online_adaptation.strategy` 设为 `neuroonline` 后，实时解码采用严格的先预测、后更新流程。小车实验每个 Scene 只允许首个因果干净的主决策窗口进入在线训练：窗口必须完整位于当前 Scene、对应 Unity ACK 确认的初始指令，并且采集期间尚未放行本 Scene 的横向控制。首次及后续更新都在累计新增 64 个唯一主决策窗口时触发，并始终使用最近 64 个主决策窗口。每个训练样本在进入缓冲区时生成固定的时间遮挡和频率遮挡视图，更新目标为三个视图的分类损失加两项表示一致性损失，并联合更新 backbone、CRM 和分类头。
+`config.yaml` 中将 `online_adaptation.strategy` 设为 `neuroonline` 后，实时解码采用严格的先预测、后更新流程。小车实验每个 Scene 只允许两个因果干净的主决策窗口进入在线训练：默认窗口为 ACK 后的 `0.5–2.5 s` 与 `1.5–3.5 s`，两者均完整位于当前 Scene、对应 Unity ACK 确认的初始指令，并且采集期间尚未放行本 Scene 的横向控制。第二个窗口完成后，系统平均两个合格窗口的类别概率来决定首次横向反馈；若只有一个窗口通过质量检查则使用该窗口，两个窗口都不合格时保持 STOP。首次及后续更新都在累计新增 64 个唯一主决策窗口时触发，并始终使用最近 64 个主决策窗口。每个训练样本在进入缓冲区时生成固定的时间遮挡和频率遮挡视图，更新目标为三个视图的分类损失加两项表示一致性损失，并联合更新 backbone、CRM 和分类头。
 
 该模式仅支持 PyTorch 模型，不支持 `riemann-mdm`。CRM 以恒等门控初始化；更新后的 backbone 保存到原模型文件，CRM 状态保存到同目录的 `<model>.neuroonline.pt` sidecar 文件。校准搜索选出的 mask ratio、一致性权重及其他模型耦合参数也写入 sidecar，重启 GUI 后实时更新会自动恢复这些参数；在线 `64/64/64`（首次阈值/更新步长/最近样本）策略、`1e-6` 学习率和控制置信度不参与这次离线搜索。将策略改回 `periodic_head` 可继续使用原有的十分钟候选分类头更新流程。
 
@@ -244,9 +254,9 @@ python download_datasets.py --dataset BNCI2014_001 --subject 1 --data-dir ./data
 
 停止运行后，程序从落盘 chunk 和事件日志独立重算并写入 `scientific_metrics`：
 
-- `primary_decision`：每个 Scene 唯一主决策窗的 test-then-train 原始与阈值后指标；这是模型在线可行性检验的主指标；
+- `primary_decision`：每个 Scene 两个主决策窗的 test-then-train 原始与阈值后指标；这是模型在线可行性检验的主指标；
 - `continuous_dynamic`：Scene 内后续动态标签窗的描述性原始与阈值后指标，不进入 NeuroOnline 主训练缓冲区；
-- `scene_classification`：直接使用每个 Scene 唯一主决策窗，不再对 LEFT→IDLE 等不同真值阶段做不科学的 Scene 内平均；
+- `scene_classification`：对同一 Scene 的两个合格主决策窗做概率平均；不会混入 LEFT→IDLE 等控制后的不同真值阶段；
 - `car_task`：以 `scene_end` 的碰撞/无碰撞结果计算避障成功率及 Wilson 95% 区间。
 
 2 秒窗以 0.5 秒步长滑动，窗口之间并不独立。因此窗口级指标用于描述在线轨迹，论文显著性检验应以 Scene、block、session 或 subject 为统计单位，不能直接对所有重叠窗口使用独立二项假设。
@@ -261,7 +271,7 @@ python download_datasets.py --dataset BNCI2014_001 --subject 1 --data-dir ./data
 
 正式小车实验启用 `online_adaptation.cued_labels` 后采用 `continuous-scene-v4-dynamic-label` 连续动态动作协议。每个 Scene 开始前，Python 先用 `SCENE_STATE` 查询 Unity 中小车的实际车道，再选择一个可达且类别均衡的初始相对动作。Unity 固定本 Scene 的唯一空车道，在同一帧、同一前向距离给另外两条路各布置一辆障碍车，并返回包含 `scene_number/start_lane/safe_lane/applied_label` 的结构化 ACK。Scene 内固定的是 `safe_lane`，而不是动作标签：Unity 只有在车辆横向位置真正到达目标车道后才发送 `LANE_SETTLED`。Python 随即根据当前车道到安全车道的相对关系重新计算真值；位于安全车道时为 `IDLE`，仍在右侧时为 `LEFT`，仍在左侧时为 `RIGHT`。
 
-碰撞只会炸掉被撞的障碍车，另一条路的障碍保持原位；Unity 上报 `SCENE_FAILED` 后，Python 只记录本 Scene 失败，不改变安全车道，到固定的 5 秒边界才同步下一 Scene。正式 Scene 时长保持 `5.0` 秒，Unity 按相对速度 `(6.0 - 3.2) m/s` 将障碍放在约 `14.0 m` 前方：走错车道会因车身碰撞半径在约 4.7 秒判定失败，走对空路则在第 5 秒通过障碍横截面并判定成功。等待首个 Scene、Scene 同步失败或两个已确认 Scene 之间，Unity 不生成任何随机交通；只有成功应用 Scene 命令后才会一次性生成两辆障碍车。未收到当前 Scene 的完整 ACK 时，Python 固定在当前 Scene 编号，绝不会根据本地时钟跳到后续 Scene。模型输入仍是 2 秒窗、0.5 秒步长。新 Scene ACK 后，Python 会继续前向行驶和实时预测，但明确阻止横向命令，直至取得从 ACK 后至少 0.5 秒开始的首个完整 2 秒主决策窗（理想步相下为 `0.5-2.5` 秒）；该窗完成 test-then-train 预测后立即放行横向控制，因此上一 Scene 的脑电不可能提前改变新 Scene 的车道。这个可见的因果门控不是隐藏 STOP 阶段。
+碰撞只会炸掉被撞的障碍车，另一条路的障碍保持原位；Unity 上报 `SCENE_FAILED` 后，Python 只记录本 Scene 失败，不改变安全车道，到固定的 5 秒边界才同步下一 Scene。正式 Scene 时长保持 `5.0` 秒，Unity 按相对速度 `(6.0 - 3.2) m/s` 将障碍放在约 `14.0 m` 前方：走错车道会因车身碰撞半径在约 4.7 秒判定失败，走对空路则在第 5 秒通过障碍横截面并判定成功。等待首个 Scene、Scene 同步失败或两个已确认 Scene 之间，Unity 不生成任何随机交通；只有成功应用 Scene 命令后才会一次性生成两辆障碍车。未收到当前 Scene 的完整 ACK 时，Python 固定在当前 Scene 编号，绝不会根据本地时钟跳到后续 Scene。模型输入仍是 2 秒窗、0.5 秒步长。新 Scene ACK 后，Python 会继续前向行驶和实时预测，但明确阻止横向命令，直至取得两个完整的因果主决策窗（理想步相下为 `0.5-2.5` 秒与 `1.5-3.5` 秒）；第二窗完成后平均全部质量合格窗的类别概率并首次放行横向控制，两个窗口都不合格时保持 STOP。因此上一 Scene 的脑电不可能提前改变新 Scene 的车道，同时每个 Scene 仍保留约 1.5 秒可见控制反馈。这个可见的因果门控不是隐藏 STOP 阶段。
 
 主决策窗的 `instruction_label` 是唯一进入 NeuroOnline 的训练真值。后续窗口仍按小车当前位置到固定安全车道计算 `vehicle_required_action`，并完整落盘用于连续行为分析，但不再因成功者快速转成大量 IDLE、失败者持续产生 LEFT/RIGHT 而污染主训练缓冲区。后续动态窗仍执行 ACK/边界/换道保护校验；以 `LANE_SETTLED` 为中心前后各 0.5 秒的窗口不计动态真值。TCP 消息在接收解析时即记录单调时钟，重复事件 ID、非递增 EEG 窗口终点和重复源窗口都会被拒绝并写入日志。
 

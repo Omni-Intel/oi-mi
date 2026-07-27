@@ -24,6 +24,7 @@ from rich.console import Console
 from acquisition.base import AbstractAcquirer
 from adaptation.calibration_search import (
     CalibrationSearchConfig,
+    load_latest_calibration_search,
     run_calibration_search,
 )
 from adaptation.mi_protocol import (
@@ -130,6 +131,39 @@ class Calibrator:
                 "Head-only calibration was removed; each experiment must train "
                 "a fresh full decoder."
             )
+        reused_search_report: dict[str, Any] | None = None
+        selected_hyperparameters: dict[str, Any] | None = None
+        hyperparameter_report_path: Path | None = None
+        if (
+            self._neuroonline_config.enabled
+            and self._calibration_search_config.reuse_latest
+        ):
+            if not isinstance(self._model, NeuroOnlineModelAdapter):
+                raise RuntimeError(
+                    "Reusing NeuroOnline hyperparameters requires a NeuroOnline "
+                    "model adapter."
+                )
+            base_template = self._model.base
+            (
+                self._neuroonline_config,
+                reused_search_report,
+                hyperparameter_report_path,
+            ) = load_latest_calibration_search(
+                calibration_records_dir=self._calibration_records_dir,
+                base_config=self._neuroonline_config,
+            )
+            selected_hyperparameters = dict(
+                reused_search_report["best_parameters"]
+            )
+            self._model = NeuroOnlineModelAdapter(
+                copy.deepcopy(base_template),
+                config=self._neuroonline_config,
+                state_path=None,
+            )
+            self._console.print(
+                "[bold green]已读取最近一次离线参数搜索结果，将直接训练新模型："
+                f"{hyperparameter_report_path}[/bold green]"
+            )
         plan = build_session_plan(self._protocol)
         (
             session_dir,
@@ -143,6 +177,15 @@ class Calibrator:
             include_practice=include_practice,
             heartbeat=heartbeat,
         )
+        if reused_search_report is not None:
+            session_metadata["hyperparameter_search"] = {
+                "mode": "reused_latest",
+                "source_report_path": str(hyperparameter_report_path),
+                "best_parameters": selected_hyperparameters,
+                "source_untouched_holdout_metrics": reused_search_report.get(
+                    "untouched_holdout_metrics"
+                ),
+            }
         self._console.print("[bold cyan]采集完成，正在保存和训练，请等待工作人员[/bold cyan]")
         search_result = None
         if self._neuroonline_config.enabled and self._calibration_search_config.enabled:
@@ -190,6 +233,7 @@ class Calibrator:
                 state_path=None,
             )
             session_metadata["hyperparameter_search"] = {
+                "mode": "searched_current_session",
                 "report_path": (
                     str(search_result.report_path)
                     if search_result.report_path is not None
@@ -200,6 +244,10 @@ class Calibrator:
                     "untouched_holdout_metrics"
                 ],
             }
+            hyperparameter_report_path = search_result.report_path
+            selected_hyperparameters = dict(
+                search_result.report["best_parameters"]
+            )
             best = search_result.report["best_parameters"]
             holdout = search_result.report["untouched_holdout_metrics"]
             self._console.print(
@@ -287,13 +335,9 @@ class Calibrator:
             calibration_data_path=(session_dir / "training_windows_main.npz") if session_dir is not None else None,
             session_dir=session_dir,
             hyperparameter_search_path=(
-                search_result.report_path if search_result is not None else None
+                hyperparameter_report_path
             ),
-            selected_hyperparameters=(
-                dict(search_result.report["best_parameters"])
-                if search_result is not None
-                else None
-            ),
+            selected_hyperparameters=selected_hyperparameters,
         )
 
     def _collect_training_data(

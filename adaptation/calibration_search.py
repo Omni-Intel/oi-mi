@@ -26,9 +26,10 @@ from models.factory import TorchModelAdapter, split_train_validation_indices
 
 @dataclass(frozen=True, slots=True)
 class CalibrationSearchConfig:
-    """Full-grid search performed after one calibration collection."""
+    """Search or reuse policy for NeuroOnline calibration hyperparameters."""
 
     enabled: bool = False
+    reuse_latest: bool = False
     mode: str = "full_grid"
     selection_epochs: int = 50
     selection_patience: int = 8
@@ -46,8 +47,15 @@ class CalibrationSearchConfig:
         mode = str(data.get("mode", "full_grid")).strip().lower()
         if mode not in {"full_grid", "staged"}:
             raise ValueError("Calibration-search mode must be 'full_grid' or 'staged'.")
+        enabled = bool(data.get("enabled", False))
+        reuse_latest = bool(data.get("reuse_latest", False))
+        if enabled and reuse_latest:
+            raise ValueError(
+                "Calibration search cannot be enabled while reuse_latest is active."
+            )
         return cls(
-            enabled=bool(data.get("enabled", False)),
+            enabled=enabled,
+            reuse_latest=reuse_latest,
             mode=mode,
             selection_epochs=max(int(data.get("selection_epochs", 50)), 1),
             selection_patience=max(int(data.get("selection_patience", 8)), 1),
@@ -79,6 +87,49 @@ class CalibrationSearchResult:
     best_config: NeuroOnlineConfig
     report: dict[str, Any]
     report_path: Path | None
+
+
+def load_latest_calibration_search(
+    *,
+    calibration_records_dir: Path | None,
+    base_config: NeuroOnlineConfig,
+) -> tuple[NeuroOnlineConfig, dict[str, Any], Path]:
+    """Load the newest completed search report without reusing model weights."""
+
+    if calibration_records_dir is None:
+        raise RuntimeError(
+            "Cannot reuse calibration hyperparameters because the calibration "
+            "records directory is not configured."
+        )
+    reports = sorted(
+        calibration_records_dir.glob("*/hyperparameter_search.json"),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    if not reports:
+        raise RuntimeError(
+            "No previous hyperparameter_search.json was found under "
+            f"{calibration_records_dir}. Copy the completed search session here "
+            "or enable calibration_search.enabled for one new search."
+        )
+
+    validation_errors: list[str] = []
+    for report_path in reports:
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            if not isinstance(report, dict):
+                raise ValueError("report root is not an object")
+            parameters = _validated_selected_parameters(report.get("best_parameters"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            validation_errors.append(f"{report_path}: {exc}")
+            continue
+        return replace(base_config, **parameters), report, report_path
+
+    details = "; ".join(validation_errors[:3])
+    raise RuntimeError(
+        "Previous calibration search reports were found, but none contains a "
+        f"complete valid best_parameters set. {details}"
+    )
 
 
 def run_calibration_search(
@@ -351,6 +402,49 @@ def _selected_parameters(config: NeuroOnlineConfig) -> dict[str, Any]:
         "offline_epochs": config.offline_epochs,
         "offline_patience": config.offline_patience,
     }
+
+
+def _validated_selected_parameters(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("best_parameters is missing or is not an object")
+    required = {
+        "offline_learning_rate",
+        "offline_batch_size",
+        "mask_ratio",
+        "consistency_weight",
+        "weight_decay",
+        "label_smoothing",
+        "offline_epochs",
+        "offline_patience",
+    }
+    missing = sorted(required - value.keys())
+    if missing:
+        raise ValueError(f"best_parameters is missing: {', '.join(missing)}")
+    parameters = {
+        "offline_learning_rate": float(value["offline_learning_rate"]),
+        "offline_batch_size": int(value["offline_batch_size"]),
+        "mask_ratio": float(value["mask_ratio"]),
+        "consistency_weight": float(value["consistency_weight"]),
+        "weight_decay": float(value["weight_decay"]),
+        "label_smoothing": float(value["label_smoothing"]),
+        "offline_epochs": int(value["offline_epochs"]),
+        "offline_patience": int(value["offline_patience"]),
+    }
+    if parameters["offline_learning_rate"] <= 0:
+        raise ValueError("offline_learning_rate must be positive")
+    if parameters["offline_batch_size"] <= 0:
+        raise ValueError("offline_batch_size must be positive")
+    if not 0.0 <= parameters["mask_ratio"] <= 1.0:
+        raise ValueError("mask_ratio must be between 0 and 1")
+    if parameters["consistency_weight"] < 0:
+        raise ValueError("consistency_weight must be non-negative")
+    if parameters["weight_decay"] < 0:
+        raise ValueError("weight_decay must be non-negative")
+    if not 0.0 <= parameters["label_smoothing"] <= 1.0:
+        raise ValueError("label_smoothing must be between 0 and 1")
+    if parameters["offline_epochs"] <= 0 or parameters["offline_patience"] <= 0:
+        raise ValueError("offline epochs and patience must be positive")
+    return parameters
 
 
 def _config_from_record(

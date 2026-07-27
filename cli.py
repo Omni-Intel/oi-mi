@@ -33,7 +33,7 @@ from utils.online_labels import (
 )
 from utils.preprocessing import filter_and_transform
 from utils.reproducibility import seed_experiment
-from utils.unity_runtime import ensure_unity_game_running
+from utils.unity_runtime import ensure_unity_game_running, wait_for_unity_scene_ready
 from web_command_server import start_web_command_server
 
 LOGGER = logging.getLogger(__name__)
@@ -869,6 +869,7 @@ def build_game_command_outlet(config: dict[str, Any]) -> Any:
     if not isinstance(startup_sequence, (list, tuple)):
         raise ValueError("output.ar_game.startup_sequence must be a list.")
 
+    driving_scene_requested = False
     if startup_sequence:
         startup_command_delay_sec = max(
             float(game_output_cfg.get("startup_command_delay_sec", 0.75)),
@@ -888,8 +889,20 @@ def build_game_command_outlet(config: dict[str, Any]) -> Any:
             if not command:
                 continue
             outlet.push(command)
+            driving_scene_requested = driving_scene_requested or command == "OPEN_3D_GAME"
             if delay_after_sec > 0:
                 time.sleep(delay_after_sec)
+    if driving_scene_requested:
+        wait_for_unity_scene_ready(
+            outlet,
+            timeout_sec=float(
+                game_output_cfg.get(
+                    "scene_ready_timeout_sec",
+                    game_output_cfg.get("startup_timeout_sec", 15.0),
+                )
+            ),
+            console=CONSOLE,
+        )
     return outlet
 
 
@@ -1184,6 +1197,12 @@ def calibrate(
     show_default=True,
     help="How long each manual label remains active for window alignment.",
 )
+@click.option(
+    "--max-scenes",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Stop cleanly after N completed cued Unity scenes (diagnostic runs).",
+)
 @click.pass_obj
 def run(
     app: AppContext,
@@ -1200,6 +1219,7 @@ def run(
     label_host: str = "127.0.0.1",
     label_port: int = 8776,
     label_ttl_sec: float = 2.0,
+    max_scenes: int | None = None,
 ) -> None:
     """Run the realtime decoder."""
 
@@ -1360,7 +1380,8 @@ def run(
         decoder.run_forever(
             subject_id=subject_id,
             record=record,
-            save_dir=records_dir / subject_id / "realtime"
+            save_dir=records_dir / subject_id / "realtime",
+            max_scenes=max_scenes,
         )
     finally:
         if online_update and not test_mode:
@@ -1370,8 +1391,7 @@ def run(
                 selected_model,
                 device_name=selected_device,
             )
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            model.save(save_path)
+            decoder.save_current_model()
             app.console.print(f"[bold green]在线更新后的模型已保存[/bold green] {save_path}")
         if online_label_server is not None:
             online_label_server.close()

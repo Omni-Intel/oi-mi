@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -75,8 +76,19 @@ def _bare_decoder(
     decoder._stop_on_game_disconnect = True
     decoder._scene_sent_scene_index = -1
     decoder._scene_sent_label_id = None
+    decoder._unity_scene_number_offset = None
+    decoder._unity_scene_numbers = {}
+    decoder._max_scenes = None
     decoder._scene_sync_error = None
     decoder._game_disconnect_message = None
+    decoder._step_sec = 0.5
+    decoder._sfreq = 200.0
+    decoder._confidence_threshold = 0.5
+    decoder._primary_windows_per_scene = 2
+    decoder._primary_window_spacing_sec = 1.0
+    decoder._primary_decision_scenes = set()
+    decoder._primary_decision_window_bounds = {}
+    decoder._primary_decision_probabilities = {}
     decoder._console = type(
         "_Console",
         (),
@@ -94,7 +106,7 @@ def _bare_decoder(
 
 
 class CuedOnlineLabelTests(unittest.TestCase):
-    def test_primary_window_releases_cued_lateral_control_once(self) -> None:
+    def test_two_spaced_primary_windows_release_cued_lateral_control(self) -> None:
         clock = _Clock(100.0)
         source = CuedOnlineLabelSource(
             ["left", "right", "idle"],
@@ -105,8 +117,6 @@ class CuedOnlineLabelTests(unittest.TestCase):
         )
         outlet = _GameOutlet(current_lane=0)
         decoder = _bare_decoder(source, outlet)
-        decoder._primary_decision_scenes = set()
-        decoder._primary_decision_window_bounds = {}
         self.assertEqual(source.prepare_scene(scene_index=0, start_lane=0), 0)
         self.assertTrue(
             source.confirm_scene_applied(
@@ -123,25 +133,114 @@ class CuedOnlineLabelTests(unittest.TestCase):
 
         label = source.get_label(window_start=100.5, window_end=102.5)
         self.assertIsNotNone(label)
-        self.assertTrue(
+        self.assertEqual(
             decoder._claim_primary_decision_window(
                 online_label=label,
                 window_start=100.5,
                 window_end=102.5,
-            )
+            ),
+            1,
         )
-        self.assertFalse(decoder._is_cued_control_gate_active())
-        self.assertFalse(
+        self.assertTrue(decoder._is_cued_control_gate_active())
+        self.assertIsNone(
             decoder._claim_primary_decision_window(
                 online_label=label,
                 window_start=101.0,
                 window_end=103.0,
             )
         )
+        self.assertTrue(decoder._is_cued_control_gate_active())
+        self.assertEqual(
+            decoder._claim_primary_decision_window(
+                online_label=label,
+                window_start=101.5,
+                window_end=103.5,
+            ),
+            2,
+        )
+        self.assertFalse(decoder._is_cued_control_gate_active())
         self.assertEqual(
             decoder._primary_decision_window_bounds[0],
-            (100.5, 102.5),
+            [(100.5, 102.5), (101.5, 103.5)],
         )
+        self.assertIsNone(
+            decoder._claim_primary_decision_window(
+                online_label=label,
+                window_start=102.0,
+                window_end=104.0,
+            )
+        )
+
+    def test_primary_control_averages_only_quality_accepted_windows(self) -> None:
+        decoder = _bare_decoder(
+            CuedOnlineLabelSource(
+                ["left"],
+                scene_duration_sec=5.0,
+                start_delay_sec=0.0,
+            ),
+            _GameOutlet(),
+        )
+        decoder._primary_decision_probabilities = {
+            0: [
+                np.asarray([0.8, 0.1, 0.1], dtype=np.float32),
+                np.asarray([0.2, 0.7, 0.1], dtype=np.float32),
+            ]
+        }
+
+        result = decoder._aggregate_primary_control_result(0)
+
+        self.assertEqual(result.class_id, 0)
+        self.assertAlmostEqual(result.confidence, 0.5)
+        rejected = decoder._aggregate_primary_control_result(1)
+        self.assertIsNone(rejected.class_id)
+        self.assertEqual(rejected.confidence, 0.0)
+
+    def test_cued_primary_windows_have_unique_adaptation_event_ids(self) -> None:
+        class Adapter:
+            def __init__(self) -> None:
+                self.event_ids: list[str] = []
+
+            def add_window(self, *_args, event_id: str, **_kwargs) -> bool:
+                self.event_ids.append(event_id)
+                return True
+
+            @staticmethod
+            def status() -> dict[str, bool]:
+                return {"training_in_background": False}
+
+        decoder = _bare_decoder(
+            CuedOnlineLabelSource(
+                ["left"],
+                scene_duration_sec=5.0,
+                start_delay_sec=0.0,
+            ),
+            _GameOutlet(),
+        )
+        adapter = Adapter()
+        decoder._neuroonline_adapter = adapter
+        decoder._batch_adapter = None
+        decoder._neuroonline_training_notice = False
+        label = SimpleNamespace(
+            label_id=0,
+            event_id="scene-000000-segment-000",
+            source="cued-protocol",
+        )
+        payload = {
+            "processed": np.zeros((2, 400), dtype=np.float32),
+            "probabilities": np.asarray([0.7, 0.2, 0.1], dtype=np.float32),
+            "operational_prediction": 0,
+            "prediction_model_revision": 0,
+            "online_label": label,
+        }
+
+        first = decoder._handle_online_label(**payload, window_end=102.5)
+        second = decoder._handle_online_label(**payload, window_end=103.5)
+
+        self.assertTrue(first)
+        self.assertTrue(second)
+        self.assertEqual(len(set(adapter.event_ids)), 2)
+        self.assertTrue(adapter.event_ids[0].endswith("102500000"))
+        self.assertTrue(adapter.event_ids[1].endswith("103500000"))
 
     def test_only_windows_inside_one_scene_receive_labels(self) -> None:
         clock = _Clock(100.0)
@@ -170,6 +269,32 @@ class CuedOnlineLabelTests(unittest.TestCase):
 
         clock.value = 105.5
         self.assertIsNone(source.get_label(window_start=103.5, window_end=105.5))
+
+    def test_delayed_first_unity_ack_anchors_scene_instead_of_expiring(self) -> None:
+        clock = _Clock(100.0)
+        source = CuedOnlineLabelSource(
+            ["right"],
+            scene_duration_sec=5.0,
+            start_delay_sec=0.0,
+            boundary_guard_sec=0.5,
+            clock=clock,
+        )
+        self.assertEqual(source.prepare_scene(scene_index=0, start_lane=0), 1)
+
+        clock.value = 112.0
+        self.assertTrue(
+            source.confirm_scene_applied(
+                scene_index=0,
+                applied_label_id=1,
+                start_lane=0,
+                safe_lane=1,
+                timestamp_monotonic=112.0,
+            )
+        )
+        status = source.status(now=112.0)
+        self.assertEqual(status["scene_index"], 0)
+        self.assertEqual(status["valid_from_monotonic"], 112.0)
+        self.assertEqual(status["valid_until_monotonic"], 117.0)
 
     def test_unconfirmed_scene_never_advances_from_local_time_alone(self) -> None:
         clock = _Clock(0.0)
@@ -579,6 +704,158 @@ class CuedOnlineLabelTests(unittest.TestCase):
         self.assertIsNotNone(label)
         assert label is not None
         self.assertEqual(label.label_name, "right")
+
+    def test_reconnect_anchors_persistent_unity_scene_counter(self) -> None:
+        clock = _Clock(100.0)
+        source = CuedOnlineLabelSource(
+            ["left", "right"],
+            scene_duration_sec=5.0,
+            start_delay_sec=0.0,
+            boundary_guard_sec=0.0,
+            clock=clock,
+        )
+        outlet = _GameOutlet(current_lane=0)
+        outlet.next_scene_number = 7
+        decoder = _bare_decoder(source, outlet)
+
+        from unittest import mock
+
+        with mock.patch("decoder.real_time_decoder.time.monotonic", return_value=100.0):
+            decoder._sync_game_scene()
+
+        self.assertEqual(decoder._unity_scene_number_offset, 6)
+        self.assertEqual(decoder._unity_scene_numbers[0], 7)
+        self.assertEqual(decoder._scene_sent_scene_index, 0)
+        self.assertEqual(outlet.commands, ["SCENE_STATE", "SCENE_LEFT"])
+
+        clock.value = 105.0
+        outlet.current_lane = -1
+        with mock.patch("decoder.real_time_decoder.time.monotonic", return_value=105.0):
+            decoder._sync_game_scene()
+
+        self.assertEqual(decoder._unity_scene_numbers[1], 8)
+        self.assertEqual(decoder._scene_sent_scene_index, 1)
+        self.assertEqual(
+            outlet.commands,
+            ["SCENE_STATE", "SCENE_LEFT", "SCENE_STATE", "SCENE_RIGHT"],
+        )
+
+    def test_lane_settled_changes_truth_without_rebuilding_same_scene(self) -> None:
+        clock = _Clock(100.0)
+        source = CuedOnlineLabelSource(
+            ["right"],
+            scene_duration_sec=5.0,
+            start_delay_sec=0.0,
+            boundary_guard_sec=0.0,
+            clock=clock,
+        )
+        outlet = _GameOutlet(current_lane=0)
+        decoder = _bare_decoder(source, outlet)
+
+        from unittest import mock
+
+        with mock.patch("decoder.real_time_decoder.time.monotonic", return_value=100.0):
+            decoder._sync_game_scene()
+        self.assertEqual(outlet.commands, ["SCENE_STATE", "SCENE_RIGHT"])
+
+        outlet.events.append(
+            {
+                "event": "LANE_SETTLED",
+                "protocol_version": "continuous-scene-v4-dynamic-label",
+                "scene_number": 1,
+                "current_lane": 1,
+                "safe_lane": 1,
+                "_received_at_monotonic": 102.0,
+            }
+        )
+        clock.value = 102.0
+        with mock.patch("decoder.real_time_decoder.time.monotonic", return_value=102.0):
+            decoder._sync_game_scene()
+
+        self.assertEqual(source.status()["label_name"], "idle")
+        self.assertEqual(outlet.commands, ["SCENE_STATE", "SCENE_RIGHT"])
+        self.assertEqual(decoder._scene_sent_scene_index, 0)
+
+    def test_late_lane_settled_is_ignored_without_stopping_next_scene(self) -> None:
+        clock = _Clock(100.0)
+        source = CuedOnlineLabelSource(
+            ["right"],
+            scene_duration_sec=5.0,
+            start_delay_sec=0.0,
+            boundary_guard_sec=0.0,
+            clock=clock,
+        )
+        outlet = _GameOutlet(current_lane=0)
+        decoder = _bare_decoder(source, outlet)
+
+        class _Writer:
+            def __init__(self) -> None:
+                self.events: list[tuple[str, dict[str, object]]] = []
+
+            def append_event(self, event_type: str, **payload: object) -> None:
+                self.events.append((event_type, payload))
+
+        decoder._writer = _Writer()
+
+        from unittest import mock
+
+        with mock.patch("decoder.real_time_decoder.time.monotonic", return_value=100.0):
+            decoder._sync_game_scene()
+        outlet.events.append(
+            {
+                "event": "LANE_SETTLED",
+                "protocol_version": "continuous-scene-v4-dynamic-label",
+                "scene_number": 1,
+                "current_lane": 1,
+                "safe_lane": 1,
+                "_received_at_monotonic": 105.015,
+            }
+        )
+        clock.value = 105.015
+        with mock.patch(
+            "decoder.real_time_decoder.time.monotonic",
+            return_value=105.015,
+        ):
+            decoder._consume_game_scene_events()
+
+        self.assertFalse(decoder._stop_event.was_set)
+        self.assertEqual(source.status(now=104.999)["label_name"], "right")
+        ignored = [
+            payload
+            for event_type, payload in decoder._writer.events
+            if event_type == "lane_settled_ignored"
+        ]
+        self.assertEqual(len(ignored), 1)
+        self.assertEqual(
+            ignored[0]["reason"],
+            "received_after_fixed_scene_boundary",
+        )
+
+    def test_scene_limit_stops_before_next_obstacle_layout(self) -> None:
+        clock = _Clock(100.0)
+        source = CuedOnlineLabelSource(
+            ["left", "right"],
+            scene_duration_sec=5.0,
+            start_delay_sec=0.0,
+            boundary_guard_sec=0.0,
+            clock=clock,
+        )
+        outlet = _GameOutlet(current_lane=0)
+        decoder = _bare_decoder(source, outlet)
+        decoder._max_scenes = 1
+
+        from unittest import mock
+
+        with mock.patch("decoder.real_time_decoder.time.monotonic", return_value=100.0):
+            decoder._sync_game_scene()
+        clock.value = 105.0
+        outlet.current_lane = -1
+        with mock.patch("decoder.real_time_decoder.time.monotonic", return_value=105.0):
+            decoder._sync_game_scene()
+
+        self.assertTrue(decoder._stop_event.was_set)
+        self.assertEqual(outlet.commands, ["SCENE_STATE", "SCENE_LEFT"])
+        self.assertEqual(decoder._scene_end_recorded, {0})
 
     def test_unity_failure_waits_for_fixed_boundary_before_next_scene(self) -> None:
         clock = _Clock(100.0)
