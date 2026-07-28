@@ -50,6 +50,29 @@ from utils.preprocessing import (
 LABEL_SEQUENCE: list[tuple[int, str]] = [(LABEL_TO_ID[label], label) for label in ("left", "right", "idle")]
 
 
+def _offline_parameter_snapshot(config: NeuroOnlineConfig) -> dict[str, Any]:
+    """Return the effective offline settings for session provenance/UI output."""
+
+    return {
+        "offline_learning_rate": config.offline_learning_rate,
+        "offline_batch_size": config.offline_batch_size,
+        "mask_ratio": (
+            config.mask_ratio
+            if config.offline_mask_ratio is None
+            else config.offline_mask_ratio
+        ),
+        "consistency_weight": (
+            config.consistency_weight
+            if config.offline_consistency_weight is None
+            else config.offline_consistency_weight
+        ),
+        "weight_decay": config.weight_decay,
+        "label_smoothing": config.label_smoothing,
+        "offline_epochs": config.offline_epochs,
+        "offline_patience": config.offline_patience,
+    }
+
+
 @dataclass(slots=True)
 class CalibrationResult:
     """Result metadata for a calibration run."""
@@ -132,7 +155,12 @@ class Calibrator:
                 "a fresh full decoder."
             )
         reused_search_report: dict[str, Any] | None = None
-        selected_hyperparameters: dict[str, Any] | None = None
+        reuse_search_error: str | None = None
+        selected_hyperparameters: dict[str, Any] | None = (
+            _offline_parameter_snapshot(self._neuroonline_config)
+            if self._neuroonline_config.enabled
+            else None
+        )
         hyperparameter_report_path: Path | None = None
         if (
             self._neuroonline_config.enabled
@@ -144,26 +172,38 @@ class Calibrator:
                     "model adapter."
                 )
             base_template = self._model.base
-            (
-                self._neuroonline_config,
-                reused_search_report,
-                hyperparameter_report_path,
-            ) = load_latest_calibration_search(
-                calibration_records_dir=self._calibration_records_dir,
-                base_config=self._neuroonline_config,
-            )
-            selected_hyperparameters = dict(
-                reused_search_report["best_parameters"]
-            )
-            self._model = NeuroOnlineModelAdapter(
-                copy.deepcopy(base_template),
-                config=self._neuroonline_config,
-                state_path=None,
-            )
-            self._console.print(
-                "[bold green]已读取最近一次离线参数搜索结果，将直接训练新模型："
-                f"{hyperparameter_report_path}[/bold green]"
-            )
+            try:
+                (
+                    self._neuroonline_config,
+                    reused_search_report,
+                    hyperparameter_report_path,
+                ) = load_latest_calibration_search(
+                    calibration_records_dir=self._calibration_records_dir,
+                    base_config=self._neuroonline_config,
+                )
+            except RuntimeError as exc:
+                reuse_search_error = str(exc)
+                selected_hyperparameters = _offline_parameter_snapshot(
+                    self._neuroonline_config
+                )
+                self._console.print(
+                    "[bold yellow]历史离线参数报告不可用；本次校准将使用 "
+                    "config.yaml 中冻结的离线参数继续，不会中止："
+                    f"{reuse_search_error}[/bold yellow]"
+                )
+            else:
+                selected_hyperparameters = dict(
+                    reused_search_report["best_parameters"]
+                )
+                self._model = NeuroOnlineModelAdapter(
+                    copy.deepcopy(base_template),
+                    config=self._neuroonline_config,
+                    state_path=None,
+                )
+                self._console.print(
+                    "[bold green]已读取最近一次离线参数搜索结果，将直接训练新模型："
+                    f"{hyperparameter_report_path}[/bold green]"
+                )
         plan = build_session_plan(self._protocol)
         (
             session_dir,
@@ -185,6 +225,20 @@ class Calibrator:
                 "source_untouched_holdout_metrics": reused_search_report.get(
                     "untouched_holdout_metrics"
                 ),
+            }
+        elif reuse_search_error is not None:
+            session_metadata["hyperparameter_search"] = {
+                "mode": "configured_fallback",
+                "reason": reuse_search_error,
+                "best_parameters": selected_hyperparameters,
+            }
+        elif (
+            self._neuroonline_config.enabled
+            and not self._calibration_search_config.enabled
+        ):
+            session_metadata["hyperparameter_search"] = {
+                "mode": "configured_fixed",
+                "best_parameters": selected_hyperparameters,
             }
         self._console.print("[bold cyan]采集完成，正在保存和训练，请等待工作人员[/bold cyan]")
         search_result = None

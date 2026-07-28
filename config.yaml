@@ -136,12 +136,16 @@ online_adaptation:
     offline_epochs: 50
     offline_patience: 50
     offline_batch_size: 16
-    offline_learning_rate: 1.0e-4
+    # Best offline pretraining parameters selected from the 2026-07-27
+    # calibration data (298 windows, 60 trial-grouped samples).
+    offline_learning_rate: 1.0e-5
+    offline_mask_ratio: 0.1
+    offline_consistency_weight: 1.5
     calibration_search:
-      # Reuse the newest successful search result from this subject's previous
-      # calibration session. This trains fresh weights and skips the grid search.
+      # Freeze the validated 2026-07-27 result above. Do not let an older
+      # mechanics-v0 report override it or block a formal calibration.
       enabled: false
-      reuse_latest: true
+      reuse_latest: false
       # Search every learning-rate/batch/mask/lambda combination. All candidates
       # share one trial-grouped split, while a separate set of complete trials
       # remains untouched until the winning configuration.

@@ -80,6 +80,24 @@ class NeuroOnlineTests(unittest.TestCase):
         self.assertEqual(config.update_stride, 64)
         self.assertEqual(config.recent_samples, 320)
 
+    def test_offline_augmentation_parameters_are_separate_from_online(self) -> None:
+        config = NeuroOnlineConfig.from_mapping(
+            {
+                "enabled": True,
+                "strategy": "neuroonline",
+                "neuroonline": {
+                    "mask_ratio": 0.7,
+                    "consistency_weight": 0.1,
+                    "offline_mask_ratio": 0.1,
+                    "offline_consistency_weight": 1.5,
+                },
+            }
+        )
+        self.assertEqual(config.mask_ratio, 0.7)
+        self.assertEqual(config.consistency_weight, 0.1)
+        self.assertEqual(config.offline_mask_ratio, 0.1)
+        self.assertEqual(config.offline_consistency_weight, 1.5)
+
     def setUp(self) -> None:
         torch.manual_seed(7)
         np.random.seed(7)
@@ -401,8 +419,10 @@ class NeuroOnlineTests(unittest.TestCase):
 
             self.assertEqual(report_path.parent, new_session)
             self.assertEqual(reused_config.offline_batch_size, 128)
-            self.assertEqual(reused_config.mask_ratio, 0.7)
-            self.assertEqual(reused_config.consistency_weight, 1.5)
+            self.assertEqual(reused_config.offline_mask_ratio, 0.7)
+            self.assertEqual(reused_config.offline_consistency_weight, 1.5)
+            self.assertEqual(reused_config.mask_ratio, 0.3)
+            self.assertEqual(reused_config.consistency_weight, 0.1)
             self.assertEqual(
                 report["untouched_holdout_metrics"]["balanced_accuracy"],
                 0.5,

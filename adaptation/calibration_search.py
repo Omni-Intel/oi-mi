@@ -135,7 +135,7 @@ def load_latest_calibration_search(
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             validation_errors.append(f"{report_path}: {exc}")
             continue
-        return replace(base_config, **parameters), report, report_path
+        return _config_from_record(base_config, parameters), report, report_path
 
     details = "; ".join(validation_errors[:3])
     raise RuntimeError(
@@ -206,8 +206,8 @@ def run_calibration_search(
                 base_config,
                 offline_learning_rate=learning_rate,
                 offline_batch_size=batch_size,
-                mask_ratio=mask_ratio,
-                consistency_weight=consistency_weight,
+                offline_mask_ratio=mask_ratio,
+                offline_consistency_weight=consistency_weight,
                 offline_epochs=search_config.selection_epochs,
                 offline_patience=search_config.selection_patience,
             )
@@ -218,9 +218,19 @@ def run_calibration_search(
         )
         max_candidates = len(search_candidates)
     else:
+        base_offline_mask_ratio = (
+            base_config.mask_ratio
+            if base_config.offline_mask_ratio is None
+            else base_config.offline_mask_ratio
+        )
+        base_offline_consistency_weight = (
+            base_config.consistency_weight
+            if base_config.offline_consistency_weight is None
+            else base_config.offline_consistency_weight
+        )
         base_pair_repeated = (
-            base_config.mask_ratio in search_config.mask_ratios
-            and base_config.consistency_weight in search_config.consistency_weights
+            base_offline_mask_ratio in search_config.mask_ratios
+            and base_offline_consistency_weight in search_config.consistency_weights
         )
         max_candidates = (
             len(optimizer_candidates)
@@ -303,8 +313,8 @@ def run_calibration_search(
         representation_candidates = _unique_candidates(
             replace(
                 best_config,
-                mask_ratio=mask_ratio,
-                consistency_weight=consistency_weight,
+                offline_mask_ratio=mask_ratio,
+                offline_consistency_weight=consistency_weight,
             )
             for mask_ratio in search_config.mask_ratios
             for consistency_weight in search_config.consistency_weights
@@ -449,8 +459,16 @@ def _selected_parameters(config: NeuroOnlineConfig) -> dict[str, Any]:
     return {
         "offline_learning_rate": config.offline_learning_rate,
         "offline_batch_size": config.offline_batch_size,
-        "mask_ratio": config.mask_ratio,
-        "consistency_weight": config.consistency_weight,
+        "mask_ratio": (
+            config.mask_ratio
+            if config.offline_mask_ratio is None
+            else config.offline_mask_ratio
+        ),
+        "consistency_weight": (
+            config.consistency_weight
+            if config.offline_consistency_weight is None
+            else config.offline_consistency_weight
+        ),
         "weight_decay": config.weight_decay,
         "label_smoothing": config.label_smoothing,
         "offline_epochs": config.offline_epochs,
@@ -505,15 +523,28 @@ def _config_from_record(
     base: NeuroOnlineConfig,
     parameters: dict[str, Any],
 ) -> NeuroOnlineConfig:
-    return replace(base, **parameters)
+    record = dict(parameters)
+    if "mask_ratio" in record:
+        record["offline_mask_ratio"] = record.pop("mask_ratio")
+    if "consistency_weight" in record:
+        record["offline_consistency_weight"] = record.pop("consistency_weight")
+    return replace(base, **record)
 
 
 def _candidate_key(config: NeuroOnlineConfig) -> tuple[float, int, float, float]:
     return (
         config.offline_learning_rate,
         config.offline_batch_size,
-        config.mask_ratio,
-        config.consistency_weight,
+        (
+            config.mask_ratio
+            if config.offline_mask_ratio is None
+            else config.offline_mask_ratio
+        ),
+        (
+            config.consistency_weight
+            if config.offline_consistency_weight is None
+            else config.offline_consistency_weight
+        ),
     )
 
 

@@ -64,6 +64,11 @@ class NeuroOnlineConfig:
     offline_patience: int = 50
     offline_batch_size: int = 16
     offline_learning_rate: float = 1e-4
+    # Offline search parameters are kept separate from the online update
+    # augmentation parameters.  Older checkpoints omit these fields and use
+    # the online values as a backward-compatible fallback.
+    offline_mask_ratio: float | None = None
+    offline_consistency_weight: float | None = None
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any] | None) -> "NeuroOnlineConfig":
@@ -89,6 +94,16 @@ class NeuroOnlineConfig:
             offline_patience=max(int(data.get("offline_patience", 50)), 1),
             offline_batch_size=max(int(data.get("offline_batch_size", 16)), 1),
             offline_learning_rate=max(float(data.get("offline_learning_rate", 1e-4)), 1e-9),
+            offline_mask_ratio=(
+                min(max(float(data["offline_mask_ratio"]), 0.0), 1.0)
+                if data.get("offline_mask_ratio") is not None
+                else None
+            ),
+            offline_consistency_weight=(
+                max(float(data["offline_consistency_weight"]), 0.0)
+                if data.get("offline_consistency_weight") is not None
+                else None
+            ),
         )
 
 
@@ -209,6 +224,7 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         frequency_masked: torch.Tensor,
         labels: torch.Tensor,
         criterion: nn.Module,
+        consistency_weight: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         logits, original_representation = self._forward_adapted(original)
         time_logits, time_representation = self._forward_adapted(time_masked)
@@ -224,8 +240,13 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
             F.mse_loss(time_representation, original_representation)
             + F.mse_loss(frequency_representation, original_representation)
         ) / 2.0
+        effective_consistency_weight = (
+            self.config.consistency_weight
+            if consistency_weight is None
+            else float(consistency_weight)
+        )
         return (
-            classification + self.config.consistency_weight * consistency,
+            classification + effective_consistency_weight * consistency,
             classification,
             consistency,
         )
@@ -238,6 +259,7 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         *,
         scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
         clip_classifier_gradients: bool = False,
+        consistency_weight: float | None = None,
     ) -> dict[str, float]:
         assert self._modulator is not None
         self.base.model.train()
@@ -254,6 +276,7 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
                 frequency_masked,
                 labels,
                 criterion,
+                consistency_weight,
             )
             optimizer.zero_grad()
             loss.backward()
@@ -338,8 +361,18 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
             torch.cuda.manual_seed_all(self.config.random_seed)
         generator = torch.Generator().manual_seed(self.config.random_seed)
         all_inputs = torch.as_tensor(X, dtype=torch.float32)
-        time_views = _time_mask(all_inputs, self.config.mask_ratio, generator)
-        frequency_views = _frequency_mask(all_inputs, self.config.mask_ratio, generator)
+        offline_mask_ratio = (
+            self.config.mask_ratio
+            if self.config.offline_mask_ratio is None
+            else self.config.offline_mask_ratio
+        )
+        offline_consistency_weight = (
+            self.config.consistency_weight
+            if self.config.offline_consistency_weight is None
+            else self.config.offline_consistency_weight
+        )
+        time_views = _time_mask(all_inputs, offline_mask_ratio, generator)
+        frequency_views = _frequency_mask(all_inputs, offline_mask_ratio, generator)
         modulator = self._prepare_training(all_inputs[:1])
         loader = self._view_loader(
             all_inputs[train_indices],
@@ -383,6 +416,7 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
                 criterion,
                 scheduler=scheduler,
                 clip_classifier_gradients=True,
+                consistency_weight=offline_consistency_weight,
             )
             probabilities = self.predict_proba(X[validation_indices])
             predictions = probabilities.argmax(axis=1)
