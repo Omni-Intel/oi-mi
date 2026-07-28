@@ -577,11 +577,16 @@ class StreamWriter:
                     "probabilities",
                     "quality_accepted",
                     "scene_indices",
+                    "training_roles",
                     "adaptation_eligible",
                     "adaptation_committed",
                 ):
                     if key in chunk:
                         arrays.setdefault(key, []).append(np.asarray(chunk[key]))
+                    elif key == "training_roles" and "labels_true" in chunk:
+                        arrays.setdefault(key, []).append(
+                            np.full(len(chunk["labels_true"]), "", dtype=np.str_)
+                        )
         if not arrays.get("labels_true"):
             return {"evaluated_windows": 0}
 
@@ -591,6 +596,7 @@ class StreamWriter:
         quality = np.concatenate(arrays["quality_accepted"]).astype(np.bool_)
         scene_indices = np.concatenate(arrays.get("scene_indices", [])).astype(np.int64)
         probabilities = np.concatenate(arrays.get("probabilities", []), axis=0)
+        training_roles = np.concatenate(arrays["training_roles"]).astype(np.str_)
         adaptation_eligible = np.concatenate(
             arrays.get(
                 "adaptation_eligible",
@@ -664,6 +670,39 @@ class StreamWriter:
             np.sum(primary_valid & ~primary_operational_valid)
         )
 
+        continuous_valid = valid & (training_roles == "continuous_context")
+        continuous_raw_valid = continuous_valid & (y_raw >= 0)
+        continuous_operational_valid = continuous_valid & (y_operational >= 0)
+        continuous_raw_metrics = self._classification_metrics(
+            y_true[continuous_raw_valid],
+            y_raw[continuous_raw_valid],
+            class_count,
+        )
+        continuous_operational_metrics = self._classification_metrics(
+            y_true[continuous_valid],
+            y_operational[continuous_valid],
+            class_count,
+            abstain_value=-1,
+        )
+        continuous_operational_metrics["coverage"] = (
+            float(np.sum(continuous_operational_valid) / np.sum(continuous_valid))
+            if np.any(continuous_valid)
+            else 0.0
+        )
+        continuous_operational_metrics["selective_accuracy"] = (
+            float(
+                np.mean(
+                    y_operational[continuous_operational_valid]
+                    == y_true[continuous_operational_valid]
+                )
+            )
+            if np.any(continuous_operational_valid)
+            else 0.0
+        )
+        continuous_operational_metrics["abstained_windows"] = int(
+            np.sum(continuous_valid & ~continuous_operational_valid)
+        )
+
         scene_truth: list[int] = []
         scene_prediction: list[int] = []
         for scene_index in np.unique(
@@ -704,6 +743,10 @@ class StreamWriter:
                 "primary_decision_filter": (
                     "quality_accepted & labels_true>=0 & adaptation_eligible"
                 ),
+                "continuous_dynamic_filter": (
+                    "quality_accepted & labels_true>=0 & "
+                    "training_roles=='continuous_context'"
+                ),
                 "raw_window_prediction": "argmax(probabilities) before online update",
                 "operational_prediction": "confidence-thresholded command; abstention=-1",
                 "balanced_accuracy": "macro recall over the fixed class set; missing-class recall=0",
@@ -720,6 +763,7 @@ class StreamWriter:
             "primary_decision_quality_rejected": int(
                 np.sum(adaptation_eligible & ~quality)
             ),
+            "continuous_dynamic_windows": int(np.sum(continuous_valid)),
             "adaptation_committed_windows": int(np.sum(adaptation_committed)),
             "excluded_unlabeled_windows": int(np.sum(y_true < 0)),
             "excluded_quality_windows": int(np.sum((y_true >= 0) & ~quality)),
@@ -730,8 +774,8 @@ class StreamWriter:
                 "operational": primary_operational_metrics,
             },
             "continuous_dynamic": {
-                "raw": raw_metrics,
-                "operational": operational_metrics,
+                "raw": continuous_raw_metrics,
+                "operational": continuous_operational_metrics,
             },
             "scene_classification": scene_metrics,
             "car_task": task_metrics,

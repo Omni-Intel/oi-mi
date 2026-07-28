@@ -861,13 +861,16 @@ class DataServerThread:
         if self.state == ConnectState.RUNNING and self.firstTimestamp == -1:
             self.firstTimestamp = dataStruct["startTimeStamp"]
         # Verify packet loss via timestamps
-        if self.lastTimestamp > 0 and self.lastTimestamp != dataStruct["startTimeStamp"]:
+        start_timestamp = dataStruct["startTimeStamp"]
+        if self.lastTimestamp > 0 and self.lastTimestamp != start_timestamp:
             self.packet_loss_count += 1
-            raise RuntimeError(
-                "Maybe a packet loss happened. Expected startTimestamp "
-                f"is {self.lastTimestamp} but received "
-                f"{dataStruct['startTimeStamp']}")
-        self.lastTimestamp = dataStruct["startTimeStamp"] + dataStruct["timeStampLength"]
+            LOGGER.warning(
+                "Data packet discontinuity: expected startTimestamp %s but "
+                "received %s; resynchronizing to the received packet.",
+                self.lastTimestamp,
+                start_timestamp,
+            )
+        self.lastTimestamp = start_timestamp + dataStruct["timeStampLength"]
 
     def combineDataAndTrigger(self):
         """

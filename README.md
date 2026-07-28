@@ -75,7 +75,7 @@ online_adaptation:
   neuroonline:
     history_threshold: 64
     update_stride: 64
-    recent_samples: 64
+    recent_samples: 320
   simulation:
     enabled: false
   cued_labels:
@@ -233,9 +233,9 @@ python download_datasets.py --dataset BNCI2014_001 --subject 1 --data-dir ./data
 
 ### NeuroOnline 算法复现与小车在线应用
 
-`config.yaml` 中将 `online_adaptation.strategy` 设为 `neuroonline` 后，实时解码采用严格的先预测、后更新流程。小车实验每个 Scene 只允许两个因果干净的主决策窗口进入在线训练：默认窗口为 ACK 后的 `0.5–2.5 s` 与 `1.5–3.5 s`，两者均完整位于当前 Scene、对应 Unity ACK 确认的初始指令，并且采集期间尚未放行本 Scene 的横向控制。第二个窗口完成后，系统平均两个合格窗口的类别概率来决定首次横向反馈；若只有一个窗口通过质量检查则使用该窗口，两个窗口都不合格时保持 STOP。首次及后续更新都在累计新增 64 个唯一主决策窗口时触发，并始终使用最近 64 个主决策窗口。每个训练样本在进入缓冲区时生成固定的时间遮挡和频率遮挡视图，更新目标为三个视图的分类损失加两项表示一致性损失，并联合更新 backbone、CRM 和分类头。
+`config.yaml` 中将 `online_adaptation.strategy` 设为 `neuroonline` 后，实时解码采用严格的先预测、后更新流程。小车实验每个 Scene 只允许一个因果干净的主决策窗口进入在线训练，即 ACK 后的 `0.5–2.5 s`；该窗口完整位于当前 Scene、对应 Unity ACK 确认的初始指令，并且采集期间尚未放行本 Scene 的横向控制。窗口完成后立即放行横向控制；窗口不合格时保持 STOP。首次及后续更新都在累计新增 64 个唯一主决策窗口时触发，回放池从 64 个样本逐步增长到 320 个样本，之后始终使用最近 320 个主决策窗口。每个训练样本在进入缓冲区时生成固定的逐通道、逐采样点时间掩码和逐通道、逐频点频率掩码视图，更新目标为三个视图的分类损失加两项表示一致性损失，并联合更新 backbone、CRM 和分类头。
 
-该模式仅支持 PyTorch 模型，不支持 `riemann-mdm`。CRM 以恒等门控初始化；更新后的 backbone 保存到原模型文件，CRM 状态保存到同目录的 `<model>.neuroonline.pt` sidecar 文件。校准搜索选出的 mask ratio、一致性权重及其他模型耦合参数也写入 sidecar，重启 GUI 后实时更新会自动恢复这些参数；在线 `64/64/64`（首次阈值/更新步长/最近样本）策略、`1e-6` 学习率和控制置信度不参与这次离线搜索。将策略改回 `periodic_head` 可继续使用原有的十分钟候选分类头更新流程。
+该模式仅支持 PyTorch 模型，不支持 `riemann-mdm`。CRM 以恒等门控初始化；更新后的 backbone 保存到原模型文件，CRM 状态保存到同目录的 `<model>.neuroonline.pt` sidecar 文件。校准搜索选出的 mask ratio、一致性权重及其他模型耦合参数也写入 sidecar，重启 GUI 后实时更新会自动恢复这些参数；在线 `64/64/320`（首次阈值/更新步长/最近样本）策略不参与离线校准搜索。当前在线优化器参数 `1e-4 / 3 epochs / batch 8` 由 2026-07-27 实时记录按每 Scene 一个窗口的因果重放选出，并应在后续会话评估前冻结。将策略改回 `periodic_head` 可继续使用原有的十分钟候选分类头更新流程。
 
 实时解码页面配套显示 NeuroOnline 遥测：累计 Scene、累计主决策窗口、距离下一次 64 窗口触发的进度、缓冲区类别覆盖、重复/过期窗口拒绝数、原始 argmax prequential accuracy/fixed-three-class balanced accuracy、实际控制覆盖率、选择性准确率、逐类准确率、累计混淆矩阵，以及每次更新的总损失、分类损失、一致性损失、CRM gate 和耗时曲线。所有在线性能只使用“先预测、后更新”时产生的预测，不会用更新后的模型回算历史样本。三类尚未全部出现时，未出现类别召回率固定按 0 计，避免早期 balanced accuracy 虚高。
 
@@ -254,9 +254,9 @@ python download_datasets.py --dataset BNCI2014_001 --subject 1 --data-dir ./data
 
 停止运行后，程序从落盘 chunk 和事件日志独立重算并写入 `scientific_metrics`：
 
-- `primary_decision`：每个 Scene 两个主决策窗的 test-then-train 原始与阈值后指标；这是模型在线可行性检验的主指标；
+- `primary_decision`：每个 Scene 唯一主决策窗的 test-then-train 原始与阈值后指标；这是模型在线可行性检验的主指标；
 - `continuous_dynamic`：Scene 内后续动态标签窗的描述性原始与阈值后指标，不进入 NeuroOnline 主训练缓冲区；
-- `scene_classification`：对同一 Scene 的两个合格主决策窗做概率平均；不会混入 LEFT→IDLE 等控制后的不同真值阶段；
+- `scene_classification`：使用每个 Scene 唯一合格主决策窗；不会混入 LEFT→IDLE 等控制后的不同真值阶段；
 - `car_task`：以 `scene_end` 的碰撞/无碰撞结果计算避障成功率及 Wilson 95% 区间。
 
 2 秒窗以 0.5 秒步长滑动，窗口之间并不独立。因此窗口级指标用于描述在线轨迹，论文显著性检验应以 Scene、block、session 或 subject 为统计单位，不能直接对所有重叠窗口使用独立二项假设。
@@ -271,7 +271,7 @@ python download_datasets.py --dataset BNCI2014_001 --subject 1 --data-dir ./data
 
 正式小车实验启用 `online_adaptation.cued_labels` 后采用 `continuous-scene-v4-dynamic-label` 连续动态动作协议。每个 Scene 开始前，Python 先用 `SCENE_STATE` 查询 Unity 中小车的实际车道，再选择一个可达且类别均衡的初始相对动作。Unity 固定本 Scene 的唯一空车道，在同一帧、同一前向距离给另外两条路各布置一辆障碍车，并返回包含 `scene_number/start_lane/safe_lane/applied_label` 的结构化 ACK。Scene 内固定的是 `safe_lane`，而不是动作标签：Unity 只有在车辆横向位置真正到达目标车道后才发送 `LANE_SETTLED`。Python 随即根据当前车道到安全车道的相对关系重新计算真值；位于安全车道时为 `IDLE`，仍在右侧时为 `LEFT`，仍在左侧时为 `RIGHT`。
 
-碰撞只会炸掉被撞的障碍车，另一条路的障碍保持原位；Unity 上报 `SCENE_FAILED` 后，Python 只记录本 Scene 失败，不改变安全车道，到固定的 5 秒边界才同步下一 Scene。正式 Scene 时长保持 `5.0` 秒，Unity 按相对速度 `(6.0 - 3.2) m/s` 将障碍放在约 `14.0 m` 前方：走错车道会因车身碰撞半径在约 4.7 秒判定失败，走对空路则在第 5 秒通过障碍横截面并判定成功。等待首个 Scene、Scene 同步失败或两个已确认 Scene 之间，Unity 不生成任何随机交通；只有成功应用 Scene 命令后才会一次性生成两辆障碍车。未收到当前 Scene 的完整 ACK 时，Python 固定在当前 Scene 编号，绝不会根据本地时钟跳到后续 Scene。模型输入仍是 2 秒窗、0.5 秒步长。新 Scene ACK 后，Python 会继续前向行驶和实时预测，但明确阻止横向命令，直至取得两个完整的因果主决策窗（理想步相下为 `0.5-2.5` 秒与 `1.5-3.5` 秒）；第二窗完成后平均全部质量合格窗的类别概率并首次放行横向控制，两个窗口都不合格时保持 STOP。因此上一 Scene 的脑电不可能提前改变新 Scene 的车道，同时每个 Scene 仍保留约 1.5 秒可见控制反馈。这个可见的因果门控不是隐藏 STOP 阶段。
+碰撞只会炸掉被撞的障碍车，另一条路的障碍保持原位；Unity 上报 `SCENE_FAILED` 后，Python 只记录本 Scene 失败，不改变安全车道，到固定的 5 秒边界才同步下一 Scene。正式 Scene 时长保持 `5.0` 秒，Unity 按相对速度 `(6.0 - 3.2) m/s` 将障碍放在约 `14.0 m` 前方：走错车道会因车身碰撞半径在约 4.7 秒判定失败，走对空路则在第 5 秒通过障碍横截面并判定成功。等待首个 Scene、Scene 同步失败或两个已确认 Scene 之间，Unity 不生成任何随机交通；只有成功应用 Scene 命令后才会一次性生成两辆障碍车。未收到当前 Scene 的完整 ACK 时，Python 固定在当前 Scene 编号，绝不会根据本地时钟跳到后续 Scene。每个 Scene 事件分别记录命令发送、ACK 接收和往返耗时；Scene 起点锚定在确认 Unity 已应用障碍布局的 ACK 接收时刻。模型输入仍是 2 秒窗、0.5 秒连续预测步长。cued 主决策不再等待自然滑窗碰巧对齐，而是从额外 EEG 历史缓冲中按源时间戳精确截取 ACK 后 `0.5-2.5` 秒的 400 点窗口，并在目标终点附近缩短轮询间隔；该窗完成后立即首次放行横向控制，不合格时保持 STOP。因此上一 Scene 的脑电不可能提前改变新 Scene 的车道，同时每个 Scene 保留约 2.5 秒可见控制反馈。这个可见的因果门控不是隐藏 STOP 阶段。
 
 主决策窗的 `instruction_label` 是唯一进入 NeuroOnline 的训练真值。后续窗口仍按小车当前位置到固定安全车道计算 `vehicle_required_action`，并完整落盘用于连续行为分析，但不再因成功者快速转成大量 IDLE、失败者持续产生 LEFT/RIGHT 而污染主训练缓冲区。后续动态窗仍执行 ACK/边界/换道保护校验；以 `LANE_SETTLED` 为中心前后各 0.5 秒的窗口不计动态真值。TCP 消息在接收解析时即记录单调时钟，重复事件 ID、非递增 EEG 窗口终点和重复源窗口都会被拒绝并写入日志。
 
@@ -282,7 +282,7 @@ Neuracle/JellyFish 原始数据以 `250 Hz` 转发。校准连续数据保留 25
 200 Hz、2秒窗口对应模型输入长度为400点。旧的250 Hz/500点模型权重和 CRM sidecar
 不能继续使用；切换采样率后必须重新完成正式校准。
 
-连续模式没有“大轮完成”或固定 trial 停止点，GUI 显示累计 Scene、相对动作真值、起始车道→空车道和 Unity 同步状态，NeuroOnline 每累计 64 个新的合格主决策窗，用最近 64 个主决策窗后台更新一次。`balance_pool_per_class: 32` 用于生成可复现的类别平衡候选池；若候选动作在边界车道不可执行，会保留到后续可执行 Scene，而不会伪造标签。运行持续到操作员切换页面、关闭 Unity 或停止 GUI。真实设备实验必须保持 `online_adaptation.simulation.enabled: false`。
+连续模式没有“大轮完成”或固定 trial 停止点，GUI 显示累计 Scene、相对动作真值、起始车道→空车道和 Unity 同步状态。每个 Scene 最多提交一个合格主决策窗，因此 NeuroOnline 的样本计数也是 Scene 级：累计 64 个样本后开始更新，之后每新增 64 个样本再次更新；回放池从 64 个样本增长到 320 个样本，达到上限后使用最近 320 个样本。`balance_pool_per_class: 32` 用于生成可复现的类别平衡候选池；若候选动作在边界车道不可执行，会保留到后续可执行 Scene，而不会伪造标签。运行持续到操作员切换页面、关闭 Unity 或停止 GUI。真实设备实验必须保持 `online_adaptation.simulation.enabled: false`。
 
 ## 各模式 EEG 保存逻辑
 

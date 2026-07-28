@@ -1,4 +1,4 @@
-"""Focused tests for the paper-faithful NeuroOnline integration."""
+"""Focused tests for the NeuroOnline integration."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from adaptation.calibration_search import (
     run_calibration_search,
 )
 from adaptation.neuroonline import (
+    NEUROONLINE_TRAINING_MECHANICS_VERSION,
     NeuroOnlineConfig,
     NeuroOnlineModelAdapter,
     NeuroOnlineStreamAdapter,
@@ -44,14 +45,40 @@ class _TinyDecoder(nn.Module):
         return self.classifier(self.features(inputs).squeeze(-1))
 
 
+class _BatchNormDropoutDecoder(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv1d(2, 4, kernel_size=3, padding=1),
+            nn.BatchNorm1d(4),
+            nn.GELU(),
+            nn.Dropout(0.5),
+            nn.AdaptiveAvgPool1d(1),
+        )
+        self.classifier = nn.Linear(4, 3)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.features(inputs).squeeze(-1))
+
+
+def _separable_tiny_data(samples_per_class: int = 10) -> tuple[np.ndarray, np.ndarray]:
+    labels = np.repeat(np.arange(3, dtype=np.int64), samples_per_class)
+    inputs = np.zeros((labels.size, 2, 16), dtype=np.float32)
+    inputs[labels == 0, 0, :] = 2.0
+    inputs[labels == 1, 1, :] = 2.0
+    inputs[labels == 2, :, :] = -2.0
+    inputs += np.random.default_rng(7).normal(0.0, 0.02, inputs.shape).astype(np.float32)
+    return inputs, labels
+
+
 class NeuroOnlineTests(unittest.TestCase):
-    def test_formal_defaults_update_from_latest_64_primary_windows(self) -> None:
+    def test_defaults_start_updating_after_64_windows(self) -> None:
         config = NeuroOnlineConfig.from_mapping(
             {"enabled": True, "strategy": "neuroonline"}
         )
         self.assertEqual(config.history_threshold, 64)
         self.assertEqual(config.update_stride, 64)
-        self.assertEqual(config.recent_samples, 64)
+        self.assertEqual(config.recent_samples, 320)
 
     def setUp(self) -> None:
         torch.manual_seed(7)
@@ -79,46 +106,112 @@ class NeuroOnlineTests(unittest.TestCase):
         actual = wrapped.predict_proba(inputs)
         np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-7)
 
-    def test_mask_ratio_uses_one_contiguous_time_and_frequency_region(self) -> None:
+    def test_mc_dropout_does_not_update_batchnorm_statistics(self) -> None:
+        inputs = np.random.randn(5, 2, 16).astype(np.float32)
+        base = TorchModelAdapter("batchnorm-dropout", _BatchNormDropoutDecoder())
+        batchnorm = base.model.features[1]
+        before_mean = batchnorm.running_mean.detach().clone()
+        before_batches = batchnorm.num_batches_tracked.detach().clone()
+
+        base.predict_proba(inputs, mc_dropout_passes=4)
+
+        torch.testing.assert_close(batchnorm.running_mean, before_mean)
+        torch.testing.assert_close(batchnorm.num_batches_tracked, before_batches)
+
+        wrapped_base = TorchModelAdapter(
+            "batchnorm-dropout",
+            _BatchNormDropoutDecoder(),
+        )
+        wrapped = NeuroOnlineModelAdapter(
+            wrapped_base,
+            config=NeuroOnlineConfig(enabled=True, prompt_count=4),
+        )
+        wrapped_batchnorm = wrapped_base.model.features[1]
+        wrapped_before_mean = wrapped_batchnorm.running_mean.detach().clone()
+        wrapped_before_batches = wrapped_batchnorm.num_batches_tracked.detach().clone()
+
+        wrapped.predict_proba(inputs, mc_dropout_passes=4)
+
+        torch.testing.assert_close(wrapped_batchnorm.running_mean, wrapped_before_mean)
+        torch.testing.assert_close(
+            wrapped_batchnorm.num_batches_tracked,
+            wrapped_before_batches,
+        )
+
+    def test_mask_ratio_uses_independent_elementwise_time_and_frequency_masks(self) -> None:
         inputs = torch.ones(3, 2, 20)
+        expected_time_generator = torch.Generator().manual_seed(11)
+        expected_time_mask = torch.rand(
+            inputs.shape,
+            generator=expected_time_generator,
+        ) < 0.25
         time_masked = _time_mask(
             inputs,
             0.25,
             torch.Generator().manual_seed(11),
         )
-        for sample in time_masked:
-            masked_positions = torch.where(sample[0] == 0)[0]
-            self.assertEqual(masked_positions.numel(), 5)
-            self.assertTrue(torch.equal(masked_positions, torch.arange(
-                masked_positions[0],
-                masked_positions[0] + 5,
-            )))
-            self.assertTrue(torch.equal(sample[0] == 0, sample[1] == 0))
+        self.assertTrue(torch.equal(time_masked == 0, expected_time_mask))
+        self.assertFalse(torch.equal(time_masked[0, 0] == 0, time_masked[0, 1] == 0))
 
         signal = torch.randn(3, 2, 20)
+        original_spectrum = torch.fft.rfft(signal, dim=-1)
+        expected_frequency_generator = torch.Generator().manual_seed(11)
+        expected_frequency_mask = torch.rand(
+            original_spectrum.shape,
+            generator=expected_frequency_generator,
+        ) < 0.25
+        expected_frequency_view = torch.fft.irfft(
+            original_spectrum.masked_fill(expected_frequency_mask, 0.0 + 0.0j),
+            n=signal.shape[-1],
+            dim=-1,
+        )
         frequency_masked = _frequency_mask(
             signal,
             0.25,
             torch.Generator().manual_seed(11),
         )
-        masked_spectrum = torch.fft.rfft(frequency_masked, dim=-1)
-        original_spectrum = torch.fft.rfft(signal, dim=-1)
-        expected_bins = round(original_spectrum.shape[-1] * 0.25)
-        for sample_index in range(signal.shape[0]):
-            removed = torch.isclose(
-                masked_spectrum[sample_index, 0],
-                torch.zeros_like(masked_spectrum[sample_index, 0]),
-                atol=1e-5,
-            )
-            self.assertGreaterEqual(int(removed.sum()), expected_bins)
-            self.assertTrue(torch.equal(
-                removed,
-                torch.isclose(
-                    masked_spectrum[sample_index, 1],
-                    torch.zeros_like(masked_spectrum[sample_index, 1]),
-                    atol=1e-5,
-                ),
-            ))
+        torch.testing.assert_close(frequency_masked, expected_frequency_view)
+        self.assertFalse(
+            torch.equal(expected_frequency_mask[0, 0], expected_frequency_mask[0, 1])
+        )
+
+    def test_objective_applies_ce_to_all_three_views_and_preserves_lambda(self) -> None:
+        class CountingCriterion(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.calls = 0
+
+            def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+                del labels
+                self.calls += 1
+                return logits.sum() * 0.0 + float(self.calls)
+
+        config = NeuroOnlineConfig(
+            enabled=True,
+            consistency_weight=0.7,
+            prompt_count=4,
+        )
+        wrapped = NeuroOnlineModelAdapter(
+            TorchModelAdapter("tiny", _TinyDecoder()),
+            config=config,
+        )
+        original = torch.randn(6, 2, 16)
+        wrapped._prepare_training(original[:1])
+        criterion = CountingCriterion()
+        loss, classification, consistency = wrapped._training_objective(
+            original,
+            original * 0.5,
+            original * 0.25,
+            torch.arange(6) % 3,
+            criterion,
+        )
+
+        self.assertEqual(criterion.calls, 3)
+        torch.testing.assert_close(classification, torch.tensor(6.0))
+        torch.testing.assert_close(
+            loss,
+            classification + config.consistency_weight * consistency,
+        )
 
     def test_full_neuroonline_objective_updates_backbone_and_persists_crm(self) -> None:
         config = NeuroOnlineConfig(
@@ -151,21 +244,54 @@ class NeuroOnlineTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "tiny.pt"
+            expected = wrapped.predict_proba(original[:3])
             wrapped.save(path)
             self.assertTrue(path.exists())
             self.assertTrue(Path(f"{path}.neuroonline.pt").exists())
+            checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+            self.assertEqual(checkpoint["checkpoint_format"], "neuroonline_bundle_v1")
+            self.assertIn("neuroonline", checkpoint)
+
+            Path(f"{path}.neuroonline.pt").unlink()
+            restored_base = TorchModelAdapter("tiny", _TinyDecoder())
+            restored_base.load(path)
+            restored = NeuroOnlineModelAdapter(
+                restored_base,
+                config=config,
+                state_path=path,
+            )
+            pending_copy = Path(tmp_dir) / "pending-copy.pt"
+            restored.save(pending_copy)
+            pending_payload = torch.load(
+                pending_copy,
+                map_location="cpu",
+                weights_only=True,
+            )
+            self.assertIn("neuroonline", pending_payload)
+            np.testing.assert_allclose(
+                restored.predict_proba(original[:3]),
+                expected,
+                rtol=1e-6,
+                atol=1e-7,
+            )
+            restored.load(path)
+            np.testing.assert_allclose(
+                restored.predict_proba(original[:3]),
+                expected,
+                rtol=1e-6,
+                atol=1e-7,
+            )
 
     def test_offline_fit_initializes_and_trains_complete_neuroonline_checkpoint(self) -> None:
         config = NeuroOnlineConfig(
             enabled=True,
             prompt_count=4,
-            offline_epochs=2,
+            offline_epochs=20,
             offline_batch_size=6,
-            offline_learning_rate=1e-3,
+            offline_learning_rate=1e-2,
         )
         wrapped = NeuroOnlineModelAdapter(TorchModelAdapter("tiny", _TinyDecoder()), config=config)
-        inputs = np.random.randn(30, 2, 16).astype(np.float32)
-        labels = np.tile(np.arange(3, dtype=np.int64), 10)
+        inputs, labels = _separable_tiny_data()
         metrics = wrapped.fit(
             inputs,
             labels,
@@ -180,27 +306,27 @@ class NeuroOnlineTests(unittest.TestCase):
         self.assertGreaterEqual(metrics["val_acc"], 0.0)
 
     def test_calibration_search_keeps_trial_holdout_and_saves_report(self) -> None:
-        inputs = np.random.randn(30, 2, 16).astype(np.float32)
-        labels = np.tile(np.arange(3, dtype=np.int64), 10)
+        inputs, labels = _separable_tiny_data()
         trial_ids = np.arange(labels.size, dtype=np.int64)
         base_config = NeuroOnlineConfig(
             enabled=True,
             prompt_count=4,
-            offline_epochs=2,
-            offline_patience=1,
+            offline_epochs=20,
+            offline_patience=20,
             offline_batch_size=6,
-            offline_learning_rate=1e-3,
+            offline_learning_rate=1e-2,
         )
         search_config = CalibrationSearchConfig(
             enabled=True,
-            selection_epochs=1,
-            selection_patience=1,
-            learning_rates=(1e-3,),
+            selection_epochs=20,
+            selection_patience=20,
+            learning_rates=(1e-2,),
             batch_sizes=(6,),
             mask_ratios=(0.3,),
             consistency_weights=(0.1,),
         )
         with tempfile.TemporaryDirectory() as tmp_dir:
+            report_dir = Path(tmp_dir) / "nested" / "search"
             result = run_calibration_search(
                 base_template=TorchModelAdapter("tiny", _TinyDecoder()),
                 base_config=base_config,
@@ -208,12 +334,13 @@ class NeuroOnlineTests(unittest.TestCase):
                 X=inputs,
                 y=labels,
                 groups=trial_ids,
-                session_dir=Path(tmp_dir),
+                session_dir=report_dir,
             )
 
-            self.assertTrue((Path(tmp_dir) / "hyperparameter_search.json").exists())
-            self.assertEqual(result.best_config.offline_epochs, 2)
+            self.assertTrue((report_dir / "hyperparameter_search.json").exists())
+            self.assertEqual(result.best_config.offline_epochs, 20)
             self.assertEqual(len(result.report["candidates"]), 1)
+            self.assertTrue(result.report["deployment_eligible"])
             split = result.report["split"]
             self.assertEqual(
                 split["train_trials"]
@@ -257,6 +384,7 @@ class NeuroOnlineTests(unittest.TestCase):
             (new_session / "hyperparameter_search.json").write_text(
                 json.dumps(
                     {
+                        "training_mechanics_version": NEUROONLINE_TRAINING_MECHANICS_VERSION,
                         "best_parameters": best_parameters,
                         "untouched_holdout_metrics": {
                             "balanced_accuracy": 0.5
@@ -299,6 +427,7 @@ class NeuroOnlineTests(unittest.TestCase):
             prompt_count=4,
             mask_ratio=0.5,
             consistency_weight=0.3,
+            random_seed=2026,
         )
         wrapped = NeuroOnlineModelAdapter(
             TorchModelAdapter("tiny", _TinyDecoder()),
@@ -321,14 +450,24 @@ class NeuroOnlineTests(unittest.TestCase):
             )
             self.assertEqual(restored.config.mask_ratio, 0.5)
             self.assertEqual(restored.config.consistency_weight, 0.3)
+            self.assertEqual(restored.config.random_seed, 2026)
 
     def test_train_from_records_restores_neuroonline_main_and_crm_weights(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             records = root / "records" / "S001" / "calibration" / "20260722_120000"
             records.mkdir(parents=True)
-            inputs = np.random.randn(12, 2, 400).astype(np.float32)
             labels = np.tile(np.arange(3, dtype=np.int64), 4)
+            time_axis = np.arange(400, dtype=np.float32) / 200.0
+            inputs = np.zeros((labels.size, 2, 400), dtype=np.float32)
+            for index, label in enumerate(labels):
+                if label == 0:
+                    inputs[index, 0] = np.sin(2 * np.pi * 10.0 * time_axis)
+                elif label == 1:
+                    inputs[index, 1] = np.sin(2 * np.pi * 10.0 * time_axis)
+                else:
+                    inputs[index, 0] = np.sin(2 * np.pi * 20.0 * time_axis)
+                    inputs[index, 1] = np.sin(2 * np.pi * 20.0 * time_axis)
             np.savez_compressed(
                 records / "training_windows_main.npz",
                 raw_windows=inputs,
@@ -347,10 +486,10 @@ class NeuroOnlineTests(unittest.TestCase):
                         "n_classes: 3",
                         "window_sec: 2.0",
                         "step_sec: 0.5",
-                        "calibration_epochs: 1",
+                        "calibration_epochs: 20",
                         "batch_size: 4",
                         "learning_rate: 0.001",
-                        "early_stopping_patience: 1",
+                        "early_stopping_patience: 20",
                         "storage:",
                         f"  models_dir: {str(root / 'models')!r}",
                         f"  records_dir: {str(root / 'records')!r}",
@@ -359,9 +498,11 @@ class NeuroOnlineTests(unittest.TestCase):
                         "  strategy: neuroonline",
                         "  neuroonline:",
                         "    prompt_count: 4",
-                        "    offline_epochs: 1",
+                        "    mask_ratio: 0.1",
+                        "    offline_epochs: 20",
+                        "    offline_patience: 20",
                         "    offline_batch_size: 4",
-                        "    offline_learning_rate: 0.001",
+                        "    offline_learning_rate: 0.01",
                     ]
                 ),
                 encoding="utf-8",

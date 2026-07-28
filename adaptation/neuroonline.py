@@ -1,8 +1,8 @@
-"""Paper-faithful NeuroOnline adaptation for labeled EEG streams.
+"""NeuroOnline training mechanics adapted to the project's EEG decoders.
 
-This module follows the released NeuroOnline implementation: every observed
-sample gets one time-masked and one frequency-masked view, the most recent
-samples are replayed after a fixed number of stream steps, and the backbone,
+Every observed sample gets one time-masked and one frequency-masked view. All
+three views receive supervised classification loss, the augmented
+representations are aligned with the original representation, and the backbone,
 context modulator, and classifier are optimized together.
 """
 
@@ -26,10 +26,21 @@ from torch.utils.data import DataLoader, TensorDataset
 from models.factory import (
     BaseModelAdapter,
     TorchModelAdapter,
+    atomic_torch_save,
+    enable_mc_dropout,
     split_train_validation_indices,
 )
 
 LOGGER = logging.getLogger(__name__)
+NEUROONLINE_TRAINING_MECHANICS_VERSION = 2
+
+
+class ClassCollapseError(RuntimeError):
+    """Raised when training never produces a checkpoint covering every class."""
+
+    def __init__(self, message: str, metrics: dict[str, float]) -> None:
+        super().__init__(message)
+        self.metrics = metrics
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,15 +53,15 @@ class NeuroOnlineConfig:
     epochs: int = 3
     update_stride: int = 64
     history_threshold: int = 64
-    recent_samples: int = 64
+    recent_samples: int = 320
     weight_decay: float = 5e-2
-    mask_ratio: float = 0.3
+    mask_ratio: float = 0.7
     consistency_weight: float = 0.1
     label_smoothing: float = 0.1
     prompt_count: int = 32
     random_seed: int = 42
     offline_epochs: int = 50
-    offline_patience: int = 6
+    offline_patience: int = 50
     offline_batch_size: int = 16
     offline_learning_rate: float = 1e-4
 
@@ -67,15 +78,15 @@ class NeuroOnlineConfig:
             epochs=max(int(data.get("epochs", 3)), 1),
             update_stride=max(int(data.get("update_stride", 64)), 1),
             history_threshold=max(int(data.get("history_threshold", 64)), 1),
-            recent_samples=max(int(data.get("recent_samples", 64)), 1),
+            recent_samples=max(int(data.get("recent_samples", 320)), 1),
             weight_decay=max(float(data.get("weight_decay", 5e-2)), 0.0),
-            mask_ratio=min(max(float(data.get("mask_ratio", 0.3)), 0.0), 1.0),
+            mask_ratio=min(max(float(data.get("mask_ratio", 0.7)), 0.0), 1.0),
             consistency_weight=max(float(data.get("consistency_weight", 0.1)), 0.0),
             label_smoothing=min(max(float(data.get("label_smoothing", 0.1)), 0.0), 1.0),
             prompt_count=max(int(data.get("prompt_count", 32)), 1),
             random_seed=int(data.get("random_seed", 42)),
             offline_epochs=max(int(data.get("offline_epochs", 50)), 1),
-            offline_patience=max(int(data.get("offline_patience", 6)), 1),
+            offline_patience=max(int(data.get("offline_patience", 50)), 1),
             offline_batch_size=max(int(data.get("offline_batch_size", 16)), 1),
             offline_learning_rate=max(float(data.get("offline_learning_rate", 1e-4)), 1e-9),
         )
@@ -153,9 +164,11 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         self._modulator: ContextAwareRepresentationModulator | None = None
         self._feature_shape: tuple[int, ...] | None = None
         self._optimizer: torch.optim.Optimizer | None = None
+        self._update_generator = torch.Generator().manual_seed(config.random_seed)
         self._state_path = state_path
         self._pending_state = _load_neuroonline_state(state_path, self._device)
         self.config = _checkpoint_config(config, self._pending_state)
+        self._update_generator.manual_seed(self.config.random_seed)
 
     def _prepare_training(self, example: torch.Tensor) -> ContextAwareRepresentationModulator:
         """Initialize CRM lazily and make the complete NeuroOnline stack trainable."""
@@ -175,6 +188,7 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         labels: torch.Tensor | np.ndarray,
         *,
         batch_size: int,
+        shuffle: bool = True,
     ) -> DataLoader:
         dataset = TensorDataset(
             torch.as_tensor(original, dtype=torch.float32),
@@ -182,7 +196,11 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
             torch.as_tensor(frequency_masked, dtype=torch.float32),
             torch.as_tensor(labels, dtype=torch.long),
         )
-        return DataLoader(dataset, batch_size=max(int(batch_size), 1), shuffle=True)
+        return DataLoader(
+            dataset,
+            batch_size=max(int(batch_size), 1),
+            shuffle=shuffle,
+        )
 
     def _training_objective(
         self,
@@ -193,9 +211,15 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         criterion: nn.Module,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         logits, original_representation = self._forward_adapted(original)
-        _, time_representation = self._forward_adapted(time_masked)
-        _, frequency_representation = self._forward_adapted(frequency_masked)
-        classification = criterion(logits, labels)
+        time_logits, time_representation = self._forward_adapted(time_masked)
+        frequency_logits, frequency_representation = self._forward_adapted(
+            frequency_masked
+        )
+        classification = (
+            criterion(logits, labels)
+            + criterion(time_logits, labels)
+            + criterion(frequency_logits, labels)
+        )
         consistency = (
             F.mse_loss(time_representation, original_representation)
             + F.mse_loss(frequency_representation, original_representation)
@@ -236,9 +260,7 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
             if clip_classifier_gradients:
                 trainable_parameters = [
                     parameter
-                    for parameter in (
-                        list(self.base.model.parameters()) + list(self._modulator.parameters())
-                    )
+                    for parameter in self._classifier.parameters()
                     if parameter.requires_grad
                 ]
                 torch.nn.utils.clip_grad_norm_(trainable_parameters, 1.0)
@@ -350,6 +372,8 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         best_loss = float("inf")
         best_model_state: dict[str, torch.Tensor] | None = None
         best_modulator_state: dict[str, torch.Tensor] | None = None
+        best_score: tuple[float, ...] | None = None
+        latest_validation_metrics: dict[str, float] = {}
         stagnant_epochs = 0
         epochs_completed = 0
         for epoch_index in range(self.config.offline_epochs):
@@ -430,40 +454,43 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
                 np.min(trial_class_accuracies[trial_totals > 0])
             )
             epochs_completed = epoch_index + 1
+            latest_validation_metrics = {
+                "val_loss": validation_loss,
+                "val_acc": accuracy,
+                "val_balanced_accuracy": balanced_accuracy,
+                "val_kappa": kappa,
+                "val_macro_f1": macro_f1,
+                "val_worst_class_accuracy": worst_class_accuracy,
+                "val_trial_acc": trial_accuracy,
+                "val_trial_balanced_accuracy": trial_balanced_accuracy,
+                "val_trial_kappa": trial_kappa,
+                "val_trial_macro_f1": trial_macro_f1,
+                "val_trial_worst_class_accuracy": trial_worst_class_accuracy,
+                "epochs_completed": float(epochs_completed),
+            }
             if progress_callback is not None:
                 progress_callback(
                     epochs_completed,
                     self.config.offline_epochs,
                     {
                         **metrics,
-                        "val_loss": validation_loss,
-                        "val_acc": accuracy,
-                        "val_balanced_accuracy": balanced_accuracy,
-                        "val_kappa": kappa,
-                        "val_macro_f1": macro_f1,
-                        "val_worst_class_accuracy": worst_class_accuracy,
-                        "val_trial_acc": trial_accuracy,
-                        "val_trial_balanced_accuracy": trial_balanced_accuracy,
-                        "val_trial_kappa": trial_kappa,
-                        "val_trial_macro_f1": trial_macro_f1,
-                        "val_trial_worst_class_accuracy": trial_worst_class_accuracy,
+                        **latest_validation_metrics,
                     },
                 )
+            noncollapsed = (
+                worst_class_accuracy > 0.0
+                and trial_worst_class_accuracy > 0.0
+            )
             score = (
+                trial_worst_class_accuracy,
+                worst_class_accuracy,
                 trial_balanced_accuracy,
                 trial_kappa,
                 trial_macro_f1,
                 balanced_accuracy,
                 -validation_loss,
             )
-            best_score = (
-                best_trial_balanced_accuracy,
-                best_trial_kappa,
-                best_trial_macro_f1,
-                best_balanced_accuracy,
-                -best_loss,
-            )
-            if score > best_score:
+            if noncollapsed and (best_score is None or score > best_score):
                 best_balanced_accuracy = balanced_accuracy
                 best_kappa = kappa
                 best_accuracy = accuracy
@@ -475,10 +502,11 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
                 best_trial_macro_f1 = trial_macro_f1
                 best_trial_worst_class_accuracy = trial_worst_class_accuracy
                 best_loss = validation_loss
+                best_score = score
                 best_model_state = _copy_state_dict(self.base.model)
                 best_modulator_state = _copy_state_dict(modulator)
                 stagnant_epochs = 0
-            else:
+            elif best_score is not None:
                 stagnant_epochs += 1
                 if stagnant_epochs >= self.config.offline_patience:
                     LOGGER.info(
@@ -488,9 +516,14 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
                         self.config.offline_patience,
                     )
                     break
-        if best_model_state is not None and best_modulator_state is not None:
-            self.base.model.load_state_dict(best_model_state)
-            self._modulator.load_state_dict(best_modulator_state)
+        if best_model_state is None or best_modulator_state is None:
+            raise ClassCollapseError(
+                "NeuroOnline training produced no checkpoint with non-zero "
+                "window and trial recall for every validation class.",
+                latest_validation_metrics,
+            )
+        self.base.model.load_state_dict(best_model_state)
+        self._modulator.load_state_dict(best_modulator_state)
         self._optimizer = None
         return {
             "val_loss": best_loss,
@@ -513,38 +546,51 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         outputs: list[np.ndarray] = []
         self._ensure_modulator(inputs[:1])
         assert self._modulator is not None
+        if passes > 1:
+            enable_mc_dropout(self.base.model)
+            enable_mc_dropout(self._modulator)
+        else:
+            self.base.model.eval()
+            self._modulator.eval()
         for _ in range(passes):
-            if passes > 1:
-                self.base.model.train()
-                self._modulator.train()
-            else:
-                self.base.model.eval()
-                self._modulator.eval()
             with torch.no_grad():
                 logits, _ = self._forward_adapted(inputs)
                 outputs.append(torch.softmax(logits, dim=1).cpu().numpy())
         return np.mean(np.stack(outputs, axis=0), axis=0)
 
     def save(self, path: Path) -> None:
-        self.base.save(path)
-        if self._modulator is None:
+        if self._modulator is None and self._pending_state is None:
+            self.base.save(path)
             return
-        sidecar = _sidecar_path(path)
-        sidecar.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
+        state = self._pending_state
+        if state is None:
+            assert self._modulator is not None
+            state = {
+                "training_mechanics_version": NEUROONLINE_TRAINING_MECHANICS_VERSION,
                 "feature_shape": self._feature_shape,
                 "config": asdict(self.config),
                 "modulator": self._modulator.state_dict(),
+            }
+        atomic_torch_save(
+            {
+                "checkpoint_format": "neuroonline_bundle_v1",
+                "model_state_dict": self.base.model.state_dict(),
+                "neuroonline": state,
             },
-            sidecar,
+            path,
         )
+        sidecar = _sidecar_path(path)
+        atomic_torch_save(state, sidecar)
 
     def load(self, path: Path) -> None:
         self.base.load(path)
-        self._state_path = _sidecar_path(path)
+        self._modulator = None
+        self._feature_shape = None
+        self._optimizer = None
+        self._state_path = path
         self._pending_state = _load_neuroonline_state(self._state_path, self._device)
         self.config = _checkpoint_config(self.config, self._pending_state)
+        self._update_generator.manual_seed(self.config.random_seed)
 
     def update(
         self,
@@ -589,12 +635,17 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
                 lr=lr,
                 weight_decay=self.config.weight_decay,
             )
+        permutation = torch.randperm(
+            inputs.shape[0],
+            generator=self._update_generator,
+        )
         loader = self._view_loader(
-            inputs,
-            X_time,
-            X_freq,
-            y,
+            inputs[permutation],
+            torch.as_tensor(X_time)[permutation],
+            torch.as_tensor(X_freq)[permutation],
+            torch.as_tensor(y)[permutation],
             batch_size=max(int(batch_size or self.config.update_batch_size), 1),
+            shuffle=False,
         )
         criterion = nn.CrossEntropyLoss(label_smoothing=self.config.label_smoothing).to(self._device)
         metrics = {"loss": 0.0, "classification_loss": 0.0, "consistency_loss": 0.0}
@@ -603,7 +654,7 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
                 loader,
                 self._optimizer,
                 criterion,
-                clip_classifier_gradients=True,
+                clip_classifier_gradients=False,
             )
         return {
             "updated": float(X.shape[0]),
@@ -1106,25 +1157,14 @@ def _time_mask(
     if inputs.ndim < 2:
         raise ValueError("Time masking expects a tensor with a time dimension.")
     ratio = float(np.clip(ratio, 0.0, 1.0))
-    time_points = int(inputs.shape[-1])
-    span = min(int(round(time_points * ratio)), time_points)
-    if span <= 0:
+    if ratio <= 0.0:
         return inputs.clone()
-    batch_size = int(inputs.shape[0])
-    starts = torch.randint(
-        0,
-        time_points - span + 1,
-        (batch_size,),
+    mask = torch.rand(
+        inputs.shape,
         generator=generator,
         device=inputs.device,
-    )
-    positions = torch.arange(time_points, device=inputs.device).view(1, time_points)
-    mask = (positions >= starts.view(-1, 1)) & (
-        positions < (starts + span).view(-1, 1)
-    )
-    mask = mask.view(batch_size, *([1] * (inputs.ndim - 2)), time_points)
-    output = inputs.clone()
-    return output.masked_fill(mask, 0.0)
+    ) < ratio
+    return inputs.masked_fill(mask, 0.0)
 
 
 def _frequency_mask(
@@ -1136,23 +1176,13 @@ def _frequency_mask(
         raise ValueError("Frequency masking expects a tensor with a time dimension.")
     ratio = float(np.clip(ratio, 0.0, 1.0))
     spectrum = torch.fft.rfft(inputs, dim=-1)
-    frequencies = int(spectrum.shape[-1])
-    span = min(int(round(frequencies * ratio)), frequencies)
-    if span <= 0:
+    if ratio <= 0.0:
         return inputs.clone()
-    batch_size = int(inputs.shape[0])
-    starts = torch.randint(
-        0,
-        frequencies - span + 1,
-        (batch_size,),
+    mask = torch.rand(
+        spectrum.shape,
         generator=generator,
         device=inputs.device,
-    )
-    positions = torch.arange(frequencies, device=inputs.device).view(1, frequencies)
-    mask = (positions >= starts.view(-1, 1)) & (
-        positions < (starts + span).view(-1, 1)
-    )
-    mask = mask.view(batch_size, *([1] * (inputs.ndim - 2)), frequencies)
+    ) < ratio
     masked = spectrum.masked_fill(mask, 0.0 + 0.0j)
     return torch.fft.irfft(masked, n=inputs.shape[-1], dim=-1)
 
@@ -1164,10 +1194,29 @@ def _sidecar_path(path: Path) -> Path:
 def _load_neuroonline_state(path: Path | None, device: torch.device) -> dict[str, Any] | None:
     if path is None:
         return None
+    if not path.name.endswith(".neuroonline.pt") and path.exists():
+        checkpoint = torch.load(path, map_location=device, weights_only=True)
+        if isinstance(checkpoint, dict):
+            embedded = checkpoint.get("neuroonline")
+            if isinstance(embedded, dict):
+                return _validate_neuroonline_state(embedded)
     sidecar = path if path.name.endswith(".neuroonline.pt") else _sidecar_path(path)
     if not sidecar.exists():
         return None
-    return torch.load(sidecar, map_location=device, weights_only=True)
+    payload = torch.load(sidecar, map_location=device, weights_only=True)
+    return _validate_neuroonline_state(payload)
+
+
+def _validate_neuroonline_state(payload: dict[str, Any]) -> dict[str, Any]:
+    saved_version = int(payload.get("training_mechanics_version", 1))
+    if saved_version != NEUROONLINE_TRAINING_MECHANICS_VERSION:
+        LOGGER.warning(
+            "Loading NeuroOnline sidecar trained with mechanics version %s; "
+            "current training uses version %s. Retrain before deployment.",
+            saved_version,
+            NEUROONLINE_TRAINING_MECHANICS_VERSION,
+        )
+    return payload
 
 
 def _checkpoint_config(
@@ -1185,6 +1234,7 @@ def _checkpoint_config(
             "weight_decay",
             "label_smoothing",
             "prompt_count",
+            "random_seed",
         )
         if field_name in saved
     }

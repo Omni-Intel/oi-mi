@@ -112,6 +112,17 @@ class CliHelperTests(unittest.TestCase):
         )
         self.assertEqual(set(labels[validation_indices]), {0, 1, 2})
 
+    def test_grouped_validation_rejects_classes_without_two_trials(self) -> None:
+        labels = np.asarray([0, 0, 1, 1, 2, 2], dtype=np.int64)
+        groups = np.asarray([0, 0, 1, 1, 2, 2], dtype=np.int64)
+
+        with self.assertRaisesRegex(ValueError, "at least two independent groups"):
+            split_train_validation_indices(
+                labels,
+                groups=groups,
+                random_state=17,
+            )
+
     def test_build_model_path_extension(self) -> None:
         config = {"storage": {"models_dir": "models_storage"}, "device_type": "brainco"}
         self.assertEqual(

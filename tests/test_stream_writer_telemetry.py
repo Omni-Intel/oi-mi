@@ -142,6 +142,43 @@ class StreamWriterTelemetryTests(unittest.TestCase):
             self.assertIn("chunks/chunk_000000.npz", checksum_paths)
             self.assertTrue(verify_bundle(root)["ok"])
 
+    def test_continuous_metrics_exclude_primary_decision_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            writer = StreamWriter(root, chunk_size=2)
+            writer.start({"mode": "realtime", "n_classes": 3})
+            writer.put(
+                np.zeros((2, 8), dtype=np.float32),
+                y_true=0,
+                y_pred=0,
+                raw_pred=0,
+                confidence=0.9,
+                probabilities=np.asarray([0.9, 0.05, 0.05], dtype=np.float32),
+                training_role="primary_decision",
+                adaptation_eligible=True,
+            )
+            writer.put(
+                np.ones((2, 8), dtype=np.float32),
+                y_true=1,
+                y_pred=2,
+                raw_pred=2,
+                confidence=0.9,
+                probabilities=np.asarray([0.05, 0.05, 0.9], dtype=np.float32),
+                training_role="continuous_context",
+                adaptation_eligible=False,
+            )
+            writer.stop()
+            writer.finalize_manifest()
+
+            manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+            metrics = manifest["scientific_metrics"]
+            self.assertEqual(metrics["raw_window"]["samples"], 2)
+            self.assertEqual(metrics["primary_decision"]["raw"]["samples"], 1)
+            self.assertEqual(metrics["primary_decision"]["raw"]["accuracy"], 1.0)
+            self.assertEqual(metrics["continuous_dynamic_windows"], 1)
+            self.assertEqual(metrics["continuous_dynamic"]["raw"]["samples"], 1)
+            self.assertEqual(metrics["continuous_dynamic"]["raw"]["accuracy"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

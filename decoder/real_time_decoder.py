@@ -149,7 +149,7 @@ class RealTimeDecoder:
         source_metadata = getattr(online_label_source, "metadata", None)
         cue_metadata = source_metadata() if callable(source_metadata) else {}
         self._primary_windows_per_scene = max(
-            int((cue_metadata or {}).get("primary_windows_per_scene", 2)),
+            int((cue_metadata or {}).get("primary_windows_per_scene", 1)),
             1,
         )
         self._primary_window_spacing_sec = max(
@@ -691,6 +691,28 @@ class RealTimeDecoder:
                     continue
                 self._last_processed_window_end_monotonic = window_end
                 self._sync_game_scene()
+                aligned = None
+                alignment_target_end = self._primary_alignment_target_end()
+                if (
+                    alignment_target_end is not None
+                    and window_end >= alignment_target_end
+                ):
+                    alignment_history_sec = self._window_sec + max(
+                        2.0 * self._step_sec,
+                        1.0,
+                    )
+                    history_window, history_timestamps = self._acquirer.get_chunk(
+                        alignment_history_sec
+                    )
+                    aligned = self._select_aligned_primary_window(
+                        history_window,
+                        history_timestamps,
+                    )
+                if aligned is not None:
+                    window, timestamps = aligned
+                    window_start, window_end = self._resolve_window_time_bounds(
+                        timestamps
+                    )
                 preprocessing = preprocess_eeg_window(window, sfreq=self._sfreq)
                 processed = preprocessing.data
                 probability_batch, model_revision = self._predict_proba_with_revision(
@@ -746,8 +768,26 @@ class RealTimeDecoder:
                     lateral_control_released = (
                         scene_index in self._primary_decision_scenes
                     )
+                    control_released_at = float("nan")
                     if lateral_control_released:
-                        self._control_released_at[scene_index] = time.monotonic()
+                        control_released_at = time.monotonic()
+                        self._control_released_at[scene_index] = control_released_at
+                    scene_started_at = getattr(self, "_scene_started_at", {}).get(
+                        scene_index,
+                    )
+                    cue_metadata = self._online_label_source_metadata() or {}
+                    boundary_guard = max(
+                        float(cue_metadata.get("boundary_guard_sec", 0.5)),
+                        0.0,
+                    )
+                    target_window_start = (
+                        float(scene_started_at) + boundary_guard
+                        + (int(primary_decision_slot) - 1)
+                        * self._primary_window_spacing_sec
+                        if scene_started_at is not None
+                        else float("nan")
+                    )
+                    target_window_end = target_window_start + self._window_sec
                     writer = getattr(self, "_writer", None)
                     if writer is not None:
                         writer.append_event(
@@ -759,6 +799,20 @@ class RealTimeDecoder:
                             windows_required=self._primary_windows_per_scene,
                             window_start_monotonic=window_start,
                             window_end_monotonic=window_end,
+                            target_window_start_monotonic=target_window_start,
+                            target_window_end_monotonic=target_window_end,
+                            window_start_alignment_error_sec=(
+                                window_start - target_window_start
+                            ),
+                            window_end_alignment_error_sec=(
+                                window_end - target_window_end
+                            ),
+                            control_released_at_monotonic=control_released_at,
+                            decision_pipeline_latency_sec=(
+                                control_released_at - window_end
+                                if lateral_control_released
+                                else float("nan")
+                            ),
                             instruction_label_id=int(online_label.label_id),
                             raw_prediction=raw_prediction,
                             operational_prediction=(
@@ -953,7 +1007,115 @@ class RealTimeDecoder:
 
             elapsed = time.perf_counter() - started_at
             sleep_time = max(0.0, self._step_sec - elapsed)
+            alignment_due = self._primary_alignment_target_end()
+            if alignment_due is not None:
+                until_due = alignment_due - time.monotonic()
+                if until_due > 0.0:
+                    sleep_time = min(sleep_time, until_due)
+                else:
+                    # Poll briefly until source-timestamped EEG through the exact
+                    # target end has arrived instead of waiting another full step.
+                    sleep_time = min(sleep_time, 0.05)
             self._sleep_with_heartbeat(sleep_time, None)
+
+    def _uses_cued_primary_alignment(self) -> bool:
+        status = self._online_label_source_status()
+        return bool(status and status.get("source") == "cued-protocol")
+
+    def _primary_alignment_target_end(self) -> float | None:
+        target = self._primary_alignment_target()
+        return None if target is None else target[2]
+
+    def _primary_alignment_target(
+        self,
+    ) -> tuple[int, float, float] | None:
+        status = self._online_label_source_status()
+        if not status or status.get("source") != "cued-protocol":
+            return None
+        scene_index = int(status.get("scene_index", -1))
+        if (
+            scene_index < 0
+            or scene_index != getattr(self, "_scene_sent_scene_index", -1)
+            or scene_index in getattr(self, "_primary_decision_scenes", set())
+        ):
+            return None
+        scene_started_at = getattr(self, "_scene_started_at", {}).get(scene_index)
+        if scene_started_at is None:
+            return None
+        bounds = getattr(self, "_primary_decision_window_bounds", {}).get(
+            scene_index,
+            [],
+        )
+        next_window_index = len(bounds)
+        windows_required = max(
+            int(getattr(self, "_primary_windows_per_scene", 1)),
+            1,
+        )
+        if next_window_index >= windows_required:
+            return None
+        metadata = self._online_label_source_metadata() or {}
+        boundary_guard = max(float(metadata.get("boundary_guard_sec", 0.5)), 0.0)
+        spacing = max(
+            float(getattr(self, "_primary_window_spacing_sec", self._step_sec)),
+            self._step_sec,
+        )
+        target_start = (
+            float(scene_started_at)
+            + boundary_guard
+            + next_window_index * spacing
+        )
+        return scene_index, target_start, target_start + self._window_sec
+
+    def _select_aligned_primary_window(
+        self,
+        history_window: np.ndarray,
+        history_timestamps: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Select the fixed current-Scene window from timestamped EEG history."""
+
+        if not self._uses_cued_primary_alignment():
+            return None
+        domain = str(
+            getattr(self._acquirer.metadata, "timestamp_domain", "relative")
+        ).strip().lower()
+        if domain != "monotonic":
+            return None
+        target = self._primary_alignment_target()
+        if target is None:
+            return None
+        _, target_start, target_end = target
+        timestamps = np.asarray(history_timestamps, dtype=np.float64).reshape(-1)
+        data = np.asarray(history_window, dtype=np.float32)
+        if (
+            data.ndim != 2
+            or timestamps.size != data.shape[-1]
+            or timestamps.size < 2
+            or not np.all(np.isfinite(timestamps))
+            or not np.all(np.diff(timestamps) > 0.0)
+        ):
+            return None
+        sample_period = 1.0 / float(self._sfreq)
+        history_end = float(timestamps[-1]) + sample_period
+        if history_end < target_end:
+            return None
+        sample_count = int(round(self._window_sec * self._sfreq))
+        start_index = int(np.searchsorted(timestamps, target_start, side="left"))
+        stop_index = start_index + sample_count
+        if start_index < 0 or stop_index > timestamps.size:
+            return None
+        selected_timestamps = timestamps[start_index:stop_index]
+        selected_start = float(selected_timestamps[0])
+        selected_end = float(selected_timestamps[-1]) + sample_period
+        tolerance = max(2.0 * sample_period, 0.01)
+        if (
+            selected_start < target_start - tolerance
+            or abs(selected_end - target_end) > tolerance
+        ):
+            return None
+        return (
+            data[:, start_index:stop_index].copy(),
+            selected_timestamps.copy(),
+        )
 
     def _flush_pending_cued_windows(
         self,
@@ -1231,7 +1393,7 @@ class RealTimeDecoder:
         if not hasattr(self, "_primary_decision_window_bounds"):
             self._primary_decision_window_bounds = {}
         if not hasattr(self, "_primary_windows_per_scene"):
-            self._primary_windows_per_scene = 2
+            self._primary_windows_per_scene = 1
         if not hasattr(self, "_primary_window_spacing_sec"):
             self._primary_window_spacing_sec = 1.0
         bounds = self._primary_decision_window_bounds.setdefault(scene_index, [])
@@ -1632,6 +1794,18 @@ class RealTimeDecoder:
                     self._last_game_transport_sent_at,
                 )
             )
+            scene_command_sent_at = float(
+                scene_ack.get("_sent_at_monotonic", scene_ack_time)
+            )
+            scene_ack_round_trip_sec = max(
+                float(
+                    scene_ack.get(
+                        "_ack_round_trip_sec",
+                        scene_ack_time - scene_command_sent_at,
+                    )
+                ),
+                0.0,
+            )
             if callable(confirm_scene) and not confirm_scene(
                 scene_index=scene_index,
                 applied_label_id=applied_label_id,
@@ -1674,6 +1848,9 @@ class RealTimeDecoder:
                     label_id=label_id,
                     label_name=status.get("label_name"),
                     unity_command=command,
+                    command_sent_at_monotonic=scene_command_sent_at,
+                    ack_received_at_monotonic=scene_ack_time,
+                    ack_round_trip_sec=scene_ack_round_trip_sec,
                     ack_confirmed=True,
                     protocol_version=CUED_PROTOCOL_VERSION,
                     start_lane=start_lane,
@@ -1945,14 +2122,28 @@ class RealTimeDecoder:
             self._last_game_transport_error = "AR transport does not support Unity scene ACK"
             return None
         try:
+            local_sent_at = time.monotonic()
             response = push_with_ack(command)
+            local_received_at = time.monotonic()
             if not isinstance(response, dict):
                 raise RuntimeError(
                     f"Unity returned no structured ACK for {command}"
                 )
+            response.setdefault("_sent_at_monotonic", local_sent_at)
+            response.setdefault("_received_at_monotonic", local_received_at)
+            response.setdefault(
+                "_ack_round_trip_sec",
+                max(
+                    float(response["_received_at_monotonic"])
+                    - float(response["_sent_at_monotonic"]),
+                    0.0,
+                ),
+            )
             self._last_game_transport_command = command
             self._last_game_transport_error = None
-            self._last_game_transport_sent_at = time.monotonic()
+            self._last_game_transport_sent_at = float(
+                response["_sent_at_monotonic"]
+            )
             return response
         except Exception as exc:  # noqa: BLE001
             self._last_game_transport_error = str(exc)
@@ -2284,7 +2475,7 @@ class RealTimeDecoder:
             result["primary_decision_windows_required"] = getattr(
                 self,
                 "_primary_windows_per_scene",
-                2,
+                1,
             )
             result["lateral_control_gate_active"] = (
                 scene_index

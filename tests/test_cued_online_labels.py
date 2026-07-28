@@ -83,6 +83,7 @@ def _bare_decoder(
     decoder._game_disconnect_message = None
     decoder._step_sec = 0.5
     decoder._sfreq = 200.0
+    decoder._window_sec = 2.0
     decoder._confidence_threshold = 0.5
     decoder._primary_windows_per_scene = 2
     decoder._primary_window_spacing_sec = 1.0
@@ -113,6 +114,7 @@ class CuedOnlineLabelTests(unittest.TestCase):
             scene_duration_sec=5.0,
             start_delay_sec=0.0,
             boundary_guard_sec=0.5,
+            primary_windows_per_scene=2,
             clock=clock,
         )
         outlet = _GameOutlet(current_lane=0)
@@ -170,6 +172,188 @@ class CuedOnlineLabelTests(unittest.TestCase):
                 window_end=104.0,
             )
         )
+
+    def test_default_single_primary_window_releases_control_at_first_window(self) -> None:
+        clock = _Clock(100.0)
+        source = CuedOnlineLabelSource(
+            ["left"],
+            scene_duration_sec=5.0,
+            start_delay_sec=0.0,
+            boundary_guard_sec=0.5,
+            clock=clock,
+        )
+        outlet = _GameOutlet(current_lane=0)
+        decoder = _bare_decoder(source, outlet)
+        decoder._primary_windows_per_scene = source.metadata()[
+            "primary_windows_per_scene"
+        ]
+        self.assertEqual(decoder._primary_windows_per_scene, 1)
+        self.assertEqual(source.prepare_scene(scene_index=0, start_lane=0), 0)
+        self.assertTrue(
+            source.confirm_scene_applied(
+                scene_index=0,
+                applied_label_id=0,
+                start_lane=0,
+                safe_lane=-1,
+                timestamp_monotonic=100.0,
+            )
+        )
+        decoder._scene_sent_scene_index = 0
+        label = source.get_label(window_start=100.5, window_end=102.5)
+
+        self.assertEqual(
+            decoder._claim_primary_decision_window(
+                online_label=label,
+                window_start=100.5,
+                window_end=102.5,
+            ),
+            1,
+        )
+        self.assertFalse(decoder._is_cued_control_gate_active())
+        self.assertIsNone(
+            decoder._claim_primary_decision_window(
+                online_label=label,
+                window_start=101.5,
+                window_end=103.5,
+            )
+        )
+
+    def test_primary_window_is_cut_at_exact_ack_relative_source_times(self) -> None:
+        clock = _Clock(100.0)
+        source = CuedOnlineLabelSource(
+            ["left"],
+            scene_duration_sec=5.0,
+            start_delay_sec=0.0,
+            boundary_guard_sec=0.5,
+            clock=clock,
+        )
+        decoder = _bare_decoder(source, _GameOutlet())
+        decoder._acquirer = SimpleNamespace(
+            metadata=SimpleNamespace(timestamp_domain="monotonic")
+        )
+        decoder._primary_windows_per_scene = 1
+        decoder._scene_sent_scene_index = 0
+        decoder._scene_started_at = {0: 100.0}
+        self.assertEqual(source.prepare_scene(scene_index=0, start_lane=0), 0)
+        self.assertTrue(
+            source.confirm_scene_applied(
+                scene_index=0,
+                applied_label_id=0,
+                start_lane=0,
+                safe_lane=-1,
+                timestamp_monotonic=100.0,
+            )
+        )
+        timestamps = 99.5 + np.arange(700, dtype=np.float64) / 200.0
+        history = np.tile(np.arange(700, dtype=np.float32), (2, 1))
+
+        aligned = decoder._select_aligned_primary_window(history, timestamps)
+
+        self.assertIsNotNone(aligned)
+        assert aligned is not None
+        window, window_timestamps = aligned
+        self.assertEqual(window.shape, (2, 400))
+        self.assertAlmostEqual(float(window_timestamps[0]), 100.5)
+        self.assertAlmostEqual(float(window_timestamps[-1]) + 1.0 / 200.0, 102.5)
+        np.testing.assert_array_equal(window[0], np.arange(200, 600, dtype=np.float32))
+
+    def test_primary_alignment_waits_until_target_eeg_has_arrived(self) -> None:
+        clock = _Clock(100.0)
+        source = CuedOnlineLabelSource(
+            ["left"],
+            scene_duration_sec=5.0,
+            start_delay_sec=0.0,
+            boundary_guard_sec=0.5,
+            clock=clock,
+        )
+        decoder = _bare_decoder(source, _GameOutlet())
+        decoder._acquirer = SimpleNamespace(
+            metadata=SimpleNamespace(timestamp_domain="monotonic")
+        )
+        decoder._primary_windows_per_scene = 1
+        decoder._scene_sent_scene_index = 0
+        decoder._scene_started_at = {0: 100.0}
+        self.assertEqual(source.prepare_scene(scene_index=0, start_lane=0), 0)
+        self.assertTrue(
+            source.confirm_scene_applied(
+                scene_index=0,
+                applied_label_id=0,
+                start_lane=0,
+                safe_lane=-1,
+                timestamp_monotonic=100.0,
+            )
+        )
+        timestamps = 99.5 + np.arange(560, dtype=np.float64) / 200.0
+        history = np.zeros((2, 560), dtype=np.float32)
+
+        self.assertIsNone(
+            decoder._select_aligned_primary_window(history, timestamps)
+        )
+
+    def test_explicit_multi_window_alignment_advances_to_next_slot(self) -> None:
+        clock = _Clock(100.0)
+        source = CuedOnlineLabelSource(
+            ["left"],
+            scene_duration_sec=5.0,
+            start_delay_sec=0.0,
+            boundary_guard_sec=0.5,
+            primary_windows_per_scene=2,
+            primary_window_spacing_sec=1.0,
+            clock=clock,
+        )
+        decoder = _bare_decoder(source, _GameOutlet())
+        decoder._acquirer = SimpleNamespace(
+            metadata=SimpleNamespace(timestamp_domain="monotonic")
+        )
+        decoder._scene_sent_scene_index = 0
+        decoder._scene_started_at = {0: 100.0}
+        decoder._primary_decision_window_bounds = {0: [(100.5, 102.5)]}
+        self.assertEqual(source.prepare_scene(scene_index=0, start_lane=0), 0)
+        self.assertTrue(
+            source.confirm_scene_applied(
+                scene_index=0,
+                applied_label_id=0,
+                start_lane=0,
+                safe_lane=-1,
+                timestamp_monotonic=100.0,
+            )
+        )
+        timestamps = 100.5 + np.arange(600, dtype=np.float64) / 200.0
+        history = np.tile(np.arange(600, dtype=np.float32), (2, 1))
+
+        aligned = decoder._select_aligned_primary_window(history, timestamps)
+
+        self.assertIsNotNone(aligned)
+        assert aligned is not None
+        _, window_timestamps = aligned
+        self.assertAlmostEqual(float(window_timestamps[0]), 101.5)
+        self.assertAlmostEqual(float(window_timestamps[-1]) + 1.0 / 200.0, 103.5)
+
+    def test_scene_ack_preserves_send_and_receive_timing(self) -> None:
+        class TimedOutlet(_GameOutlet):
+            def push_with_ack(self, command: str) -> dict[str, object]:
+                response = super().push_with_ack(command)
+                response["_sent_at_monotonic"] = 99.95
+                response["_received_at_monotonic"] = 100.0
+                response["_ack_round_trip_sec"] = 0.05
+                return response
+
+        decoder = _bare_decoder(
+            CuedOnlineLabelSource(
+                ["left"],
+                scene_duration_sec=5.0,
+                start_delay_sec=0.0,
+            ),
+            TimedOutlet(),
+        )
+
+        response = decoder._push_game_scene_transport_command("SCENE_LEFT")
+
+        self.assertIsNotNone(response)
+        self.assertAlmostEqual(decoder._last_game_transport_sent_at, 99.95)
+        assert response is not None
+        self.assertAlmostEqual(float(response["_received_at_monotonic"]), 100.0)
+        self.assertAlmostEqual(float(response["_ack_round_trip_sec"]), 0.05)
 
     def test_primary_control_averages_only_quality_accepted_windows(self) -> None:
         decoder = _bare_decoder(

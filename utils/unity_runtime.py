@@ -21,6 +21,7 @@ DEFAULT_BUILD_DIR = Path("unity相关") / "ARPrototype3D-windows-x64"
 DEFAULT_EXECUTABLE = DEFAULT_BUILD_DIR / "ARPrototype3D.exe"
 RUNTIME_MANIFEST_FILENAME = "oi-mi-runtime.json"
 REQUIRED_RUNTIME_PROTOCOL = "continuous-scene-v4-dynamic-label"
+DEFAULT_UNITY_WINDOW_TITLE = "AR Pong"
 REQUIRED_RUNTIME_FEATURES = frozenset(
     {
         "continuous_control",
@@ -376,9 +377,18 @@ def _enable_existing_window_resize(
         return
 
     executable = configured_unity_executable(config, project_root=project_root)
-    title = str(ar_game_cfg.get("window_title") or executable.stem)
-    if _make_windows_resizable(window_title=title):
-        _notify(console, f"Enabled resizing for Unity window: {title}")
+    configured_title = str(ar_game_cfg.get("window_title") or "").strip()
+    titles = [configured_title] if configured_title else [executable.stem]
+    # The packaged player uses its product name (currently "AR Pong") as the
+    # top-level window title, which is different from the executable stem.
+    if DEFAULT_UNITY_WINDOW_TITLE.casefold() not in {
+        title.casefold() for title in titles
+    }:
+        titles.append(DEFAULT_UNITY_WINDOW_TITLE)
+    for title in titles:
+        if _make_windows_resizable(window_title=title):
+            _notify(console, f"Enabled resizing for Unity window: {title}")
+            return
 
 
 def _enable_launched_window_resize(

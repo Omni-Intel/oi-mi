@@ -167,7 +167,7 @@ class CuedOnlineLabelSource(OnlineLabelSource):
         start_delay_sec: float = 5.0,
         boundary_guard_sec: float = 0.5,
         lane_transition_guard_sec: float = 0.0,
-        primary_windows_per_scene: int = 2,
+        primary_windows_per_scene: int = 1,
         primary_window_spacing_sec: float = 1.0,
         clock: Any = time.monotonic,
     ) -> None:
@@ -633,7 +633,7 @@ def build_cued_online_label_source(
             cue_config.get("lane_transition_guard_sec", 0.5)
         ),
         primary_windows_per_scene=int(
-            cue_config.get("primary_windows_per_scene", 2)
+            cue_config.get("primary_windows_per_scene", 1)
         ),
         primary_window_spacing_sec=float(
             cue_config.get("primary_window_spacing_sec", 1.0)

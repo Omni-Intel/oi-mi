@@ -127,11 +127,20 @@ class ArTcpCommandSender:
             try:
                 self._ensure_connected()
                 assert self._sock is not None
+                sent_at = time.monotonic()
                 self._sock.sendall(payload)
                 deadline = time.monotonic() + self._timeout_sec
                 while time.monotonic() < deadline:
                     response = self._drain_messages_locked(expected_ack=command)
                     if response is not None:
+                        received_at = float(
+                            response.get("_received_at_monotonic", time.monotonic())
+                        )
+                        response.setdefault("_sent_at_monotonic", sent_at)
+                        response.setdefault(
+                            "_ack_round_trip_sec",
+                            max(received_at - sent_at, 0.0),
+                        )
                         return response
                     chunk = self._sock.recv(4096)
                     if not chunk:

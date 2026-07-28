@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import pickle
+import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Callable
@@ -19,6 +21,31 @@ from models.custom_s4d import SimpleS4D
 from models.hybrid_net import HybridSpectralTemporalNet
 
 LOGGER = logging.getLogger(__name__)
+
+
+def atomic_torch_save(payload: object, path: Path) -> None:
+    """Write a torch checkpoint completely before promoting it into place."""
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with temporary.open("wb") as handle:
+            torch.save(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def enable_mc_dropout(module: nn.Module) -> None:
+    """Enable stochastic dropout without updating normalization statistics."""
+
+    module.eval()
+    for child in module.modules():
+        if isinstance(child, (nn.modules.dropout._DropoutNd, nn.MultiheadAttention)):
+            child.train()
 
 
 def split_train_validation_indices(
@@ -53,18 +80,30 @@ def split_train_validation_indices(
             for label in np.unique(group_labels)
         ]
         n_splits = min(5, min(groups_per_class, default=0))
-        if n_splits >= 2:
-            from sklearn.model_selection import StratifiedGroupKFold
+        if n_splits < 2:
+            counts = {
+                int(label): int(count)
+                for label, count in zip(
+                    np.unique(group_labels),
+                    groups_per_class,
+                    strict=True,
+                )
+            }
+            raise ValueError(
+                "Trial-group validation requires at least two independent "
+                f"groups per observed class; got {counts}."
+            )
+        from sklearn.model_selection import StratifiedGroupKFold
 
-            splitter = StratifiedGroupKFold(
-                n_splits=n_splits,
-                shuffle=True,
-                random_state=random_state,
-            )
-            train_indices, validation_indices = next(
-                splitter.split(indices, labels, groups=group_ids)
-            )
-            return train_indices, validation_indices
+        splitter = StratifiedGroupKFold(
+            n_splits=n_splits,
+            shuffle=True,
+            random_state=random_state,
+        )
+        train_indices, validation_indices = next(
+            splitter.split(indices, labels, groups=group_ids)
+        )
+        return train_indices, validation_indices
 
     from sklearn.model_selection import train_test_split
 
@@ -213,7 +252,10 @@ class TorchModelAdapter(BaseModelAdapter):
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_val_acc = val_acc
-                best_state = {key: value.detach().cpu() for key, value in self.model.state_dict().items()}
+                best_state = {
+                    key: value.detach().cpu().clone()
+                    for key, value in self.model.state_dict().items()
+                }
                 stagnant_epochs = 0
             else:
                 stagnant_epochs += 1
@@ -229,11 +271,11 @@ class TorchModelAdapter(BaseModelAdapter):
         inputs = torch.tensor(X, dtype=torch.float32, device=self._device)
         passes = max(mc_dropout_passes, 1)
         outputs: list[np.ndarray] = []
+        if passes > 1:
+            enable_mc_dropout(self.model)
+        else:
+            self.model.eval()
         for _ in range(passes):
-            if passes > 1:
-                self.model.train()
-            else:
-                self.model.eval()
             with torch.no_grad():
                 logits = self.model(inputs)
                 probabilities = torch.softmax(logits, dim=1).detach().cpu().numpy()
@@ -241,10 +283,12 @@ class TorchModelAdapter(BaseModelAdapter):
         return np.mean(np.stack(outputs, axis=0), axis=0)
 
     def save(self, path: Path) -> None:
-        torch.save(self.model.state_dict(), path)
+        atomic_torch_save(self.model.state_dict(), path)
 
     def load(self, path: Path) -> None:
-        state = torch.load(path, map_location=self._device)
+        state = torch.load(path, map_location=self._device, weights_only=True)
+        if isinstance(state, dict) and "model_state_dict" in state:
+            state = state["model_state_dict"]
         self.model.load_state_dict(state)
         self.model.to(self._device)
 

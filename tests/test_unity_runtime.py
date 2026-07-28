@@ -70,6 +70,38 @@ def test_existing_unity_window_matches_configured_executable_title(
     assert calls == [{"window_title": "MyDrivingGame"}]
 
 
+def test_existing_packaged_unity_window_falls_back_to_product_title(
+    monkeypatch, tmp_path
+) -> None:
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(unity_runtime.os, "name", "nt")
+
+    def make_resizable(**kwargs: object) -> bool:
+        calls.append(kwargs)
+        return kwargs.get("window_title") == "AR Pong"
+
+    monkeypatch.setattr(unity_runtime, "_make_windows_resizable", make_resizable)
+    config = {
+        "output": {
+            "ar_game": {
+                "executable_path": "build/ARPrototype3D.exe",
+                "resizable_window": True,
+            }
+        }
+    }
+
+    unity_runtime._enable_existing_window_resize(
+        config,
+        project_root=tmp_path,
+        console=None,
+    )
+
+    assert calls == [
+        {"window_title": "ARPrototype3D"},
+        {"window_title": "AR Pong"},
+    ]
+
+
 def test_runtime_manifest_round_trip_and_hash_validation(tmp_path) -> None:
     build_dir = tmp_path / "ARPrototype3D-windows-x64"
     managed_dir = build_dir / "ARPrototype3D_Data" / "Managed"

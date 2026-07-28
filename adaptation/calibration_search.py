@@ -20,7 +20,12 @@ from sklearn.metrics import (
     f1_score,
 )
 
-from adaptation.neuroonline import NeuroOnlineConfig, NeuroOnlineModelAdapter
+from adaptation.neuroonline import (
+    ClassCollapseError,
+    NEUROONLINE_TRAINING_MECHANICS_VERSION,
+    NeuroOnlineConfig,
+    NeuroOnlineModelAdapter,
+)
 from models.factory import TorchModelAdapter, split_train_validation_indices
 
 
@@ -32,7 +37,7 @@ class CalibrationSearchConfig:
     reuse_latest: bool = False
     mode: str = "full_grid"
     selection_epochs: int = 50
-    selection_patience: int = 8
+    selection_patience: int = 50
     learning_rates: tuple[float, ...] = (1e-5, 3e-5, 1e-4, 3e-4, 1e-3)
     batch_sizes: tuple[int, ...] = (16, 32, 128, 256)
     mask_ratios: tuple[float, ...] = (0.1, 0.3, 0.5, 0.7)
@@ -58,7 +63,7 @@ class CalibrationSearchConfig:
             reuse_latest=reuse_latest,
             mode=mode,
             selection_epochs=max(int(data.get("selection_epochs", 50)), 1),
-            selection_patience=max(int(data.get("selection_patience", 8)), 1),
+            selection_patience=max(int(data.get("selection_patience", 50)), 1),
             learning_rates=_positive_float_tuple(
                 data.get("learning_rates"),
                 defaults.learning_rates,
@@ -119,6 +124,13 @@ def load_latest_calibration_search(
             report = json.loads(report_path.read_text(encoding="utf-8"))
             if not isinstance(report, dict):
                 raise ValueError("report root is not an object")
+            report_version = int(report.get("training_mechanics_version", 0))
+            if report_version != NEUROONLINE_TRAINING_MECHANICS_VERSION:
+                raise ValueError(
+                    "training mechanics version "
+                    f"{report_version} is incompatible with current version "
+                    f"{NEUROONLINE_TRAINING_MECHANICS_VERSION}"
+                )
             parameters = _validated_selected_parameters(report.get("best_parameters"))
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             validation_errors.append(f"{report_path}: {exc}")
@@ -239,14 +251,29 @@ def run_calibration_search(
                 )
 
         candidate_started = time.perf_counter()
-        metrics = adapter.fit_with_split(
-            X,
-            labels,
-            train_indices=train_indices,
-            validation_indices=validation_indices,
-            groups=trial_groups,
-            progress_callback=epoch_progress,
-        )
+        try:
+            metrics = adapter.fit_with_split(
+                X,
+                labels,
+                train_indices=train_indices,
+                validation_indices=validation_indices,
+                groups=trial_groups,
+                progress_callback=epoch_progress,
+            )
+        except ClassCollapseError as exc:
+            candidates.append(
+                {
+                    "candidate_index": candidate_number,
+                    "stage": stage,
+                    "parameters": _selected_parameters(candidate_config),
+                    "metrics": _finite_mapping(exc.metrics),
+                    "duration_sec": time.perf_counter() - candidate_started,
+                    "rejected": "class_collapse",
+                }
+            )
+            del adapter
+            _release_unused_memory()
+            return
         record = {
             "candidate_index": candidate_number,
             "stage": stage,
@@ -306,15 +333,21 @@ def run_calibration_search(
         holdout_trial_truth,
         holdout_trial_probabilities.argmax(axis=1),
     )
+    holdout_collapsed = (
+        float(holdout_trial_metrics["worst_class_accuracy"]) <= 0.0
+    )
     final_config = replace(
         best_config,
         offline_epochs=base_config.offline_epochs,
         offline_patience=base_config.offline_patience,
     )
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "training_mechanics_version": NEUROONLINE_TRAINING_MECHANICS_VERSION,
         "selection_method": f"{search_config.mode}_trial_grouped_search",
         "ranking": [
+            "validation_trial_worst_class_accuracy",
+            "validation_window_worst_class_accuracy",
             "validation_trial_balanced_accuracy",
             "validation_trial_kappa",
             "validation_trial_macro_f1",
@@ -342,12 +375,27 @@ def run_calibration_search(
         "untouched_holdout_metrics": holdout_trial_metrics,
         "untouched_holdout_trial_metrics": holdout_trial_metrics,
         "untouched_holdout_window_metrics": holdout_window_metrics,
+        "deployment_eligible": not holdout_collapsed,
         "duration_sec": time.perf_counter() - started_at,
     }
+    if holdout_collapsed:
+        report["rejected"] = "untouched_holdout_class_collapse"
     report_path = None
     if session_dir is not None:
         report_path = session_dir / "hyperparameter_search.json"
         _write_json_atomic(report_path, report)
+    if holdout_collapsed:
+        del best_adapter
+        _release_unused_memory()
+        raise ClassCollapseError(
+            "The selected NeuroOnline hyperparameters collapse at least one "
+            "class on the untouched trial holdout.",
+            {
+                f"holdout_{name}": float(value)
+                for name, value in holdout_trial_metrics.items()
+                if isinstance(value, (int, float))
+            },
+        )
     del best_adapter
     _release_unused_memory()
     return CalibrationSearchResult(
@@ -376,6 +424,10 @@ def _classification_metrics(truth: np.ndarray, predictions: np.ndarray) -> dict[
         "kappa": kappa,
         "macro_f1": float(f1_score(truth, predictions, average="macro", zero_division=0)),
         "worst_class_accuracy": float(np.min(per_class)),
+        "per_class_recall": {
+            str(int(label)): float(per_class[index])
+            for index, label in enumerate(labels)
+        },
         "confusion_matrix": matrix.astype(int).tolist(),
         "labels": labels.astype(int).tolist(),
     }
@@ -383,6 +435,8 @@ def _classification_metrics(truth: np.ndarray, predictions: np.ndarray) -> dict[
 
 def _metric_rank(metrics: dict[str, float]) -> tuple[float, ...]:
     return (
+        float(metrics["val_trial_worst_class_accuracy"]),
+        float(metrics["val_worst_class_accuracy"]),
         float(metrics["val_trial_balanced_accuracy"]),
         float(metrics["val_trial_kappa"]),
         float(metrics["val_trial_macro_f1"]),
@@ -526,6 +580,7 @@ def _validate_disjoint_groups(
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
     with temporary.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
