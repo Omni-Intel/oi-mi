@@ -249,6 +249,7 @@ class CliHelperTests(unittest.TestCase):
         self.assertEqual(online["mask_ratio"], 0.1)
         self.assertEqual(online["consistency_weight"], 1.5)
         self.assertEqual(online["random_seed"], 2026)
+        self.assertEqual(online["offline_random_seed"], 42)
 
     def test_protocol_block_randomizer_respects_constraints(self) -> None:
         sequence = generate_block_sequence({"left": 8, "right": 8, "idle": 8}, rng=random.Random(17))

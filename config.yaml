@@ -132,7 +132,10 @@ online_adaptation:
     consistency_weight: 1.5
     label_smoothing: 0.1
     prompt_count: 32
+    # Online seed only controls stochastic masks and batch ordering during
+    # realtime updates. Offline calibration uses an independent fixed seed.
     random_seed: 2026
+    offline_random_seed: 42
     offline_epochs: 50
     offline_patience: 50
     offline_batch_size: 16

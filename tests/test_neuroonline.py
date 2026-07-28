@@ -441,7 +441,7 @@ class NeuroOnlineTests(unittest.TestCase):
                 }
             )
 
-    def test_checkpoint_restores_selected_model_coupled_parameters(self) -> None:
+    def test_checkpoint_restores_model_settings_without_overriding_online_seed(self) -> None:
         selected = NeuroOnlineConfig(
             enabled=True,
             prompt_count=4,
@@ -465,12 +465,21 @@ class NeuroOnlineTests(unittest.TestCase):
                     prompt_count=4,
                     mask_ratio=0.3,
                     consistency_weight=0.1,
+                    random_seed=42,
                 ),
                 state_path=model_path,
             )
             self.assertEqual(restored.config.mask_ratio, 0.5)
             self.assertEqual(restored.config.consistency_weight, 0.3)
-            self.assertEqual(restored.config.random_seed, 2026)
+            self.assertEqual(restored.config.random_seed, 42)
+
+    def test_offline_seed_is_independent_from_online_seed(self) -> None:
+        config = NeuroOnlineConfig.from_mapping(
+            {"neuroonline": {"random_seed": 2026, "offline_random_seed": 42}}
+        )
+
+        self.assertEqual(config.random_seed, 2026)
+        self.assertEqual(config.effective_offline_random_seed, 42)
 
     def test_train_from_records_restores_neuroonline_main_and_crm_weights(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

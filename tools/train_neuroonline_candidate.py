@@ -182,7 +182,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     base_config = replace(
         NeuroOnlineConfig.from_mapping(neuro_root),
         enabled=True,
-        random_seed=args.search_seed,
+        offline_random_seed=args.search_seed,
     )
     configured_search = CalibrationSearchConfig.from_mapping(neuro_root)
     search_config = replace(
@@ -285,7 +285,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 n_classes=n_classes,
                 sfreq=dataset_sfreq,
             ),
-            config=replace(search_result.best_config, random_seed=seed),
+            config=replace(search_result.best_config, offline_random_seed=seed),
         )
         started = time.perf_counter()
         try:

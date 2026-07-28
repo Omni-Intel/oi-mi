@@ -165,6 +165,7 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
             "label_smoothing": 0.1,
             "prompt_count": 32,
             "random_seed": 2026,
+            "offline_random_seed": 42,
             "offline_epochs": 50,
             "offline_patience": 50,
             "offline_batch_size": 16,
@@ -1104,8 +1105,11 @@ def calibrate(
     )
     experiment_seed = int(
         config.get("online_adaptation", {}).get("neuroonline", {}).get(
-            "random_seed",
-            config.get("online_adaptation", {}).get("random_seed", 42),
+            "offline_random_seed",
+            config.get("online_adaptation", {}).get("neuroonline", {}).get(
+                "random_seed",
+                config.get("online_adaptation", {}).get("random_seed", 42),
+            ),
         )
     )
     seed_experiment(experiment_seed)

@@ -235,7 +235,7 @@ python download_datasets.py --dataset BNCI2014_001 --subject 1 --data-dir ./data
 
 `config.yaml` 中将 `online_adaptation.strategy` 设为 `neuroonline` 后，实时解码采用严格的先预测、后更新流程。小车实验每个 Scene 只允许一个因果干净的主决策窗口进入在线训练，即 ACK 后的 `0.5–2.5 s`；该窗口完整位于当前 Scene、对应 Unity ACK 确认的初始指令，并且采集期间尚未放行本 Scene 的横向控制。窗口完成后立即放行横向控制；窗口不合格时保持 STOP。首次及后续更新都在累计新增 64 个唯一主决策窗口时触发，回放池从 64 个样本逐步增长到 320 个样本，之后始终使用最近 320 个主决策窗口。每个训练样本在进入缓冲区时生成固定的逐通道、逐采样点时间掩码和逐通道、逐频点频率掩码视图，更新目标为三个视图的分类损失加两项表示一致性损失，并联合更新 backbone、CRM 和分类头。
 
-该模式仅支持 PyTorch 模型，不支持 `riemann-mdm`。CRM 以恒等门控初始化；更新后的 backbone 保存到原模型文件，CRM 状态保存到同目录的 `<model>.neuroonline.pt` sidecar 文件。离线与在线的 mask ratio 和一致性权重分别配置，避免离线搜索结果意外覆盖在线更新。当前在线配置 `1e-4 / 3 epochs / batch 8 / mask 0.1 / lambda 1.5 / seed 2026` 由 2026-07-27 实时记录按每 Scene 一个窗口的因果重放选出或固定，`64/64/320` 分别表示首次阈值、更新步长和最近样本上限；整组参数应在后续会话评估前冻结。将策略改回 `periodic_head` 可继续使用原有的十分钟候选分类头更新流程。
+该模式仅支持 PyTorch 模型，不支持 `riemann-mdm`。CRM 以恒等门控初始化；更新后的 backbone 保存到原模型文件，CRM 状态保存到同目录的 `<model>.neuroonline.pt` sidecar 文件。离线与在线的 mask ratio、一致性权重及随机种子分别配置，避免离线搜索结果意外覆盖在线更新。当前在线配置 `1e-4 / 3 epochs / batch 8 / mask 0.1 / lambda 1.5 / seed 2026` 由 2026-07-27 实时记录按每 Scene 一个窗口的因果重放选出或固定，`64/64/320` 分别表示首次阈值、更新步长和最近样本上限；在线 seed 只用于复现随机 mask 与 batch 排列，并非性能参数。离线校准独立使用 `offline_random_seed: 42`。整组参数应在后续会话评估前冻结。将策略改回 `periodic_head` 可继续使用原有的十分钟候选分类头更新流程。
 
 实时解码页面配套显示 NeuroOnline 遥测：累计 Scene、累计主决策窗口、距离下一次 64 窗口触发的进度、缓冲区类别覆盖、重复/过期窗口拒绝数、原始 argmax prequential accuracy/fixed-three-class balanced accuracy、实际控制覆盖率、选择性准确率、逐类准确率、累计混淆矩阵，以及每次更新的总损失、分类损失、一致性损失、CRM gate 和耗时曲线。所有在线性能只使用“先预测、后更新”时产生的预测，不会用更新后的模型回算历史样本。三类尚未全部出现时，未出现类别召回率固定按 0 计，避免早期 balanced accuracy 虚高。
 

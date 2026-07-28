@@ -69,6 +69,15 @@ class NeuroOnlineConfig:
     # the online values as a backward-compatible fallback.
     offline_mask_ratio: float | None = None
     offline_consistency_weight: float | None = None
+    offline_random_seed: int | None = None
+
+    @property
+    def effective_offline_random_seed(self) -> int:
+        return (
+            self.random_seed
+            if self.offline_random_seed is None
+            else self.offline_random_seed
+        )
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any] | None) -> "NeuroOnlineConfig":
@@ -102,6 +111,11 @@ class NeuroOnlineConfig:
             offline_consistency_weight=(
                 max(float(data["offline_consistency_weight"]), 0.0)
                 if data.get("offline_consistency_weight") is not None
+                else None
+            ),
+            offline_random_seed=(
+                int(data["offline_random_seed"])
+                if data.get("offline_random_seed") is not None
                 else None
             ),
         )
@@ -313,7 +327,7 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         train_indices, validation_indices = split_train_validation_indices(
             y,
             groups=groups,
-            random_state=self.config.random_seed,
+            random_state=self.config.effective_offline_random_seed,
         )
         return self.fit_with_split(
             X,
@@ -354,12 +368,13 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         if trial_groups is not None and trial_groups.shape != np.asarray(y).shape:
             raise ValueError("NeuroOnline trial groups must match the labels shape.")
 
-        random.seed(self.config.random_seed)
-        np.random.seed(self.config.random_seed)
-        torch.manual_seed(self.config.random_seed)
+        offline_seed = self.config.effective_offline_random_seed
+        random.seed(offline_seed)
+        np.random.seed(offline_seed)
+        torch.manual_seed(offline_seed)
         if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(self.config.random_seed)
-        generator = torch.Generator().manual_seed(self.config.random_seed)
+            torch.cuda.manual_seed_all(offline_seed)
+        generator = torch.Generator().manual_seed(offline_seed)
         all_inputs = torch.as_tensor(X, dtype=torch.float32)
         offline_mask_ratio = (
             self.config.mask_ratio
@@ -1268,7 +1283,6 @@ def _checkpoint_config(
             "weight_decay",
             "label_smoothing",
             "prompt_count",
-            "random_seed",
         )
         if field_name in saved
     }

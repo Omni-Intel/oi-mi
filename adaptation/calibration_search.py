@@ -163,16 +163,17 @@ def run_calibration_search(
         raise ValueError("Calibration search groups must match the labels shape.")
     _validate_trial_groups(labels, trial_groups)
 
+    offline_seed = base_config.effective_offline_random_seed
     all_indices = np.arange(labels.size, dtype=np.int64)
     development_indices, holdout_indices = split_train_validation_indices(
         labels,
         groups=trial_groups,
-        random_state=base_config.random_seed,
+        random_state=offline_seed,
     )
     inner_train_relative, inner_validation_relative = split_train_validation_indices(
         labels[development_indices],
         groups=trial_groups[development_indices],
-        random_state=base_config.random_seed + 1,
+        random_state=offline_seed + 1,
     )
     train_indices = development_indices[inner_train_relative]
     validation_indices = development_indices[inner_validation_relative]
@@ -364,7 +365,7 @@ def run_calibration_search(
             "validation_window_balanced_accuracy",
             "negative_validation_loss",
         ],
-        "random_seed": base_config.random_seed,
+        "random_seed": offline_seed,
         "split": {
             "all_windows": int(all_indices.size),
             "all_trials": int(np.unique(trial_groups).size),
