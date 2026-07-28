@@ -128,11 +128,11 @@ online_adaptation:
     history_threshold: 64
     recent_samples: 320
     weight_decay: 5.0e-2
-    mask_ratio: 0.7
-    consistency_weight: 0.1
+    mask_ratio: 0.1
+    consistency_weight: 1.5
     label_smoothing: 0.1
     prompt_count: 32
-    random_seed: 42
+    random_seed: 2026
     offline_epochs: 50
     offline_patience: 50
     offline_batch_size: 16
