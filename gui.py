@@ -43,7 +43,6 @@ from utils.online_labels import (
     SimulatedOnlineLabelSource,
     build_cued_online_label_source,
 )
-from utils.reproducibility import seed_experiment
 from web_command_server import start_web_command_server
 
 _GUI_ROOT = Path(__file__).resolve().parent
@@ -1377,25 +1376,10 @@ def run_calibration_session(
             device_name=str(config["device_type"]),
             config=config,
         )
-        effective_n_channels = int(acquirer.metadata.n_channels)
         if console is None:
             console, refresh = init_live_view(fullscreen=True)
         else:
             refresh = lambda: None
-        experiment_seed = int(
-            config.get("online_adaptation", {}).get("neuroonline", {}).get(
-                "random_seed",
-                config.get("online_adaptation", {}).get("random_seed", 42),
-            )
-        )
-        seed_experiment(experiment_seed)
-        model = ModelFactory.get(
-            model_name,
-            n_chans=effective_n_channels,
-            sfreq=float(config["sfreq"]),
-            n_classes=int(config["n_classes"]),
-            n_times=int(float(config["sfreq"]) * float(config["window_sec"])),
-        )
         model_path = build_model_path(
             config,
             subject_id,
@@ -1404,7 +1388,7 @@ def run_calibration_session(
         )
         calibrator = Calibrator(
             acquirer=acquirer,
-            model=model,
+            model=None,
             marker_backend=build_marker_backend(config),
             console=console,
             sfreq=float(config["sfreq"]),

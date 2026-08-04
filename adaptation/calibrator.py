@@ -202,7 +202,7 @@ class Calibrator:
     def __init__(
         self,
         acquirer: AbstractAcquirer,
-        model: BaseModelAdapter,
+        model: BaseModelAdapter | None,
         marker_backend: MarkerBackend,
         console: Console,
         *,
@@ -220,7 +220,9 @@ class Calibrator:
         self._calibration_search_config = CalibrationSearchConfig.from_mapping(
             online_adaptation_config
         )
-        if self._neuroonline_config.enabled:
+        if model is None:
+            self._model = None
+        elif self._neuroonline_config.enabled:
             if not isinstance(model, TorchModelAdapter):
                 raise ValueError("NeuroOnline calibration requires a PyTorch decoder model.")
             self._model = NeuroOnlineModelAdapter(
@@ -309,6 +311,11 @@ class Calibrator:
                 ),
                 session_dir=session_dir,
                 training_performed=False,
+            )
+        if self._model is None:
+            raise RuntimeError(
+                "Calibration training requires a decoder model; collection-only "
+                "runs may omit it."
             )
         reused_search_report: dict[str, Any] | None = None
         reuse_search_error: str | None = None

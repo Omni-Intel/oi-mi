@@ -154,18 +154,24 @@ def test_operator_pause_drains_recording_and_emits_paired_events() -> None:
 
 def test_collection_only_saves_session_without_training_model(tmp_path: Path) -> None:
     protocol = ProtocolConfig.from_config({"protocol": {}})
-    calibrator = Calibrator.__new__(Calibrator)
-    calibrator._protocol = protocol
     messages: list[str] = []
-    calibrator._console = SimpleNamespace(print=lambda message: messages.append(message))
-    calibrator._model = SimpleNamespace(
-        fit=lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("collection-only mode must not train")
+    calibrator = Calibrator(
+        acquirer=SimpleNamespace(
+            metadata=SimpleNamespace(n_channels=3),
+            source_sfreq=250.0,
         ),
-        save=lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("collection-only mode must not save a model")
-        ),
+        model=None,
+        marker_backend=SimpleNamespace(),
+        console=SimpleNamespace(print=lambda message: messages.append(message)),
+        sfreq=200.0,
+        window_sec=2.0,
+        step_sec=0.5,
+        model_path=tmp_path / "unused.pt",
+        calibration_records_dir=tmp_path,
+        protocol_config=protocol,
+        online_adaptation_config={"enabled": True, "strategy": "neuroonline"},
     )
+    assert calibrator._model is None
     session_metadata: dict = {}
     processed = np.empty((12, 3, 400), dtype=np.float32)
     calibrator._collect_training_data = lambda **kwargs: (
