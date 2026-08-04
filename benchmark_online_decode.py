@@ -78,13 +78,12 @@ def evaluate_predictions(y_true: np.ndarray, probabilities: np.ndarray, *, thres
 @click.command()
 @click.option("--calibration", "calibration_path", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
 @click.option("--test-chunk", "test_chunk_path", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
-@click.option("--model", "model_name", type=str, default="eegnet", show_default=True)
+@click.option("--model", "model_name", type=str, default="cbramod", show_default=True)
 @click.option("--sfreq", type=float, default=200.0, show_default=True)
 @click.option("--threshold", type=float, default=0.5, show_default=True)
 @click.option("--epochs", type=int, default=35, show_default=True)
 @click.option("--batch-size", type=int, default=32, show_default=True)
 @click.option("--learning-rate", type=float, default=1e-3, show_default=True)
-@click.option("--patience", type=int, default=12, show_default=True)
 @click.option("--mc-dropout-passes", type=int, default=8, show_default=True)
 @click.option("--smooth", "smooth_sizes", type=int, multiple=True, default=(1, 3, 5))
 @click.option("--hmm-stay", type=float, default=None, help="Optional Viterbi self-transition probability.")
@@ -98,7 +97,6 @@ def main(
     epochs: int,
     batch_size: int,
     learning_rate: float,
-    patience: int,
     mc_dropout_passes: int,
     smooth_sizes: tuple[int, ...],
     hmm_stay: float | None,
@@ -123,7 +121,6 @@ def main(
         epochs=epochs,
         batch_size=batch_size,
         learning_rate=learning_rate,
-        patience=patience,
         head_only=False,
     )
     probabilities = model.predict_proba(X_test, mc_dropout_passes=mc_dropout_passes)

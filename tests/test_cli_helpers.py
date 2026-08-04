@@ -236,6 +236,8 @@ class CliHelperTests(unittest.TestCase):
     def test_default_config_matches_project_config_file(self) -> None:
         project_config = yaml.safe_load((Path(__file__).resolve().parents[1] / "config.yaml").read_text(encoding="utf-8"))
         self.assertEqual(default_config(), project_config)
+        self.assertEqual(project_config["model_name"], "cbramod")
+        self.assertIn("oi-car-unity-src", project_config["output"]["ar_game"]["executable_path"])
         self.assertEqual(
             project_config["online_adaptation"]["cued_labels"][
                 "lane_transition_guard_sec"
@@ -263,18 +265,7 @@ class CliHelperTests(unittest.TestCase):
             self.assertFalse(sequence[idx] == sequence[idx - 1] == sequence[idx - 2])
 
     def test_model_registry_names(self) -> None:
-        self.assertEqual(
-            ModelFactory.list_models(),
-            [
-                "conformer-lite",
-                "deepconvnet",
-                "eegnet",
-                "hybrid-net",
-                "riemann-mdm",
-                "s4d",
-                "shallowconvnet",
-            ],
-        )
+        self.assertEqual(ModelFactory.list_models(), ["cbramod"])
 
     def test_default_acquirer_does_not_support_impedance_check(self) -> None:
         from acquisition.base import AbstractAcquirer
@@ -346,6 +337,9 @@ class CliHelperTests(unittest.TestCase):
         self.assertEqual(acquirer.metadata.n_channels, 59)
         self.assertEqual(acquirer.metadata.sfreq, 200)
         self.assertEqual(acquirer.source_sfreq, 250)
+        self.assertEqual(len(acquirer.metadata.channel_names), 59)
+        self.assertEqual(acquirer.metadata.channel_names[0], "Fpz")
+        self.assertEqual(acquirer.metadata.channel_names[-1], "O2")
 
     def test_build_acquirer_uses_dummy_when_hardware_dummy_mode_enabled(self) -> None:
         config = {
@@ -620,9 +614,10 @@ class CliHelperTests(unittest.TestCase):
                 self.commands.append(command)
                 return {
                     "ack": command,
-                    "protocol_version": "continuous-scene-v4-dynamic-label",
+                    "protocol_version": "continuous-scene-v5-centered-single-decision",
                     "scene_number": 1,
                     "current_lane": 0,
+                    "next_scene_start_lane": 0,
                 }
 
         fake_outlet = FakeOutlet()
@@ -1040,14 +1035,27 @@ class CliHelperTests(unittest.TestCase):
 
             with (
                 mock.patch(
-                    "adaptation.calibrator.preprocess_eeg_window",
-                    lambda data, sfreq: SimpleNamespace(
+                    "adaptation.calibrator.preprocess_eeg_continuous",
+                    lambda data, source_sfreq, target_sfreq: SimpleNamespace(
+                        raw_data=data.astype(np.float32),
                         data=data.astype(np.float32) + 10.0,
+                        bad_channel_indices=(),
+                        source_nonfinite_mask=np.zeros_like(data, dtype=bool),
+                        source_sfreq=float(source_sfreq),
+                        target_sfreq=float(target_sfreq),
+                    ),
+                ),
+                mock.patch(
+                    "adaptation.calibrator.finalize_preprocessed_window",
+                    lambda data, **kwargs: SimpleNamespace(
+                        data=data.astype(np.float32),
                         quality=SimpleNamespace(
                             accepted=True,
                             peak_abs_uv=1.0,
                             clip_fraction=0.0,
                             bad_channel_fraction=0.0,
+                            bad_channel_indices=(),
+                            reasons=(),
                         ),
                     ),
                 ),
@@ -1057,7 +1065,6 @@ class CliHelperTests(unittest.TestCase):
                     epochs=1,
                     batch_size=1,
                     learning_rate=0.001,
-                    patience=1,
                     head_only=False,
                 )
 

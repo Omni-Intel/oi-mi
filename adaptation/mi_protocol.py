@@ -63,6 +63,8 @@ class ProtocolConfig:
     calibration_trials_per_class_per_block: int
     rest_between_blocks_sec: float
     random_seed: int
+    continuous_collection: bool
+    minimum_calibration_trials: int
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> ProtocolConfig:
@@ -81,6 +83,16 @@ class ProtocolConfig:
             baseline_segments = [
                 BaselineSegment("eyes_open_fixation", 60.0, "睁眼注视中央十字，保持放松。"),
             ]
+        calibration_blocks = int(protocol.get("calibration_blocks", 4))
+        calibration_trials_per_class_per_block = int(
+            protocol.get("calibration_trials_per_class_per_block", 5)
+        )
+        minimum_calibration_trials = int(
+            protocol.get(
+                "minimum_calibration_trials",
+                calibration_blocks * calibration_trials_per_class_per_block * 3,
+            )
+        )
         return cls(
             window_sec=float(config.get("window_sec", protocol.get("window_sec", 2.0))),
             stride_sec=float(config.get("step_sec", protocol.get("stride_sec", 0.5))),
@@ -101,12 +113,12 @@ class ProtocolConfig:
             practice_labels=[str(label) for label in protocol.get("practice_labels", ["left", "right", "idle", "left", "right", "idle"])],
             practice_repetitions=int(protocol.get("practice_repetitions", 1)),
             baseline_segments=baseline_segments,
-            calibration_blocks=int(protocol.get("calibration_blocks", 4)),
-            calibration_trials_per_class_per_block=int(
-                protocol.get("calibration_trials_per_class_per_block", 5)
-            ),
+            calibration_blocks=calibration_blocks,
+            calibration_trials_per_class_per_block=calibration_trials_per_class_per_block,
             rest_between_blocks_sec=float(protocol.get("rest_between_blocks_sec", 20.0)),
             random_seed=int(protocol.get("random_seed", 17)),
+            continuous_collection=bool(protocol.get("continuous_collection", False)),
+            minimum_calibration_trials=max(minimum_calibration_trials, 3),
         )
 
 

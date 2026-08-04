@@ -19,10 +19,10 @@ winget install --id Python.Python.3.12 --exact --source winget --scope user
 
 安装完成后关闭并重新打开终端，再运行上面的命令。不要在 PowerShell/CMD 中运行 `source`；也不要直接运行全局的 `streamlit run gui.py`，否则容易调用到缺少 `yaml`、PyTorch 等依赖的系统 Python。直接使用 `.venv\Scripts\python.exe` 不需要激活虚拟环境。
 
-仓库已经包含经过协议校验的 Unity Windows 运行包。`setup_local.py` 会创建 `.venv`、安装项目及 PyYAML 等全部依赖，并校验随仓库提供的运行包；正常情况下不会再次下载：
+独立小车 Windows 运行包位于独立 Unity 工程。`setup_local.py` 只创建项目 `.venv`、安装 Python 依赖并下载 CBraMod 官方权重，不再下载或安装完整版 Unity：
 
 ```text
-unity相关/ARPrototype3D-windows-x64/ARPrototype3D.exe
+../oi-car-unity-src/Car_game/Builds/Windows/ARPrototype3D.exe
 ```
 
 ### 采集电脑强制更新（解决 `config.yaml` 冲突）
@@ -43,7 +43,7 @@ git reset --hard origin/main
 
 如果采集电脑的仓库不在 `D:\oi-mi`，只需要把第一行 `cd` 改成实际项目路径。
 
-现场电脑只运行仓库内的这个打包结果，不调用其他 Unity 源码仓库，也不需要安装 Unity Editor。运行包必须包含 `oi-mi-runtime.json`；启动前会校验协议版本、必要功能和关键文件 SHA-256，旧版或混装的 Unity 会直接报错，不会继续产生不可信标签。`tools/download_unity_build.py --force` 仅作为运行包损坏时的备用恢复方式，日常更新直接同步 Git 仓库即可。
+现场电脑只运行独立小车工程 `../oi-car-unity-src/Car_game/Builds/Windows/ARPrototype3D.exe`，不调用完整版 Unity 的源码、DLL 或构建脚本。运行包必须包含由独立工程构建命令自动生成的 `oi-mi-runtime.json`；启动前会校验协议版本、必要功能和关键文件 SHA-256，旧版或混装的 Unity 会直接报错，不会继续产生不可信标签。
 
 点击网页左侧的“实时解码”或启动 dummy 测试时，如果 Unity 没有打开，程序会自动以窗口模式启动这个 exe。TCP 端口打开只表示 Game Hub 已启动，程序还会发送 `OPEN_3D_GAME`，随后重复执行无副作用的 `SCENE_STATE` 就绪握手；只有收到正确协议版本、有效 Scene 编号和实际车道后，才启动 EEG 流与 Scene 计时。小车场景最长等待 15 秒，普通 Unity ACK 的单次超时为 3 秒。Windows 实验包会自动启用唯一支持的 Fixed Speed 控制模式，不依赖固定加载时长。实时解码运行期间关闭 Unity 窗口会让小车 TCP 连接断开，网页端实时解码也会停止。
 
@@ -51,13 +51,13 @@ git reset --hard origin/main
 
 ### 新设备第一次正式实验
 
-1. 在“设置”页确认被试 ID、`shallowconvnet`、真实设备类型和设备地址，然后保存。
+1. 在“设置”页确认被试 ID、`cbramod`、真实设备类型和设备地址，然后保存。
 2. 在“连通检测”页确认 EEG 数据可读取；需要时再做“阻抗检查”。
 3. 进入“校准”并点击“正式实验”；每次实验都会从头校准，不复用旧模型。
 4. 若该被试已经完成过参数搜索，程序会在采集开始前读取最近一次
    `records_storage/<被试>/calibration/<时间>/hyperparameter_search.json`，
    跳过搜索并用其中的最佳参数训练全新的正式模型。等待页面明确显示模型保存路径。
-5. 模型和 CRM 应分别出现在 `models_storage/<被试>/<设备>/shallowconvnet.pt` 与 `shallowconvnet.pt.neuroonline.pt`。
+5. 模型和 CRM 应分别出现在 `models_storage/<被试>/<设备>/cbramod.pt` 与 `cbramod.pt.neuroonline.pt`。
 6. 先进入“测试模式”验证模型和小车链路，再进入“实时解码”开始连续 NeuroOnline 实验。
 
 真实实验前应确认 [config.yaml](./config.yaml) 中：
@@ -167,19 +167,27 @@ python3.12 setup_local.py
 统一从头校准：
 
 ```bash
-oi-mi calibrate --subject S001 --model shallowconvnet
+oi-mi calibrate --subject S001 --model cbramod
 ```
 
-默认正式采集严格为约 12 分钟，不含可选教程、练习和后续训练时间：
+GUI 默认采用持续校准。前 60 个正式 trial 约需 12 分钟（不含可选教程、练习和后续训练时间），这是允许人工结束的下限，不是固定终点：
 
 - 60 秒睁眼 baseline
-- 4 个 block，每个 block 包含 `LEFT/RIGHT/IDLE` 各 5 个 trial，共 60 trial
+- 前 4 个 block 每个包含 `LEFT/RIGHT/IDLE` 各 5 个 trial，共 60 trial
 - 每 trial 为 `2s fixation + 1s cue + 5s control + 2s ITI`
 - 3 次 block 间休息，每次 20 秒
 
-每个 trial 通常产生 5 个 2 秒窗口，因此质量筛选前共有 300 个窗口、每类
-100 个。训练/验证按 `trial_ids` 分组，同一 trial 的重叠窗口不会跨集合。后续
-离线训练时间不计入这 12 分钟。启用 `neuroonline.calibration_search` 后，程序先固定
+达到 60 trial 后，工作人员可以结束并保存，也可以继续追加每类各 5 个 trial 的
+平衡 block。暂停请求会在当前完整 trial 结束后生效；暂停期间 EEG 连接和连续原始记录
+保持运行，但不会产生 cue/control 事件或训练窗口。结束请求只在三类累计数量相等的 trial
+边界生效，避免额外采集破坏类别平衡。GUI 页面刷新或短暂断线后会重新连接仍在运行的后台
+校准任务。GUI 持续校准以采集为主，结束后保存原始 EEG、事件、元数据及质量筛选后的
+训练窗口，不自动执行模型训练；需要模型时可再用 `train-from-records` 离线训练。命令行
+`calibrate` 没有交互控制，仍执行配置中的固定 block 计划并训练模型。
+
+前 60 个 trial 通常产生 300 个 2 秒窗口、每类 100 个（每 trial 5 个，质量筛选前）；
+继续采集时按相同比例增加。训练/验证按 `trial_ids` 分组，同一 trial 的重叠窗口不会跨集合。
+后续离线训练时间不计入上述采集时间。启用 `neuroonline.calibration_search` 后，程序先固定
 完整 trial 的训练集、选择验证集和独立检验集：同一 trial 的重叠窗口绝不会跨集合。
 搜索同时比较 5 个离线学习率、4 个 batch size、4 个 mask ratio 与 6 个一致性
 损失权重，完整笛卡尔网格共评估 480 个候选。每个候选最多训练 50 epoch，验证排名
@@ -243,7 +251,7 @@ python download_datasets.py --dataset BNCI2014_001 --subject 1 --data-dir ./data
 
 ### 论文级实验记录
 
-正式 NeuroOnline 运行强制开启记录。GUI 必须勾选“保存实时脑波数据至本地记录”，CLI 会自动开启；真实 Neuracle 模式还必须填写 `storage.native_recording_id`，其值应与博瑞康采集软件保存的 BDF/NDF 文件名或会话编号一致。项目窗口记录不能替代放大器原生连续文件，归档时两者必须一起保存。
+正式 NeuroOnline 运行强制开启项目侧实时记录：GUI 必须勾选“保存实时脑波数据至本地记录”，CLI 会自动开启。
 
 一次实时运行形成以下不可变实验包：
 
@@ -275,12 +283,14 @@ python download_datasets.py --dataset BNCI2014_001 --subject 1 --data-dir ./data
 
 主决策窗的 `instruction_label` 是唯一进入 NeuroOnline 的训练真值。后续窗口仍按小车当前位置到固定安全车道计算 `vehicle_required_action`，并完整落盘用于连续行为分析，但不再因成功者快速转成大量 IDLE、失败者持续产生 LEFT/RIGHT 而污染主训练缓冲区。后续动态窗仍执行 ACK/边界/换道保护校验；以 `LANE_SETTLED` 为中心前后各 0.5 秒的窗口不计动态真值。TCP 消息在接收解析时即记录单调时钟，重复事件 ID、非递增 EEG 窗口终点和重复源窗口都会被拒绝并写入日志。
 
-Neuracle/JellyFish 原始数据以 `250 Hz` 转发。校准连续数据保留 250 Hz 源时间轴，切出完整源窗口后做带抗混叠滤波的 `250→200 Hz` 降采样；实时解码同样先取得 500 点的 2 秒源窗口，再降为模型使用的 400 点。后续预处理、模型输入和 NeuroOnline 更新统一使用 `200 Hz`。实时窗口不再把 `get_chunk()` 返回时刻当作脑电终点，而是利用 JellyFish 数据包的源时间戳，将样本时间映射到 Python 的单调时钟后再与 Unity Scene 对齐。`device.neuracle_transport_delay_sec` 用于补偿经 Trigger/回环实验测得的固定采集链路延迟；未测量前保持 `0.0`，系统仍会利用源时间戳消除排队和轮询抖动。
+Neuracle/JellyFish 原始数据以 `250 Hz` 转发。校准对完整连续记录做坏导修复、CAR、带抗混叠的 `250→200 Hz` 降采样和带通后，再切出 400 点模型窗；实时解码对采集器保留的连续源历史执行同一变换，再截取最新或与 Unity 精确对齐的 2 秒窗。这样重叠窗口共享相同的连续处理样本，不再分别对每个 500 点源窗滤波。模型输入和 NeuroOnline 更新统一使用 `200 Hz`。实时窗口不再把 `get_chunk()` 返回时刻当作脑电终点，而是利用 JellyFish 数据包的源时间戳，将样本时间映射到 Python 的单调时钟后再与 Unity Scene 对齐。`device.neuracle_transport_delay_sec` 是可选的固定采集链路延迟补偿；没有独立测量条件时保持 `0.0`，系统仍会利用源时间戳消除排队和轮询抖动。
 
-模型输入预处理参考 CBraMod 的运动想象数据管线，统一采用微伏输入、逐通道中位数去直流、坏导稳健修复、Common Average Reference、`0.3-40 Hz` 五阶 Butterworth SOS 零相位滤波和 `[-150, 150] uV` 数值保护。逐通道去直流用于避免 Neuracle 电极基线偏置在短窗高通时形成边界瞬态；它只减去一个常数，不做逐窗 z-score，也不会归一化运动想象的幅值变化。校准、离线重建和实时解码调用同一个实现。非有限值、坏导比例过高、峰值超过 `300 uV` 或超幅占比超过 1% 的窗口不会进入校准训练或 NeuroOnline 更新，但实时控制仍会产生预测，并在记录文件中保存质量标志。
+Neuracle 的 59 通道并非 CBraMod 限制。2026-07-25 与 2026-07-27 原生 BDF 均证明设备记录 64 路：前 59 路为 `Fpz` 至 `O2` 的头皮 EEG，后 5 路为 `ECG/HEOR/HEOL/VEOU/VEOL`。正式配置显式列出这 59 个 EEG 名称；连接 JellyFish 后按名称选择并恢复固定顺序，而不是假设前 59 路不变。缺导、重名或非 EEG 类型会中止启动。校准 metadata 和实时 manifest 保存源通道、选择索引及排除通道，使每次实验的 montage 可追溯。
 
-200 Hz、2秒窗口对应模型输入长度为400点。旧的250 Hz/500点模型权重和 CRM sidecar
-不能继续使用；切换采样率后必须重新完成正式校准。
+模型输入预处理参考 CBraMod 的运动想象数据管线，统一采用微伏输入、连续段逐通道中位数去直流、坏导稳健修复、Common Average Reference、`0.3-40 Hz` 五阶 Butterworth SOS 零相位滤波和 `[-150, 150] uV` 数值保护。连续变换完成后才切窗并执行逐窗质量判定与裁剪；这里不做逐窗 z-score，也不会归一化运动想象的幅值变化。校准、离线重建和实时解码调用同一个实现。非有限值、坏导比例过高、峰值超过 `300 uV` 或超幅占比超过 1% 的窗口不会进入校准训练或 NeuroOnline 更新，但实时控制仍会产生预测，并在记录文件中保存质量标志。
+
+200 Hz、2秒窗口对应模型输入长度为400点，并在 CBraMod 内切为两个200点 patch。
+旧的 ShallowConvNet 权重和 CRM sidecar 不能继续使用；切换模型后必须重新完成正式校准。
 
 连续模式没有“大轮完成”或固定 trial 停止点，GUI 显示累计 Scene、相对动作真值、起始车道→空车道和 Unity 同步状态。每个 Scene 最多提交一个合格主决策窗，因此 NeuroOnline 的样本计数也是 Scene 级：累计 64 个样本后开始更新，之后每新增 64 个样本再次更新；回放池从 64 个样本增长到 320 个样本，达到上限后使用最近 320 个样本。`balance_pool_per_class: 32` 用于生成可复现的类别平衡候选池；若候选动作在边界车道不可执行，会保留到后续可执行 Scene，而不会伪造标签。运行持续到操作员切换页面、关闭 Unity 或停止 GUI。真实设备实验必须保持 `online_adaptation.simulation.enabled: false`。
 
@@ -302,7 +312,7 @@ Neuracle/JellyFish 原始数据以 `250 Hz` 转发。校准连续数据保留 25
 补充说明：
 
 - 测试模式与实时模式的 `chunk_*.npz` 由后台 `StreamWriter` 异步分块写盘，避免阻塞解码循环。
-- 在线推理会做 `preprocess_eeg_window`，但落盘的 `window` 为采集器返回的原始窗（仅转为 `float32`）。
+- 在线推理先调用 `preprocess_eeg_continuous` 处理保留的连续历史，再切 2 秒窗；落盘的 `window` 是同一连续段重采样后的未带通窗，模型使用的是带通和质量裁剪后的窗口。
 - 实时 chunk 额外保存 `quality_accepted`、`quality_peak_abs_uv`、`quality_clip_fraction` 和 `quality_bad_channel_fraction`；质量不合格的窗不参与在线更新。
 
 默认配置：
@@ -324,7 +334,7 @@ Neuracle/JellyFish 原始数据以 `250 Hz` 转发。校准连续数据保留 25
 
 - JellyFish 数据转发端口与 `config.yaml` 一致
 - BrainCo SDK 已安装，且设备可通过 mDNS 自动发现，或已手工填写 `brainco_addr` / `brainco_port`
-- BrainCo 硬件固定以 250 Hz 采集；实时窗口在进入预处理前统一抗混叠降采样到 200 Hz
+- BrainCo 硬件固定以 250 Hz 采集；实时连续缓存统一预处理并降采样到 200 Hz 后再切模型窗
 - 若启用 trigger box，`trigger_serial_port` 配置正确
 
 ### `collect` 目录现在是做什么的
@@ -350,19 +360,19 @@ oi-mi probe-device --device neuracle --duration 5
 统一从头校准（有 cue）：
 
 ```bash
-oi-mi calibrate --subject S001 --model shallowconvnet
+oi-mi calibrate --subject S001 --model cbramod
 ```
 
 使用已保存的 calibration 数据重训：
 
 ```bash
-oi-mi train-from-records --subject S001 --model eegnet
+oi-mi train-from-records --subject S001 --model cbramod
 ```
 
 只用指定 session 重训：
 
 ```bash
-oi-mi train-from-records --subject S001 --model eegnet \
+oi-mi train-from-records --subject S001 --model cbramod \
   --session 20260413_224710
 ```
 
@@ -383,7 +393,7 @@ $latest = Get-ChildItem .\records_storage\S001\calibration -Directory |
 
 .\.venv\Scripts\python.exe cli.py train-from-records `
     --subject S001 `
-    --model shallowconvnet `
+    --model cbramod `
     --device neuracle `
     --session $latest.Name
 ```
@@ -393,14 +403,14 @@ $latest = Get-ChildItem .\records_storage\S001\calibration -Directory |
 用 test_mode 保存的窗口做离线回放评估：
 
 ```bash
-oi-mi replay-test-mode --subject S001 --model eegnet
+oi-mi replay-test-mode --subject S001 --model cbramod
 ```
 
 如果数据和模型不在仓库默认目录，而是在外部目录 `/mnt/dataset1/xkp/oi-mi`，建议单独准备一个配置文件，例如 `config.dataset1.yaml`：
 
 ```yaml
 subject_id: S001
-model_name: eegnet
+model_name: cbramod
 device_type: brainco
 sfreq: 200
 n_classes: 3
@@ -411,7 +421,6 @@ mc_dropout_passes: 8
 calibration_epochs: 50
 batch_size: 32
 learning_rate: 0.001
-early_stopping_patience: 6
 buffer_sec: 60
 device:
   brainco_source_sfreq: 250
@@ -424,27 +433,27 @@ storage:
 
 ```bash
 conda run -n uni python cli.py --config config.dataset1.yaml \
-  train-from-records --subject S001 --model eegnet --session 20260413_224710
+  train-from-records --subject S001 --model cbramod --session 20260413_224710
 ```
 
 用同一份配置做 test_mode 离线回放：
 
 ```bash
 conda run -n uni python cli.py --config config.dataset1.yaml \
-  replay-test-mode --subject S001 --model eegnet \
+  replay-test-mode --subject S001 --model cbramod \
   --test-dir /mnt/dataset1/xkp/oi-mi/records_storage/S001/test_mode
 ```
 
 实时运行（无 cue，自动输出）：
 
 ```bash
-oi-mi run --subject S001 --model eegnet --device neuracle
+oi-mi run --subject S001 --model cbramod --device neuracle
 ```
 
 测试模式（有 cue，保存 EEG/标签并输出准确率）：
 
 ```bash
-oi-mi run --subject S001 --model eegnet --device neuracle --test-mode --test-duration 600
+oi-mi run --subject S001 --model cbramod --device neuracle --test-mode --test-duration 600
 ```
 
 ### 采集设备范围
@@ -457,23 +466,14 @@ Neuracle；采集器按完整时间窗做带抗混叠滤波的 `250→200 Hz` �
 测试模式：
 
 ```bash
-oi-mi run --subject S001 --model eegnet --device brainco --test-mode --test-duration 600
+oi-mi run --subject S001 --model cbramod --device brainco --test-mode --test-duration 600
 ```
 
 ## 模型说明
 
-当前可选模型：
-
-- `riemann-mdm`
-- `eegnet`
-- `deepconvnet`
-- `shallowconvnet`
-- `s4d`
-
-建议当前优先使用：
-
-- `riemann-mdm` 作为首个稳定基线
-- `eegnet` 作为轻量深度学习基线
+当前正式实验模型只暴露 `cbramod`：官方12层预训练 backbone、全局平均池化分类头，
+并与 NeuroOnline 的 CRM、三视图监督损失和在线候选模型更新共同训练。旧模型构造代码仅用于
+读取历史实验，不再出现在设置界面或新实验模型列表中。
 
 ## 测试
 

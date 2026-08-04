@@ -12,9 +12,9 @@ from typing import Any
 import numpy as np
 
 from utils.preprocessing import (
-    DEFAULT_PREPROCESSING,
-    preprocess_eeg_window,
-    resample_eeg,
+    continuous_preprocessing_metadata,
+    finalize_preprocessed_window,
+    preprocess_eeg_continuous,
 )
 
 
@@ -84,6 +84,15 @@ def build_windows(
         raise ValueError("channel_indices must select at least one channel.")
     if selected_channels.min() < 0 or selected_channels.max() >= continuous_eeg.shape[0]:
         raise ValueError("channel_indices contains a channel outside the continuous EEG array.")
+    selected_continuous = np.asarray(
+        continuous_eeg[selected_channels],
+        dtype=np.float32,
+    )
+    continuous = preprocess_eeg_continuous(
+        selected_continuous,
+        source_sfreq=source_sfreq,
+        target_sfreq=target_sfreq,
+    )
 
     for trial_id, trial in enumerate(trials):
         control_on = int(trial["control_on_sample"])
@@ -93,22 +102,29 @@ def build_windows(
             if start_source < 0 or stop_source > continuous_eeg.shape[1]:
                 continue
 
-            source_window = np.asarray(
-                continuous_eeg[selected_channels, start_source:stop_source],
-                dtype=np.float32,
-            )
-            target_window = resample_eeg(
-                source_window,
-                source_sfreq=source_sfreq,
-                target_sfreq=target_sfreq,
-            )
+            start_target = int(round(start_source * target_sfreq / source_sfreq))
+            stop_target = start_target + target_window_samples
+            target_window = continuous.raw_data[:, start_target:stop_target]
             if target_window.shape[-1] != target_window_samples:
                 raise RuntimeError(
-                    f"Resampling produced {target_window.shape[-1]} points; "
+                    f"Continuous preprocessing produced {target_window.shape[-1]} points; "
                     f"expected {target_window_samples}."
                 )
 
-            result = preprocess_eeg_window(target_window, sfreq=target_sfreq)
+            filtered_window = continuous.data[:, start_target:stop_target]
+            nonfinite_fraction = float(
+                np.mean(
+                    continuous.source_nonfinite_mask[
+                        :,
+                        start_source:stop_source,
+                    ]
+                )
+            )
+            result = finalize_preprocessed_window(
+                filtered_window,
+                bad_channel_indices=continuous.bad_channel_indices,
+                nonfinite_fraction=nonfinite_fraction,
+            )
             if not result.quality.accepted:
                 rejected_windows += 1
                 for reason in result.quality.reasons:
@@ -134,7 +150,7 @@ def build_windows(
             trial_indices.append(int(trial.get("trial_index", trial_id)))
             windows_in_trial.append(window_in_trial)
             starts_source.append(start_source)
-            starts_target.append(int(round(start_source * target_sfreq / source_sfreq)))
+            starts_target.append(start_target)
 
     if not raw_windows:
         raise RuntimeError(
@@ -277,22 +293,11 @@ def reprocess_session(
 
     corrected_metadata = dict(metadata)
     corrected_metadata["preprocessing"] = {
+        **continuous_preprocessing_metadata(),
         "source_sfreq": source_sfreq,
         "target_sfreq": target_sfreq,
         "resampling": "scipy.signal.resample_poly",
-        "dc_removal": DEFAULT_PREPROCESSING.dc_removal,
-        "bandpass_hz": [
-            DEFAULT_PREPROCESSING.low_hz,
-            DEFAULT_PREPROCESSING.high_hz,
-        ],
-        "bandpass_design": (
-            f"Butterworth SOS zero-phase order {DEFAULT_PREPROCESSING.filter_order}"
-        ),
-        "reference": "common_average",
-        "bad_channel_repair": "pointwise_median_of_good_channels",
-        "artifact_clip_uv": DEFAULT_PREPROCESSING.clip_uv,
-        "artifact_reject_peak_uv": DEFAULT_PREPROCESSING.reject_peak_uv,
-        "artifact_max_clip_fraction": DEFAULT_PREPROCESSING.max_clip_fraction,
+        "continuous_span": "complete_calibration_session",
         "selected_channel_indices": (
             list(range(eeg_channel_count)) if eeg_channel_count is not None else "all"
         ),

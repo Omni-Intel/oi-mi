@@ -8,7 +8,6 @@ profile:
   epochs: 12
   batch_size: 32
   learning_rate: 0.001
-  patience: 6
   seed: 17
 metrics:
   val_loss: 0.7242544293403625

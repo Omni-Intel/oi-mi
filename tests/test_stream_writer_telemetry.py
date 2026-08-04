@@ -102,7 +102,11 @@ class StreamWriterTelemetryTests(unittest.TestCase):
                     "scene_end",
                     timestamp_monotonic=15.0 + (index * 5.0),
                     scene_index=index,
+                    label_id=truth,
                     outcome="failed" if index == 2 else "success",
+                    reason="endpoint_lane_mismatch" if index == 2 else "safe_lane_reached",
+                    endpoint_lane=(0, 0, 1)[index],
+                    endpoint_matches_safe_lane=index != 2,
                 )
             writer.stop()
             writer.finalize_manifest()
@@ -134,6 +138,15 @@ class StreamWriterTelemetryTests(unittest.TestCase):
             )
             self.assertEqual(metrics["car_task"]["completed_scenes"], 3)
             self.assertAlmostEqual(metrics["car_task"]["success_rate"], 2.0 / 3.0)
+            self.assertEqual(metrics["car_task"]["endpoint_verified_scenes"], 3)
+            self.assertEqual(
+                metrics["car_task"]["by_label_id"]["2"]["failed_scenes"],
+                1,
+            )
+            self.assertEqual(
+                metrics["car_task"]["failure_reasons"],
+                {"endpoint_lane_mismatch": 1},
+            )
             self.assertEqual(manifest["integrity"]["status"], "complete")
             checksum_paths = {
                 item["path"] for item in manifest["integrity"]["checksums"]

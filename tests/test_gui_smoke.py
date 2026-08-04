@@ -30,10 +30,20 @@ class GuiSmokeTests(unittest.TestCase):
         app.button(key="nav_btn_校准").click().run()
         self.assertEqual(list(app.exception), [])
         self.assertEqual(list(app.radio), [])
-        self.assertTrue(
-            any("预计正式采集 12.0 分钟" in info.value for info in app.info)
-        )
+        self.assertTrue(any("至少完成 60 个正式 trial" in info.value for info in app.info))
+        self.assertTrue(any("可继续追加采集" in info.value for info in app.info))
         self.assertIn("正式实验", {button.label for button in app.button})
+
+        app.button(key="nav_btn_设置").click().run()
+        self.assertEqual(list(app.exception), [])
+        self.assertIn(
+            "持续采集，人工结束",
+            {checkbox.label for checkbox in app.checkbox},
+        )
+        self.assertIn(
+            "允许结束前的最少 trial 数",
+            {number_input.label for number_input in app.number_input},
+        )
 
     def test_calibration_run_disables_return_button(self) -> None:
         gui_path = Path(__file__).resolve().parents[1] / "gui.py"
@@ -41,6 +51,12 @@ class GuiSmokeTests(unittest.TestCase):
 
         self.assertIn('render_experiment_return_button(disabled=is_running)', source)
         self.assertIn('is_running = calibration_view == "run"', source)
+        self.assertIn('key="calibration_pause"', source)
+        self.assertIn('key="calibration_resume"', source)
+        self.assertIn('key="calibration_finish"', source)
+        self.assertIn("_start_calibration_worker", source)
+        self.assertIn("train_after_collection=False", source)
+        self.assertIn('"■ 结束并保存"', source)
         self.assertIn("st.session_state.calibration_last_outcome = outcome", source)
         self.assertIn('st.session_state.gui_nav_mode = "校准"', source)
         self.assertIn("st.rerun()", source)
@@ -132,6 +148,26 @@ class GuiSmokeTests(unittest.TestCase):
                     },
                     require_neuroonline_sidecar=True,
                 )
+
+    def test_collection_only_success_does_not_require_model_files(self) -> None:
+        import gui
+
+        with TemporaryDirectory() as temporary:
+            session_dir = Path(temporary) / "session"
+            session_dir.mkdir()
+            (session_dir / "metadata.json").write_text("{}", encoding="utf-8")
+            windows_path = session_dir / "training_windows_main.npz"
+            windows_path.write_bytes(b"windows")
+
+            gui._validate_calibration_outcome(
+                {
+                    "training_performed": False,
+                    "model_path": None,
+                    "calibration_data_path": str(windows_path),
+                    "session_dir": str(session_dir),
+                },
+                require_neuroonline_sidecar=True,
+            )
 
 
 if __name__ == "__main__":

@@ -32,7 +32,7 @@ from models.factory import (
 )
 
 LOGGER = logging.getLogger(__name__)
-NEUROONLINE_TRAINING_MECHANICS_VERSION = 2
+NEUROONLINE_TRAINING_MECHANICS_VERSION = 3
 
 
 class ClassCollapseError(RuntimeError):
@@ -41,6 +41,17 @@ class ClassCollapseError(RuntimeError):
     def __init__(self, message: str, metrics: dict[str, float]) -> None:
         super().__init__(message)
         self.metrics = metrics
+
+
+def _normalized_update_policy(value: Any) -> str:
+    policy = str(value).strip().lower()
+    aliases = {"head_only": "head", "last_two": "last2", "all": "full"}
+    policy = aliases.get(policy, policy)
+    if policy not in {"head", "last2", "full"}:
+        raise ValueError(
+            "NeuroOnline update_policy must be one of: head, last2, full."
+        )
+    return policy
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +72,6 @@ class NeuroOnlineConfig:
     prompt_count: int = 32
     random_seed: int = 42
     offline_epochs: int = 50
-    offline_patience: int = 50
     offline_batch_size: int = 16
     offline_learning_rate: float = 1e-4
     # Offline search parameters are kept separate from the online update
@@ -70,6 +80,10 @@ class NeuroOnlineConfig:
     offline_mask_ratio: float | None = None
     offline_consistency_weight: float | None = None
     offline_random_seed: int | None = None
+    update_policy: str = "full"
+    backbone_learning_rate: float | None = None
+    offline_update_policy: str = "full"
+    offline_backbone_learning_rate: float | None = None
 
     @property
     def effective_offline_random_seed(self) -> int:
@@ -100,7 +114,6 @@ class NeuroOnlineConfig:
             prompt_count=max(int(data.get("prompt_count", 32)), 1),
             random_seed=int(data.get("random_seed", 42)),
             offline_epochs=max(int(data.get("offline_epochs", 50)), 1),
-            offline_patience=max(int(data.get("offline_patience", 50)), 1),
             offline_batch_size=max(int(data.get("offline_batch_size", 16)), 1),
             offline_learning_rate=max(float(data.get("offline_learning_rate", 1e-4)), 1e-9),
             offline_mask_ratio=(
@@ -116,6 +129,20 @@ class NeuroOnlineConfig:
             offline_random_seed=(
                 int(data["offline_random_seed"])
                 if data.get("offline_random_seed") is not None
+                else None
+            ),
+            update_policy=_normalized_update_policy(data.get("update_policy", "full")),
+            backbone_learning_rate=(
+                max(float(data["backbone_learning_rate"]), 1e-9)
+                if data.get("backbone_learning_rate") is not None
+                else None
+            ),
+            offline_update_policy=_normalized_update_policy(
+                data.get("offline_update_policy", "full")
+            ),
+            offline_backbone_learning_rate=(
+                max(float(data["offline_backbone_learning_rate"]), 1e-9)
+                if data.get("offline_backbone_learning_rate") is not None
                 else None
             ),
         )
@@ -199,15 +226,78 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         self.config = _checkpoint_config(config, self._pending_state)
         self._update_generator.manual_seed(self.config.random_seed)
 
-    def _prepare_training(self, example: torch.Tensor) -> ContextAwareRepresentationModulator:
-        """Initialize CRM lazily and make the complete NeuroOnline stack trainable."""
+    def _prepare_training(
+        self,
+        example: torch.Tensor,
+        *,
+        update_policy: str = "full",
+    ) -> ContextAwareRepresentationModulator:
+        """Initialize CRM lazily and configure the requested trainable parameter set."""
 
         self._ensure_modulator(example.to(self._device))
         assert self._modulator is not None
-        for module in (self.base.model, self._modulator):
-            for parameter in module.parameters():
-                parameter.requires_grad = True
+        policy = _normalized_update_policy(update_policy)
+        for parameter in self.base.model.parameters():
+            parameter.requires_grad = policy == "full"
+        for parameter in self._modulator.parameters():
+            parameter.requires_grad = True
+        for parameter in self._classifier.parameters():
+            parameter.requires_grad = True
+        if policy == "last2":
+            backbone = getattr(self.base.model, "backbone", None)
+            encoder = getattr(backbone, "encoder", None)
+            layers = getattr(encoder, "layers", None)
+            if not isinstance(layers, nn.ModuleList) or len(layers) < 2:
+                raise ValueError(
+                    "The last2 NeuroOnline update policy requires a CBraMod-style "
+                    "backbone.encoder.layers module."
+                )
+            for layer in layers[-2:]:
+                for parameter in layer.parameters():
+                    parameter.requires_grad = True
         return self._modulator
+
+    def _optimizer_groups(
+        self,
+        modulator: ContextAwareRepresentationModulator,
+        *,
+        head_learning_rate: float,
+        backbone_learning_rate: float | None,
+    ) -> list[dict[str, Any]]:
+        head_ids = {
+            id(parameter)
+            for module in (self._classifier, modulator)
+            for parameter in module.parameters()
+            if parameter.requires_grad
+        }
+        head_parameters = [
+            parameter
+            for module in (self._classifier, modulator)
+            for parameter in module.parameters()
+            if parameter.requires_grad
+        ]
+        backbone_parameters = [
+            parameter
+            for parameter in self.base.model.parameters()
+            if parameter.requires_grad and id(parameter) not in head_ids
+        ]
+        groups: list[dict[str, Any]] = []
+        if backbone_parameters:
+            groups.append(
+                {
+                    "params": backbone_parameters,
+                    "lr": float(backbone_learning_rate or head_learning_rate),
+                    "group_name": "backbone",
+                }
+            )
+        groups.append(
+            {
+                "params": head_parameters,
+                "lr": float(head_learning_rate),
+                "group_name": "head_crm",
+            }
+        )
+        return groups
 
     def _view_loader(
         self,
@@ -240,6 +330,10 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         criterion: nn.Module,
         consistency_weight: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        original = original.to(self._device)
+        time_masked = time_masked.to(self._device)
+        frequency_masked = frequency_masked.to(self._device)
+        labels = labels.to(self._device)
         logits, original_representation = self._forward_adapted(original)
         time_logits, time_representation = self._forward_adapted(time_masked)
         frequency_logits, frequency_representation = self._forward_adapted(
@@ -318,12 +412,11 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         epochs: int,
         batch_size: int,
         learning_rate: float,
-        patience: int,
         head_only: bool = False,
         groups: np.ndarray | None = None,
         progress_callback: Callable[[int, int, dict[str, float]], None] | None = None,
     ) -> dict[str, float]:
-        del epochs, batch_size, learning_rate, patience, head_only
+        del epochs, batch_size, learning_rate, head_only
         train_indices, validation_indices = split_train_validation_indices(
             y,
             groups=groups,
@@ -367,6 +460,14 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         trial_groups = None if groups is None else np.asarray(groups, dtype=np.int64)
         if trial_groups is not None and trial_groups.shape != np.asarray(y).shape:
             raise ValueError("NeuroOnline trial groups must match the labels shape.")
+        if trial_groups is not None:
+            train_groups = np.unique(trial_groups[train_indices])
+            validation_groups = np.unique(trial_groups[validation_indices])
+            if np.intersect1d(train_groups, validation_groups).size:
+                raise ValueError(
+                    "NeuroOnline training and validation splits contain windows "
+                    "from the same trial."
+                )
 
         offline_seed = self.config.effective_offline_random_seed
         random.seed(offline_seed)
@@ -388,7 +489,10 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         )
         time_views = _time_mask(all_inputs, offline_mask_ratio, generator)
         frequency_views = _frequency_mask(all_inputs, offline_mask_ratio, generator)
-        modulator = self._prepare_training(all_inputs[:1])
+        modulator = self._prepare_training(
+            all_inputs[:1],
+            update_policy=self.config.offline_update_policy,
+        )
         loader = self._view_loader(
             all_inputs[train_indices],
             time_views[train_indices],
@@ -397,8 +501,11 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
             batch_size=self.config.offline_batch_size,
         )
         optimizer = torch.optim.AdamW(
-            list(self.base.model.parameters()) + list(modulator.parameters()),
-            lr=self.config.offline_learning_rate,
+            self._optimizer_groups(
+                modulator,
+                head_learning_rate=self.config.offline_learning_rate,
+                backbone_learning_rate=self.config.offline_backbone_learning_rate,
+            ),
             weight_decay=self.config.weight_decay,
         )
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -422,8 +529,8 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         best_modulator_state: dict[str, torch.Tensor] | None = None
         best_score: tuple[float, ...] | None = None
         latest_validation_metrics: dict[str, float] = {}
-        stagnant_epochs = 0
         epochs_completed = 0
+        best_epoch = 0
         for epoch_index in range(self.config.offline_epochs):
             metrics = self._train_epoch(
                 loader,
@@ -554,17 +661,7 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
                 best_score = score
                 best_model_state = _copy_state_dict(self.base.model)
                 best_modulator_state = _copy_state_dict(modulator)
-                stagnant_epochs = 0
-            elif best_score is not None:
-                stagnant_epochs += 1
-                if stagnant_epochs >= self.config.offline_patience:
-                    LOGGER.info(
-                        "NeuroOnline offline calibration stopped after %s epochs "
-                        "(no validation-score improvement for %s epochs).",
-                        epochs_completed,
-                        self.config.offline_patience,
-                    )
-                    break
+                best_epoch = epochs_completed
         if best_model_state is None or best_modulator_state is None:
             raise ClassCollapseError(
                 "NeuroOnline training produced no checkpoint with non-zero "
@@ -587,6 +684,113 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
             "val_trial_macro_f1": best_trial_macro_f1,
             "val_trial_worst_class_accuracy": best_trial_worst_class_accuracy,
             "epochs_completed": float(epochs_completed),
+            "best_epoch": float(best_epoch),
+        }
+
+    def fit_full(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        *,
+        epochs: int | None = None,
+    ) -> dict[str, float]:
+        """Fit the selected offline configuration on every calibration window."""
+
+        from sklearn.metrics import balanced_accuracy_score, confusion_matrix
+
+        inputs = torch.as_tensor(X, dtype=torch.float32)
+        labels = np.asarray(y, dtype=np.int64)
+        if inputs.ndim != 3 or inputs.shape[0] != labels.size or labels.size == 0:
+            raise ValueError("NeuroOnline full fit requires non-empty [N,C,T] inputs and labels.")
+        training_epochs = self.config.offline_epochs if epochs is None else int(epochs)
+        if training_epochs < 1 or training_epochs > self.config.offline_epochs:
+            raise ValueError(
+                "NeuroOnline full-fit epochs must be between 1 and offline_epochs."
+            )
+
+        offline_seed = self.config.effective_offline_random_seed
+        random.seed(offline_seed)
+        np.random.seed(offline_seed)
+        torch.manual_seed(offline_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(offline_seed)
+        generator = torch.Generator().manual_seed(offline_seed)
+        mask_ratio = (
+            self.config.mask_ratio
+            if self.config.offline_mask_ratio is None
+            else self.config.offline_mask_ratio
+        )
+        consistency_weight = (
+            self.config.consistency_weight
+            if self.config.offline_consistency_weight is None
+            else self.config.offline_consistency_weight
+        )
+        time_views = _time_mask(inputs, mask_ratio, generator)
+        frequency_views = _frequency_mask(inputs, mask_ratio, generator)
+        modulator = self._prepare_training(
+            inputs[:1],
+            update_policy=self.config.offline_update_policy,
+        )
+        loader = self._view_loader(
+            inputs,
+            time_views,
+            frequency_views,
+            torch.as_tensor(labels, dtype=torch.long),
+            batch_size=self.config.offline_batch_size,
+        )
+        optimizer = torch.optim.AdamW(
+            self._optimizer_groups(
+                modulator,
+                head_learning_rate=self.config.offline_learning_rate,
+                backbone_learning_rate=self.config.offline_backbone_learning_rate,
+            ),
+            weight_decay=self.config.weight_decay,
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(self.config.offline_epochs * len(loader), 1),
+            eta_min=1e-6,
+        )
+        criterion = nn.CrossEntropyLoss(
+            label_smoothing=self.config.label_smoothing
+        ).to(self._device)
+        metrics: dict[str, float] = {}
+        for _ in range(training_epochs):
+            metrics = self._train_epoch(
+                loader,
+                optimizer,
+                criterion,
+                scheduler=scheduler,
+                clip_classifier_gradients=True,
+                consistency_weight=consistency_weight,
+            )
+
+        probabilities = self.predict_proba(X)
+        predictions = probabilities.argmax(axis=1)
+        matrix = confusion_matrix(
+            labels,
+            predictions,
+            labels=np.arange(int(np.max(labels)) + 1),
+        )
+        class_totals = matrix.sum(axis=1)
+        class_recalls = np.divide(
+            np.diag(matrix),
+            class_totals,
+            out=np.zeros_like(class_totals, dtype=np.float64),
+            where=class_totals > 0,
+        )
+        self._optimizer = None
+        return {
+            **metrics,
+            "train_accuracy": float(np.mean(predictions == labels)),
+            "train_balanced_accuracy": float(
+                balanced_accuracy_score(labels, predictions)
+            ),
+            "train_worst_class_recall": float(
+                np.min(class_recalls[class_totals > 0])
+            ),
+            "epochs_completed": float(training_epochs),
+            "scheduler_horizon_epochs": float(self.config.offline_epochs),
         }
 
     def predict_proba(self, X: np.ndarray, mc_dropout_passes: int = 1) -> np.ndarray:
@@ -676,12 +880,18 @@ class NeuroOnlineModelAdapter(BaseModelAdapter):
         if X.size == 0 or y.size == 0:
             return {"updated": 0.0, "loss": 0.0}
         inputs = torch.as_tensor(X, dtype=torch.float32)
-        modulator = self._prepare_training(inputs[:1])
+        modulator = self._prepare_training(
+            inputs[:1],
+            update_policy=self.config.update_policy,
+        )
         lr = self.config.learning_rate if learning_rate is None else float(learning_rate)
         if self._optimizer is None:
             self._optimizer = torch.optim.AdamW(
-                list(self.base.model.parameters()) + list(modulator.parameters()),
-                lr=lr,
+                self._optimizer_groups(
+                    modulator,
+                    head_learning_rate=lr,
+                    backbone_learning_rate=self.config.backbone_learning_rate,
+                ),
                 weight_decay=self.config.weight_decay,
             )
         permutation = torch.randperm(
@@ -1278,8 +1488,6 @@ def _checkpoint_config(
     supported = {
         field_name: saved[field_name]
         for field_name in (
-            "mask_ratio",
-            "consistency_weight",
             "weight_decay",
             "label_smoothing",
             "prompt_count",

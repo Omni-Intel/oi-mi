@@ -1,5 +1,5 @@
 subject_id: S001
-model_name: shallowconvnet
+model_name: cbramod
 device_type: neuracle
 hardware_dummy_mode: false
 sfreq: 200
@@ -11,7 +11,6 @@ mc_dropout_passes: 8
 calibration_epochs: 50
 batch_size: 32
 learning_rate: 0.001
-early_stopping_patience: 6
 collect_block_sec: 10
 buffer_sec: 60
 protocol:
@@ -38,22 +37,91 @@ protocol:
     iti_sec: 2.0
   calibration_blocks: 4
   calibration_trials_per_class_per_block: 5
+  # Complete at least the original 60 balanced trials, then continue until the
+  # operator requests completion. Pause and completion take effect at trial
+  # boundaries so partial trials never enter the training set.
+  continuous_collection: true
+  minimum_calibration_trials: 60
   rest_between_blocks_sec: 20.0
   random_seed: 17
 device:
   neuracle_host: 127.0.0.1
   neuracle_port: 8712
-  # Neuracle/JellyFish hardware forwards at 250 Hz. Model-facing windows are
-  # anti-aliased and resampled to the global 200 Hz rate by the acquirer.
+  # Neuracle/JellyFish hardware forwards at 250 Hz. Retained continuous EEG is
+  # preprocessed/resampled to 200 Hz before model windows are cut.
   neuracle_source_sfreq: 250
-  # Measured fixed delay from amplifier sample time to JellyFish forwarding.
-  # Keep 0 until a trigger/loopback measurement is available.
+  # Optional fixed-delay compensation from amplifier sample time to JellyFish.
+  # Keep this at 0.0 when no independent measurement is available.
   neuracle_transport_delay_sec: 0.0
   neuracle_eeg_channels: 59
+  # Verified from the native 64-channel BDF files recorded on 2026-07-25 and
+  # 2026-07-27. The five excluded channels are ECG/HEOR/HEOL/VEOU/VEOL.
+  # JellyFish is matched by name at startup; missing or duplicate channels stop
+  # the formal run instead of silently changing the model input montage.
+  neuracle_eeg_channel_names:
+  - Fpz
+  - Fp1
+  - Fp2
+  - AF3
+  - AF4
+  - AF7
+  - AF8
+  - Fz
+  - F1
+  - F2
+  - F3
+  - F4
+  - F5
+  - F6
+  - F7
+  - F8
+  - FCz
+  - FC1
+  - FC2
+  - FC3
+  - FC4
+  - FC5
+  - FC6
+  - FT7
+  - FT8
+  - Cz
+  - C1
+  - C2
+  - C3
+  - C4
+  - C5
+  - C6
+  - T7
+  - T8
+  - CP1
+  - CP2
+  - CP3
+  - CP4
+  - CP5
+  - CP6
+  - TP7
+  - TP8
+  - Pz
+  - P3
+  - P4
+  - P5
+  - P6
+  - P7
+  - P8
+  - POz
+  - PO3
+  - PO4
+  - PO5
+  - PO6
+  - PO7
+  - PO8
+  - Oz
+  - O1
+  - O2
   brainco_addr: ''
   brainco_port: 0
-  # BrainCo hardware acquires at 250 Hz; the acquirer resamples model windows
-  # to the global 200 Hz rate before preprocessing and decoding.
+  # BrainCo hardware acquires at 250 Hz; retained continuous EEG is processed
+  # and resampled to 200 Hz before model windows are cut.
   brainco_source_sfreq: 250
   brainco_auto_discover: true
   brainco_scan_timeout_sec: 6.0
@@ -74,8 +142,11 @@ output:
     # Unity applies scene layouts on its main thread. Allow ordinary frame or
     # Windows scheduling stalls without falsely abandoning a valid scene.
     timeout_sec: 3.0
+    # Optional delay compensation from Unity's scene ACK to obstacle visibility.
+    # Keep this at 0.0 when no independent measurement is available.
+    visual_onset_delay_sec: 0.0
     auto_launch: true
-    executable_path: unity相关/ARPrototype3D-windows-x64/ARPrototype3D.exe
+    executable_path: ../oi-car-unity-src/Car_game/Builds/Windows/ARPrototype3D.exe
     startup_timeout_sec: 15.0
     startup_command_delay_sec: 0.75
     startup_sequence:
@@ -96,9 +167,6 @@ storage:
   models_dir: models_storage
   records_dir: records_storage
   record_realtime_default: true
-  # Fill this with the matching Neuracle BDF/NDF file or acquisition-session ID
-  # before each formal run. It is embedded in the experiment manifest.
-  native_recording_id: ""
 online_adaptation:
   enabled: true
   strategy: neuroonline
@@ -137,7 +205,6 @@ online_adaptation:
     random_seed: 2026
     offline_random_seed: 42
     offline_epochs: 50
-    offline_patience: 50
     offline_batch_size: 16
     # Best offline pretraining parameters selected from the 2026-07-27
     # calibration data (298 windows, 60 trial-grouped samples).
@@ -154,7 +221,6 @@ online_adaptation:
       # remains untouched until the winning configuration.
       mode: full_grid
       selection_epochs: 50
-      selection_patience: 50
       learning_rates:
       - 1.0e-5
       - 3.0e-5
@@ -188,8 +254,9 @@ online_adaptation:
     # Unity holds one obstacle layout for this epoch. Forward motion and
     # decoding continue, but lateral commands are causally gated until the
     # clean current-Scene decision window has completed.
-    # Unity ACK fixes the safe lane for five seconds. LEFT/RIGHT/IDLE truth is
-    # recalculated whenever Unity confirms that the car has settled in a lane.
+    # Every Scene resets the car to the center lane, so LEFT/RIGHT/IDLE remain
+    # balanced and independent of the previous model output. The obstacle wall
+    # remains visible and serves as the subject's action instruction.
     # A collision only records failure; the next scene still starts at the
     # fixed 5 s boundary.
     scene_duration_sec: 5.0
@@ -204,7 +271,8 @@ online_adaptation:
     lane_transition_guard_sec: 0.5
     balance_pool_per_class: 32
     start_delay_sec: 5.0
-    random_seed: 17
+    # null generates and records an independent seed for every realtime session.
+    random_seed: null
 ssvep_game:
   rounds: 5
   keeper_save_probability: 0.35

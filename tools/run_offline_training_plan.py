@@ -40,7 +40,6 @@ def _run_configuration(
     method: str,
     seed: int,
     epochs: int,
-    patience: int,
     batch_size: int,
     learning_rate: float,
     mask_ratio: float = 0.3,
@@ -66,8 +65,6 @@ def _run_configuration(
         str(seed),
         "--epochs",
         str(epochs),
-        "--patience",
-        str(patience),
         "--batch-size",
         str(batch_size),
         "--learning-rate",
@@ -139,7 +136,6 @@ def run_baseline_selection(args: argparse.Namespace) -> list[dict[str, Any]]:
                 method="baseline",
                 seed=args.selection_seed,
                 epochs=args.epochs,
-                patience=args.patience,
                 batch_size=batch_size,
                 learning_rate=learning_rate,
             )
@@ -177,7 +173,6 @@ def run_neuroonline_selection(
                 method="neuroonline",
                 seed=args.selection_seed,
                 epochs=args.epochs,
-                patience=args.patience,
                 batch_size=batch_size,
                 learning_rate=learning_rate,
                 mask_ratio=mask_ratio,
@@ -219,7 +214,6 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--selection-seed", type=int, default=42)
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--patience", type=int, default=10)
     return parser.parse_args()
 
 

@@ -7,13 +7,13 @@ preprocessing that are compatible with a sliding-window decoder:
 * per-channel robust DC removal
 * common-average reference
 * 0.3--40 Hz band-pass
-* 200 Hz model rate (resampling is performed by the acquirer)
+* 200 Hz model rate
 
-CBraMod filters continuous recordings and can use montage metadata to
-interpolate known bad channels.  This project receives short windows without
-montage coordinates, so it uses a deterministic robust spatial replacement
-for obviously flat/non-finite/noisy channels.  The exact same function is
-used by calibration, offline reconstruction, and realtime inference.
+CBraMod filters continuous recordings before epoching.  Calibration, offline
+reconstruction, and hardware realtime inference therefore transform retained
+continuous source-rate EEG before cutting model windows.  Montage coordinates
+are unavailable from the forwarding API, so obviously flat/non-finite/noisy
+channels use a deterministic robust spatial replacement.
 """
 
 from __future__ import annotations
@@ -52,6 +52,32 @@ class PreprocessingConfig:
 DEFAULT_PREPROCESSING = PreprocessingConfig()
 
 
+def continuous_preprocessing_metadata(
+    config: PreprocessingConfig = DEFAULT_PREPROCESSING,
+) -> dict[str, Any]:
+    """Return an auditable description of the active temporal transform."""
+
+    return {
+        **config.as_dict(),
+        "temporal_scope": "continuous_before_windowing",
+        "transform_order": [
+            "dc_removal",
+            "bad_channel_repair",
+            "common_average_reference",
+            "resample_to_model_rate",
+            "bandpass",
+            "window_slice",
+            "quality_assessment",
+            "clip",
+        ],
+        "quality_scope": "per_window_after_continuous_transform",
+        "filter_design": "Butterworth SOS zero-phase",
+        "reference": "common_average",
+        "bad_channel_repair": "pointwise_median_of_good_channels",
+        "input_unit": "uV",
+    }
+
+
 @dataclass(frozen=True)
 class WindowQuality:
     """Quality measurements made before numerical-safety clipping."""
@@ -77,6 +103,18 @@ class PreprocessingResult:
 
     data: np.ndarray
     quality: WindowQuality
+
+
+@dataclass(frozen=True)
+class ContinuousPreprocessingResult:
+    """Continuous target-rate EEG before model-window quality clipping."""
+
+    raw_data: np.ndarray
+    data: np.ndarray
+    bad_channel_indices: tuple[int, ...]
+    source_nonfinite_mask: np.ndarray
+    source_sfreq: float
+    target_sfreq: float
 
 
 def resample_eeg(
@@ -238,6 +276,125 @@ def _sanitize_and_repair_channels(
     return centered, bad_indices, nonfinite_fraction
 
 
+def _sanitize_nonfinite(data: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Replace non-finite values while retaining their original locations."""
+
+    array = np.asarray(data, dtype=np.float64)
+    finite = np.isfinite(array)
+    sanitized = array.copy()
+    for channel_index in range(sanitized.shape[0]):
+        channel_finite = finite[channel_index]
+        replacement = (
+            float(np.median(sanitized[channel_index, channel_finite]))
+            if np.any(channel_finite)
+            else 0.0
+        )
+        sanitized[channel_index, ~channel_finite] = replacement
+    return np.asarray(sanitized, dtype=np.float32), ~finite
+
+
+def finalize_preprocessed_window(
+    data: np.ndarray,
+    *,
+    bad_channel_indices: tuple[int, ...] = (),
+    nonfinite_fraction: float = 0.0,
+    config: PreprocessingConfig = DEFAULT_PREPROCESSING,
+) -> PreprocessingResult:
+    """Assess and clip a window already transformed as continuous EEG."""
+
+    filtered = np.asarray(data, dtype=np.float32)
+    if filtered.ndim != 2:
+        raise ValueError(
+            f"Expected EEG shaped (channels, time), got {filtered.shape}."
+        )
+    if filtered.shape[0] < 2 or filtered.shape[1] < 2:
+        raise ValueError("Preprocessed EEG requires at least two channels and samples.")
+
+    bad_indices = tuple(int(index) for index in bad_channel_indices)
+    absolute = np.abs(filtered)
+    peak_abs_uv = float(np.max(absolute))
+    clip_fraction = float(np.mean(absolute > config.clip_uv))
+    bad_channel_fraction = float(len(bad_indices) / filtered.shape[0])
+    reasons: list[str] = []
+    if float(nonfinite_fraction) > 0.0:
+        reasons.append("nonfinite_samples")
+    if bad_channel_fraction > config.max_bad_channel_fraction:
+        reasons.append("too_many_bad_channels")
+    if peak_abs_uv > config.reject_peak_uv:
+        reasons.append("extreme_amplitude")
+    if clip_fraction > config.max_clip_fraction:
+        reasons.append("excessive_clipping")
+
+    quality = WindowQuality(
+        accepted=not reasons,
+        reasons=tuple(reasons),
+        bad_channel_indices=bad_indices,
+        bad_channel_fraction=bad_channel_fraction,
+        nonfinite_fraction=float(nonfinite_fraction),
+        clip_fraction=clip_fraction,
+        peak_abs_uv=peak_abs_uv,
+    )
+    cleaned = reject_artifacts(filtered, clip_uv=config.clip_uv).astype(np.float32)
+    return PreprocessingResult(data=cleaned, quality=quality)
+
+
+def preprocess_eeg_continuous(
+    data: np.ndarray,
+    *,
+    source_sfreq: float,
+    target_sfreq: float,
+    config: PreprocessingConfig = DEFAULT_PREPROCESSING,
+) -> ContinuousPreprocessingResult:
+    """Transform a continuous recording before any model windows are cut.
+
+    Bad-channel detection is performed once for the supplied continuous span so
+    overlapping windows share the same repaired and filtered samples.  Window
+    quality metrics and numerical clipping are intentionally deferred until
+    after slicing.
+    """
+
+    array = np.asarray(data)
+    if array.ndim != 2:
+        raise ValueError(f"Expected EEG shaped (channels, time), got {array.shape}.")
+    if array.shape[0] < 2:
+        raise ValueError("At least two EEG channels are required for CAR.")
+    if array.shape[1] < 2:
+        raise ValueError("Continuous EEG must contain at least two samples.")
+    if array.shape[0] == 65:
+        array = array[:64, :]
+
+    sanitized, source_nonfinite_mask = _sanitize_nonfinite(array)
+    raw_centered = remove_channel_dc(sanitized)
+    raw_target = resample_eeg(
+        raw_centered,
+        source_sfreq=source_sfreq,
+        target_sfreq=target_sfreq,
+    )
+
+    repaired, bad_indices, _ = _sanitize_and_repair_channels(array, config=config)
+    referenced = common_average_reference(repaired)
+    referenced_target = resample_eeg(
+        referenced,
+        source_sfreq=source_sfreq,
+        target_sfreq=target_sfreq,
+    )
+    filtered = bandpass_filter(
+        referenced_target,
+        sfreq=target_sfreq,
+        low_hz=config.low_hz,
+        high_hz=config.high_hz,
+        order=config.filter_order,
+    )
+    return ContinuousPreprocessingResult(
+        raw_data=np.asarray(raw_target, dtype=np.float32),
+        data=np.asarray(filtered, dtype=np.float32),
+        bad_channel_indices=bad_indices,
+        source_nonfinite_mask=np.asarray(source_nonfinite_mask, dtype=bool),
+        source_sfreq=float(source_sfreq),
+        target_sfreq=float(target_sfreq),
+    )
+
+
 def preprocess_eeg_window(
     data: np.ndarray,
     sfreq: float,
@@ -273,31 +430,12 @@ def preprocess_eeg_window(
         order=config.filter_order,
     )
 
-    absolute = np.abs(filtered)
-    peak_abs_uv = float(np.max(absolute))
-    clip_fraction = float(np.mean(absolute > config.clip_uv))
-    bad_channel_fraction = float(len(bad_indices) / filtered.shape[0])
-    reasons: list[str] = []
-    if nonfinite_fraction > 0.0:
-        reasons.append("nonfinite_samples")
-    if bad_channel_fraction > config.max_bad_channel_fraction:
-        reasons.append("too_many_bad_channels")
-    if peak_abs_uv > config.reject_peak_uv:
-        reasons.append("extreme_amplitude")
-    if clip_fraction > config.max_clip_fraction:
-        reasons.append("excessive_clipping")
-
-    quality = WindowQuality(
-        accepted=not reasons,
-        reasons=tuple(reasons),
+    return finalize_preprocessed_window(
+        filtered,
         bad_channel_indices=bad_indices,
-        bad_channel_fraction=bad_channel_fraction,
         nonfinite_fraction=nonfinite_fraction,
-        clip_fraction=clip_fraction,
-        peak_abs_uv=peak_abs_uv,
+        config=config,
     )
-    cleaned = reject_artifacts(filtered, clip_uv=config.clip_uv).astype(np.float32)
-    return PreprocessingResult(data=cleaned, quality=quality)
 
 
 def filter_and_transform(data: np.ndarray, sfreq: float) -> np.ndarray:

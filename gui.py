@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from dataclasses import dataclass, field
 import html
 import json
 import os
@@ -17,7 +18,7 @@ import streamlit as st
 
 from acquisition.base import AbstractAcquirer, ElectrodeImpedance
 from acquisition.factory import AcquirerFactory, register_default_acquirers
-from adaptation.calibrator import Calibrator
+from adaptation.calibrator import CalibrationRunControl, Calibrator
 from adaptation.mi_protocol import LABEL_DESCRIPTION, LABEL_DISPLAY, LABEL_SYMBOL, ProtocolConfig
 from cli import (
     build_acquirer,
@@ -120,12 +121,15 @@ def _validate_calibration_outcome(
 ) -> None:
     """Refuse to report success until every experiment-critical artifact exists."""
 
-    required_paths: list[tuple[str, Path]] = []
-    for key, label in (
-        ("model_path", "模型"),
+    training_performed = bool(outcome.get("training_performed", True))
+    required_artifacts = [
         ("calibration_data_path", "训练窗口"),
         ("session_dir", "校准 session"),
-    ):
+    ]
+    if training_performed:
+        required_artifacts.insert(0, ("model_path", "模型"))
+    required_paths: list[tuple[str, Path]] = []
+    for key, label in required_artifacts:
         value = str(outcome.get(key, "") or "").strip()
         if not value:
             raise RuntimeError(f"校准完成结果缺少{label}路径")
@@ -139,16 +143,17 @@ def _validate_calibration_outcome(
         for label, path in required_paths
         if not path.exists() or (path.is_file() and path.stat().st_size <= 0)
     ]
-    model_path = Path(str(outcome["model_path"])).expanduser()
-    if not model_path.is_absolute():
-        model_path = _GUI_ROOT / model_path
-    metrics_path = model_path.with_suffix(".metrics.yaml")
-    if not metrics_path.is_file() or metrics_path.stat().st_size <= 0:
-        missing.append(f"训练指标: {metrics_path}")
-    if require_neuroonline_sidecar:
-        neuroonline_path = Path(f"{model_path}.neuroonline.pt")
-        if not neuroonline_path.is_file() or neuroonline_path.stat().st_size <= 0:
-            missing.append(f"CRM: {neuroonline_path}")
+    if training_performed:
+        model_path = Path(str(outcome["model_path"])).expanduser()
+        if not model_path.is_absolute():
+            model_path = _GUI_ROOT / model_path
+        metrics_path = model_path.with_suffix(".metrics.yaml")
+        if not metrics_path.is_file() or metrics_path.stat().st_size <= 0:
+            missing.append(f"训练指标: {metrics_path}")
+        if require_neuroonline_sidecar:
+            neuroonline_path = Path(f"{model_path}.neuroonline.pt")
+            if not neuroonline_path.is_file() or neuroonline_path.stat().st_size <= 0:
+                missing.append(f"CRM: {neuroonline_path}")
     search_path_value = str(
         outcome.get("hyperparameter_search_path", "") or ""
     ).strip()
@@ -222,10 +227,13 @@ def _recover_completed_calibration(config: dict) -> dict[str, object] | None:
             outcome = {
                 "ok": True,
                 "windows_collected": int(metadata["windows_collected"]),
-                "model_path": str(metadata["model_path"]),
+                "model_path": metadata.get("model_path"),
                 "calibration_data_path": str(session_dir / "training_windows_main.npz"),
                 "session_dir": str(session_dir),
-                "metrics": dict(metadata["metrics"]),
+                "metrics": dict(metadata.get("metrics", {})),
+                "training_performed": bool(
+                    metadata.get("training_performed", True)
+                ),
                 "hyperparameter_search_path": search_metadata.get("report_path"),
                 "selected_hyperparameters": search_metadata.get("best_parameters"),
                 "recovered_after_reconnect": True,
@@ -657,10 +665,17 @@ class StreamlitConsole:
         if threading.get_ident() == self._ui_thread_id:
             self.render_pending()
 
+    def attach(self, cue_placeholder, log_placeholder) -> None:
+        """Attach fresh placeholders after a Streamlit rerun."""
+
+        with self._lock:
+            self.cue_placeholder = cue_placeholder
+            self.log_placeholder = log_placeholder
+            self._ui_thread_id = threading.get_ident()
+            self._last_progress_render_at = 0.0
+
     def render_pending(self) -> None:
         with self._lock:
-            if not self._pending_events:
-                return
             pending = list(self._pending_events)
             self._pending_events.clear()
 
@@ -680,6 +695,8 @@ class StreamlitConsole:
 
         if log_updated and not self.fullscreen:
             self.log_placeholder.code("\n".join(self.logs))
+        if self.fullscreen:
+            self._render_fullscreen_surface()
 
     def _append_log(self, msg: str) -> None:
         self.logs.append(msg)
@@ -689,19 +706,25 @@ class StreamlitConsole:
     def set_stage_progress(self, *, stage_name: str, elapsed_sec: float, duration_sec: float) -> None:
         if not self.fullscreen:
             return
-        total = max(float(duration_sec), 0.0)
-        elapsed = min(max(float(elapsed_sec), 0.0), total) if total > 0 else 0.0
-        label = stage_name.strip() or self._last_stage_label or "阶段"
-        self._last_stage_label = label
-        self._progress_label = label
-        self._progress_elapsed = elapsed
-        self._progress_duration = total
-        if elapsed <= 0.0:
-            self._progress_started_at = time.monotonic()
-        now = time.monotonic()
-        if elapsed >= total or now - self._last_progress_render_at >= 0.25:
+        with self._lock:
+            total = max(float(duration_sec), 0.0)
+            elapsed = min(max(float(elapsed_sec), 0.0), total) if total > 0 else 0.0
+            label = stage_name.strip() or self._last_stage_label or "阶段"
+            self._last_stage_label = label
+            self._progress_label = label
+            self._progress_elapsed = elapsed
+            self._progress_duration = total
+            if elapsed <= 0.0:
+                self._progress_started_at = time.monotonic()
+            now = time.monotonic()
+            should_render = (
+                threading.get_ident() == self._ui_thread_id
+                and (elapsed >= total or now - self._last_progress_render_at >= 0.25)
+            )
+            if should_render:
+                self._last_progress_render_at = now
+        if should_render:
             self._render_fullscreen_surface()
-            self._last_progress_render_at = now
 
     def _render_cue(self, msg: str, *, prediction: bool) -> None:
         resolved = _resolve_cue_symbol(msg, event_type="prediction" if prediction else "cue")
@@ -935,6 +958,45 @@ def enter_experiment_view() -> None:
           color: #0f172a !important;
           opacity: 1;
         }
+        .st-key-calibration_pause,
+        .st-key-calibration_resume,
+        .st-key-calibration_finish {
+          position: fixed;
+          top: 1rem;
+          z-index: 10002;
+          width: 9.5rem !important;
+        }
+        .st-key-calibration_pause,
+        .st-key-calibration_resume {
+          right: 12rem;
+        }
+        .st-key-calibration_finish {
+          right: 1.25rem;
+        }
+        .st-key-calibration_pause button,
+        .st-key-calibration_resume button,
+        .st-key-calibration_finish button {
+          width: 100% !important;
+          min-height: 2.75rem !important;
+          border-radius: 6px !important;
+          font-size: 0.95rem !important;
+          font-weight: 700 !important;
+        }
+        .oi-calibration-control-status {
+          position: fixed;
+          top: 4.25rem;
+          right: 1.25rem;
+          z-index: 10002;
+          min-width: 20.25rem;
+          padding: 0.55rem 0.7rem;
+          border: 1px solid #cbd5e1;
+          border-radius: 6px;
+          background: rgba(255, 255, 255, 0.96);
+          color: #0f172a;
+          font-size: 0.8rem;
+          line-height: 1.35;
+          text-align: right;
+        }
         .oi-guidance-panel {
           position: fixed;
           inset: 0;
@@ -1059,12 +1121,20 @@ def render_calibration_guidance() -> None:
         st.rerun()
 
 
-def init_live_view(*, fullscreen: bool = False) -> tuple[StreamlitConsole, callable]:
+def init_live_view(
+    *,
+    fullscreen: bool = False,
+    existing_console: StreamlitConsole | None = None,
+) -> tuple[StreamlitConsole, callable]:
     """Create cue/log placeholders for a running EEG page."""
 
     cue_box = st.empty()
     log_box = st.empty()
-    console = StreamlitConsole(cue_box, log_box, fullscreen=fullscreen)
+    if existing_console is None:
+        console = StreamlitConsole(cue_box, log_box, fullscreen=fullscreen)
+    else:
+        console = existing_console
+        console.attach(cue_box, log_box)
 
     def refresh() -> None:
         console.render_pending()
@@ -1202,10 +1272,95 @@ def _sleep_preview_stage(
     console.set_stage_progress(stage_name="", elapsed_sec=total, duration_sec=total)
 
 
-def run_calibration_session(config: dict, protocol: ProtocolConfig) -> dict[str, object]:
+@dataclass
+class CalibrationWorkerHandle:
+    """One background calibration task retained across Streamlit reruns."""
+
+    control: CalibrationRunControl
+    console: StreamlitConsole
+    started_at_unix: float
+    thread: threading.Thread | None = None
+    _outcome: dict[str, object] | None = None
+    _lock: threading.RLock = field(default_factory=threading.RLock)
+
+    def set_outcome(self, outcome: dict[str, object]) -> None:
+        with self._lock:
+            self._outcome = dict(outcome)
+
+    def outcome(self) -> dict[str, object] | None:
+        with self._lock:
+            return None if self._outcome is None else dict(self._outcome)
+
+
+@st.cache_resource(show_spinner=False)
+def _calibration_worker_registry() -> tuple[dict[str, CalibrationWorkerHandle], threading.RLock]:
+    return {}, threading.RLock()
+
+
+def _calibration_worker_key(config: dict) -> str:
+    return f"{_calibration_status_path(config).resolve()}"
+
+
+def _get_calibration_worker(config: dict) -> CalibrationWorkerHandle | None:
+    registry, lock = _calibration_worker_registry()
+    with lock:
+        return registry.get(_calibration_worker_key(config))
+
+
+def _remove_calibration_worker(config: dict) -> None:
+    registry, lock = _calibration_worker_registry()
+    with lock:
+        registry.pop(_calibration_worker_key(config), None)
+
+
+def _start_calibration_worker(
+    config: dict,
+    protocol: ProtocolConfig,
+    console: StreamlitConsole,
+) -> CalibrationWorkerHandle:
+    registry, lock = _calibration_worker_registry()
+    key = _calibration_worker_key(config)
+    with lock:
+        existing = registry.get(key)
+        if existing is not None and existing.outcome() is None:
+            return existing
+        control = CalibrationRunControl(
+            minimum_trials=protocol.minimum_calibration_trials,
+        )
+        handle = CalibrationWorkerHandle(
+            control=control,
+            console=console,
+            started_at_unix=time.time(),
+        )
+
+        def worker() -> None:
+            outcome = run_calibration_session(
+                config,
+                protocol,
+                console=console,
+                run_control=control,
+            )
+            handle.set_outcome(outcome)
+
+        handle.thread = threading.Thread(
+            target=worker,
+            name=f"calibration-{config.get('subject_id', 'unknown')}",
+            daemon=True,
+        )
+        registry[key] = handle
+        handle.thread.start()
+        return handle
+
+
+def run_calibration_session(
+    config: dict,
+    protocol: ProtocolConfig,
+    *,
+    console: StreamlitConsole | None = None,
+    run_control: CalibrationRunControl | None = None,
+) -> dict[str, object]:
     """Run real calibration in the subject-facing experiment view."""
 
-    console: StreamlitConsole | None = None
     refresh = None
     started_at_unix = time.time()
     _write_calibration_status(
@@ -1223,7 +1378,10 @@ def run_calibration_session(config: dict, protocol: ProtocolConfig) -> dict[str,
             config=config,
         )
         effective_n_channels = int(acquirer.metadata.n_channels)
-        console, refresh = init_live_view(fullscreen=True)
+        if console is None:
+            console, refresh = init_live_view(fullscreen=True)
+        else:
+            refresh = lambda: None
         experiment_seed = int(
             config.get("online_adaptation", {}).get("neuroonline", {}).get(
                 "random_seed",
@@ -1263,23 +1421,25 @@ def run_calibration_session(config: dict, protocol: ProtocolConfig) -> dict[str,
 
         console.set_stage_progress(stage_name="启动 EEG 采集", elapsed_sec=0.0, duration_sec=10.0)
         refresh()
-        with st.spinner("校准进行中..."):
-            result = calibrator.calibrate(
-                duration_sec=None,
-                epochs=int(config.get("calibration_epochs", 50)),
-                batch_size=int(config["batch_size"]),
-                learning_rate=float(config["learning_rate"]),
-                patience=int(config["early_stopping_patience"]),
-                head_only=False,
-                include_practice=False,
-                heartbeat=refresh,
-            )
+        result = calibrator.calibrate(
+            duration_sec=None,
+            epochs=int(config.get("calibration_epochs", 50)),
+            batch_size=int(config["batch_size"]),
+            learning_rate=float(config["learning_rate"]),
+            head_only=False,
+            include_practice=False,
+            heartbeat=refresh,
+            run_control=run_control,
+            train_after_collection=False,
+        )
 
         refresh()
         outcome: dict[str, object] = {
             "ok": True,
             "windows_collected": int(result.windows_collected),
-            "model_path": str(result.model_path),
+            "model_path": (
+                str(result.model_path) if result.model_path is not None else None
+            ),
             "calibration_data_path": (
                 str(result.calibration_data_path)
                 if result.calibration_data_path is not None
@@ -1293,6 +1453,7 @@ def run_calibration_session(config: dict, protocol: ProtocolConfig) -> dict[str,
                 else None
             ),
             "selected_hyperparameters": result.selected_hyperparameters,
+            "training_performed": result.training_performed,
         }
         _validate_calibration_outcome(
             outcome,
@@ -1313,6 +1474,8 @@ def run_calibration_session(config: dict, protocol: ProtocolConfig) -> dict[str,
         )
         return outcome
     except Exception as exc:  # noqa: BLE001
+        if run_control is not None:
+            run_control.mark_failed()
         outcome = {"ok": False, "error": str(exc)}
         _write_calibration_status(
             config,
@@ -1410,13 +1573,15 @@ def render_settings(config: dict) -> None:
     trial_timing_cfg = protocol_cfg.setdefault("trial_timing", {})
     output_cfg = config.setdefault("output", {})
     ar_game_cfg = output_cfg.setdefault("ar_game", {})
+    device_cfg = config.setdefault("device", {})
 
     subject_id = st.text_input("被试 ID (subject_id)", value=str(config.get("subject_id", "S001")))
     models = ModelFactory.list_models()
+    configured_model = str(config.get("model_name", "cbramod"))
     model_name = st.selectbox(
         "默认模型 (model_name)",
         models,
-        index=models.index(str(config.get("model_name", "riemann-mdm"))),
+        index=models.index(configured_model) if configured_model in models else 0,
     )
     devices = AcquirerFactory.list_devices()
     current_device = str(config.get("device_type", devices[0]))
@@ -1425,6 +1590,40 @@ def render_settings(config: dict) -> None:
         devices,
         index=devices.index(current_device) if current_device in devices else 0,
     )
+    neuracle_transport_delay_sec = float(
+        device_cfg.get("neuracle_transport_delay_sec", 0.0)
+    )
+    visual_onset_delay_sec = float(ar_game_cfg.get("visual_onset_delay_sec", 0.0))
+    if device_type == "neuracle":
+        timing_col1, timing_col2 = st.columns(2)
+        neuracle_transport_delay_sec = float(
+            timing_col1.number_input(
+                "设备到 JellyFish 固定延迟 (秒)",
+                min_value=0.0,
+                value=neuracle_transport_delay_sec,
+                step=0.001,
+                format="%.3f",
+            )
+        )
+        visual_onset_delay_sec = float(
+            timing_col2.number_input(
+                "Unity ACK 到障碍物显示延迟 (秒)",
+                min_value=0.0,
+                value=visual_onset_delay_sec,
+                step=0.001,
+                format="%.3f",
+            )
+        )
+    else:
+        visual_onset_delay_sec = float(
+            st.number_input(
+                "Unity ACK 到障碍物显示延迟 (秒)",
+                min_value=0.0,
+                value=visual_onset_delay_sec,
+                step=0.001,
+                format="%.3f",
+            )
+        )
 
     base_col1, base_col2 = st.columns(2)
     window_sec = float(
@@ -1514,10 +1713,28 @@ def render_settings(config: dict) -> None:
     )
     calibration_epochs = int(
         subject_col3.number_input(
-            "离线训练最大 epoch",
+            "离线训练固定 epoch",
             min_value=1,
             value=int(config.get("calibration_epochs", 50)),
             step=1,
+        )
+    )
+    continuous_col1, continuous_col2 = st.columns(2)
+    continuous_collection = continuous_col1.checkbox(
+        "持续采集，人工结束",
+        value=bool(protocol_cfg.get("continuous_collection", True)),
+    )
+    minimum_calibration_trials = int(
+        continuous_col2.number_input(
+            "允许结束前的最少 trial 数",
+            min_value=3,
+            value=int(
+                protocol_cfg.get(
+                    "minimum_calibration_trials",
+                    calibration_blocks * calibration_trials_per_class_per_block * 3,
+                )
+            ),
+            step=3,
         )
     )
 
@@ -1567,7 +1784,14 @@ def render_settings(config: dict) -> None:
                 "calibration_trials_per_class_per_block": (
                     calibration_trials_per_class_per_block
                 ),
+                "continuous_collection": continuous_collection,
+                "minimum_calibration_trials": minimum_calibration_trials,
                 "rest_between_blocks_sec": rest_between_blocks_sec,
+            }
+        )
+        device_cfg.update(
+            {
+                "neuracle_transport_delay_sec": neuracle_transport_delay_sec,
             }
         )
         next_ar_game_cfg = dict(ar_game_cfg)
@@ -1577,6 +1801,7 @@ def render_settings(config: dict) -> None:
                 "host": ar_game_host,
                 "port": ar_game_port,
                 "timeout_sec": ar_game_timeout_sec,
+                "visual_onset_delay_sec": visual_onset_delay_sec,
             }
         )
         output_cfg["ar_game"] = next_ar_game_cfg
@@ -1649,16 +1874,99 @@ def render_impedance(config: dict) -> None:
     st.markdown(_build_impedance_table_html(results), unsafe_allow_html=True)
 
 
+def _render_running_calibration(
+    config: dict,
+    protocol: ProtocolConfig,
+) -> dict[str, object] | None:
+    handle = _get_calibration_worker(config)
+    if handle is None:
+        console, _ = init_live_view(fullscreen=True)
+        handle = _start_calibration_worker(config, protocol, console)
+    else:
+        init_live_view(fullscreen=True, existing_console=handle.console)
+
+    snapshot = handle.control.snapshot()
+    state = str(snapshot["state"])
+    collecting = state in {"collecting", "pause_pending", "paused", "stop_pending"}
+    if state in {"pause_pending", "paused"}:
+        if st.button(
+            "▶ 继续",
+            key="calibration_resume",
+            type="primary",
+        ):
+            handle.control.request_resume()
+            st.rerun()
+    else:
+        if st.button(
+            "Ⅱ 暂停",
+            key="calibration_pause",
+            disabled=not collecting or bool(snapshot["stop_requested"]),
+        ):
+            handle.control.request_pause()
+            st.rerun()
+
+    if st.button(
+        "■ 结束并保存",
+        key="calibration_finish",
+        type="primary",
+        disabled=(
+            not collecting
+            or not bool(snapshot["can_request_stop"])
+            or bool(snapshot["stop_requested"])
+        ),
+    ):
+        handle.control.request_stop()
+        st.rerun()
+
+    state_labels = {
+        "collecting": "采集中",
+        "pause_pending": "将在当前 trial 结束后暂停",
+        "paused": "已暂停",
+        "stop_pending": "将在类别平衡点结束",
+        "training": "采集完成，正在保存",
+        "failed": "执行失败",
+    }
+    counts = snapshot["class_counts"]
+    st.markdown(
+        (
+            "<div class='oi-calibration-control-status'>"
+            f"{html.escape(state_labels.get(state, state))}<br>"
+            f"trial {int(snapshot['completed_trials'])} / 最少 {int(snapshot['minimum_trials'])} · "
+            f"左 {int(counts['left'])} · 右 {int(counts['right'])} · 静息 {int(counts['idle'])}"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+    handle.console.render_pending()
+    outcome = handle.outcome()
+    if outcome is not None:
+        return outcome
+    time.sleep(0.25)
+    st.rerun()
+    return None
+
+
 def render_calibration(config: dict) -> None:
     protocol = ProtocolConfig.from_config(config)
 
     calibration_view = st.session_state.get("calibration_experiment_view")
+    active_worker = _get_calibration_worker(config)
+    if (
+        calibration_view is None
+        and active_worker is not None
+        and active_worker.outcome() is None
+    ):
+        st.session_state.calibration_experiment_view = "run"
+        st.rerun()
     if calibration_view is not None:
         enter_experiment_view()
         is_running = calibration_view == "run"
         render_experiment_return_button(disabled=is_running)
         if is_running:
-            st.warning("正式采集及离线训练完成前不可返回。请勿刷新或关闭页面，直到显示模型保存路径。")
+            st.warning(
+                "采集和保存完成前不可返回。页面刷新或短暂断线不会停止后台采集，"
+                "重新进入校准页会自动恢复当前任务。"
+            )
         if calibration_view == "guidance":
             render_calibration_guidance()
         elif calibration_view == "practice":
@@ -1667,14 +1975,13 @@ def render_calibration(config: dict) -> None:
             st.session_state.gui_nav_mode = "校准"
             st.rerun()
         elif calibration_view == "run":
-            outcome = run_calibration_session(
-                config,
-                protocol,
-            )
-            st.session_state.calibration_last_outcome = outcome
-            st.session_state.pop("calibration_experiment_view", None)
-            st.session_state.gui_nav_mode = "校准"
-            st.rerun()
+            outcome = _render_running_calibration(config, protocol)
+            if outcome is not None:
+                st.session_state.calibration_last_outcome = outcome
+                st.session_state.pop("calibration_experiment_view", None)
+                st.session_state.gui_nav_mode = "校准"
+                _remove_calibration_worker(config)
+                st.rerun()
         return
 
     st.title("被试校准")
@@ -1685,11 +1992,23 @@ def render_calibration(config: dict) -> None:
     calibration_outcome = st.session_state.get("calibration_last_outcome")
     if isinstance(calibration_outcome, dict):
         if bool(calibration_outcome.get("ok", False)):
-            st.success("校准完成，模型与 CRM 已保存。")
+            training_performed = bool(
+                calibration_outcome.get("training_performed", True)
+            )
+            if training_performed:
+                st.success("校准完成，模型与 CRM 已保存。")
+            else:
+                st.success(
+                    "采集完成，原始 EEG、事件、元数据和训练窗口已保存；"
+                    "未执行模型训练。"
+                )
             if bool(calibration_outcome.get("recovered_after_reconnect", False)):
                 st.info("已从磁盘恢复校准完成状态；此前的页面刷新或断线没有丢失模型。")
             st.write(f"- 采集窗口数: **{int(calibration_outcome.get('windows_collected', 0))}**")
-            st.write(f"- 模型保存位置: `{calibration_outcome.get('model_path', '-')}`")
+            if training_performed:
+                st.write(
+                    f"- 模型保存位置: `{calibration_outcome.get('model_path', '-')}`"
+                )
             if calibration_outcome.get("calibration_data_path"):
                 st.write(f"- 校准数据保存位置: `{calibration_outcome['calibration_data_path']}`")
             if calibration_outcome.get("session_dir"):
@@ -1733,10 +2052,17 @@ def render_calibration(config: dict) -> None:
         + formal_trials * protocol.trial_timing.total_sec
         + max(protocol.calibration_blocks - 1, 0) * protocol.rest_between_blocks_sec
     )
-    st.info(
-        f"当前为统一从头校准：{formal_trials} 个正式 trial，"
-        f"预计正式采集 {collection_seconds / 60.0:.1f} 分钟。"
-    )
+    if protocol.continuous_collection:
+        st.info(
+            f"当前为持续校准：至少完成 {protocol.minimum_calibration_trials} 个正式 trial "
+            f"（约 {collection_seconds / 60.0:.1f} 分钟），之后可继续追加采集。"
+            "工作人员可在 trial 边界暂停/继续，并在类别平衡点结束和保存采集数据。"
+        )
+    else:
+        st.info(
+            f"当前为统一从头校准：{formal_trials} 个正式 trial，"
+            f"预计正式采集 {collection_seconds / 60.0:.1f} 分钟。"
+        )
 
     tutorial_col, practice_col, run_col = st.columns([1, 1, 1])
     tutorial_requested = tutorial_col.button("教程", type="secondary", use_container_width=True)
@@ -1755,6 +2081,7 @@ def render_calibration(config: dict) -> None:
 
     if run_requested:
         st.session_state.pop("calibration_last_outcome", None)
+        _remove_calibration_worker(config)
         _write_calibration_status(
             config,
             {
@@ -1973,8 +2300,8 @@ def _build_online_label_source(
     cued_cfg = adaptation_cfg.get("cued_labels", {})
     if bool(cued_cfg.get("enabled", True)):
         st.info(
-            "在线适配使用与 Unity 障碍布局统一的连续场景真值；每个 Scene 先采集两个"
-            "因果干净的主决策窗，再放行模型横向控制。跨场景、换道保护区或质量不合格"
+            "在线适配使用与 Unity 障碍布局统一的连续场景真值；每个 Scene 先采集一个"
+            "因果主决策窗，再放行模型横向控制。跨场景、换道保护区或质量不合格"
             "的 EEG 窗口不进入训练和准确率。"
         )
         return build_cued_online_label_source(config), None
@@ -2027,13 +2354,6 @@ def render_realtime(config: dict) -> None:
         "保存实时脑波数据至本地记录",
         value=bool(config.get("storage", {}).get("record_realtime_default", False)),
     )
-    storage_cfg = config.setdefault("storage", {})
-    native_recording_id = st.text_input(
-        "博瑞康原始 BDF/NDF 文件名或采集会话编号",
-        value=str(storage_cfg.get("native_recording_id", "") or ""),
-        help="用于把本次oi-mi记录与博瑞康原始连续脑电及Trigger文件一一对应。",
-    ).strip()
-    storage_cfg["native_recording_id"] = native_recording_id
     _render_online_adaptation_notice(adaptation_cfg)
 
     if st.button("开始实时解码", type="primary"):
@@ -2044,18 +2364,6 @@ def render_realtime(config: dict) -> None:
             and not record
         ):
             st.error("NeuroOnline正式实验必须开启实时记录，请勾选“保存实时脑波数据至本地记录”。")
-            return
-        if (
-            bool(adaptation_cfg.get("enabled", False))
-            and str(adaptation_cfg.get("strategy", "")).strip().lower()
-            == "neuroonline"
-            and not (
-                bool(config.get("hardware_dummy_mode", False))
-                or str(config.get("device_type", "")).strip().lower() == "dummy"
-            )
-            and not native_recording_id
-        ):
-            st.error("正式实验必须填写对应的博瑞康原始 BDF/NDF 文件名或采集会话编号。")
             return
         try:
             subject_id = str(config["subject_id"])

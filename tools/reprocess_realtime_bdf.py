@@ -18,10 +18,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from tools.reprocess_calibration import build_windows
 from utils.preprocessing import (
-    bandpass_filter,
-    common_average_reference,
-    reject_artifacts,
-    resample_eeg,
+    continuous_preprocessing_metadata,
+    finalize_preprocessed_window,
+    preprocess_eeg_continuous,
 )
 
 
@@ -201,26 +200,21 @@ def reprocess_realtime_from_waveform_matches(
 
         segment_start = int(window_starts_source.min())
         segment_stop = int(window_ends_source.max())
-        source_indices = (
-            window_starts_source[:, None]
-            - segment_start
-            + np.arange(source_window_samples, dtype=np.int64)[None, :]
-        )
-        raw_windows = np.empty(
-            (len(labels), eeg_channel_count, target_window_samples),
+        source_segment = np.empty(
+            (eeg_channel_count, segment_stop - segment_start),
             dtype=np.float32,
         )
         for channel in range(eeg_channel_count):
-            channel_signal = source.readSignal(
+            source_segment[channel] = source.readSignal(
                 channel,
                 start=segment_start,
                 n=segment_stop - segment_start,
             ).astype(np.float32)
-            raw_windows[:, channel] = resample_eeg(
-                channel_signal[source_indices],
-                source_sfreq=source_sfreq,
-                target_sfreq=target_sfreq,
-            )
+        continuous = preprocess_eeg_continuous(
+            source_segment,
+            source_sfreq=source_sfreq,
+            target_sfreq=target_sfreq,
+        )
         channel_labels = [
             source.getLabel(index).strip() for index in range(eeg_channel_count)
         ]
@@ -239,14 +233,36 @@ def reprocess_realtime_from_waveform_matches(
         )
 
     processed_windows: list[np.ndarray] = []
+    raw_windows: list[np.ndarray] = []
     clip_fractions: list[float] = []
     peak_abs_uv: list[float] = []
-    for window in raw_windows:
-        referenced = common_average_reference(window)
-        filtered = bandpass_filter(referenced, sfreq=target_sfreq)
-        clip_fractions.append(float(np.mean(np.abs(filtered) > 150.0)))
-        peak_abs_uv.append(float(np.max(np.abs(filtered))))
-        processed_windows.append(reject_artifacts(filtered))
+    for start_source, stop_source in zip(
+        window_starts_source,
+        window_ends_source,
+        strict=True,
+    ):
+        local_start_source = int(start_source) - segment_start
+        local_stop_source = int(stop_source) - segment_start
+        start_target = int(
+            round(local_start_source * target_sfreq / source_sfreq)
+        )
+        stop_target = start_target + target_window_samples
+        raw_windows.append(continuous.raw_data[:, start_target:stop_target])
+        result = finalize_preprocessed_window(
+            continuous.data[:, start_target:stop_target],
+            bad_channel_indices=continuous.bad_channel_indices,
+            nonfinite_fraction=float(
+                np.mean(
+                    continuous.source_nonfinite_mask[
+                        :,
+                        local_start_source:local_stop_source,
+                    ]
+                )
+            ),
+        )
+        clip_fractions.append(result.quality.clip_fraction)
+        peak_abs_uv.append(result.quality.peak_abs_uv)
+        processed_windows.append(result.data)
 
     per_trial_count: dict[int, int] = {}
     window_indices: list[int] = []
@@ -256,7 +272,7 @@ def reprocess_realtime_from_waveform_matches(
         per_trial_count[trial] = per_trial_count.get(trial, 0) + 1
 
     payload = {
-        "raw_windows": raw_windows,
+        "raw_windows": np.stack(raw_windows).astype(np.float32),
         "processed_windows": np.stack(processed_windows).astype(np.float32),
         "labels": labels,
         "trial_ids": trial_ids,
@@ -305,10 +321,11 @@ def reprocess_realtime_from_waveform_matches(
         "window_sec": window_sec,
         "step_sec": float(manifest["step_sec"]),
         "preprocessing": {
+            **continuous_preprocessing_metadata(),
+            "source_sfreq": source_sfreq,
+            "target_sfreq": target_sfreq,
             "resampling": "scipy.signal.resample_poly",
-            "bandpass_hz": [8.0, 30.0],
-            "reference": "common_average over selected EEG channels",
-            "artifact_clip_uv": 150.0,
+            "continuous_span": "matched_realtime_bdf_segment",
         },
     }
     (output_dir / "metadata_waveform_aligned.json").write_text(
@@ -418,10 +435,11 @@ def reprocess_realtime(
         "step_sec": float(manifest["step_sec"]),
         "label_sequence_repeats": True,
         "preprocessing": {
+            **continuous_preprocessing_metadata(),
+            "source_sfreq": source_sfreq,
+            "target_sfreq": target_sfreq,
             "resampling": "scipy.signal.resample_poly",
-            "bandpass_hz": [8.0, 30.0],
-            "reference": "common_average over selected EEG channels",
-            "artifact_clip_uv": 150.0,
+            "continuous_span": "complete_reconstructed_bdf_segment",
         },
     }
     (output_dir / "metadata_corrected.json").write_text(

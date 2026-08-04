@@ -8,6 +8,7 @@ __pycache__/
 .coverage
 htmlcov/
 .streamlit.*.log
+*.log
 
 # Virtual environments
 *venv*/
@@ -37,3 +38,4 @@ ARPrototype3D-windows-x64.zip
 .windsurf/
 .roo/
 .aider*
+assets/pretrained/*.pth

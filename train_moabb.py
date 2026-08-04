@@ -15,7 +15,7 @@ from models.factory import ModelFactory
 from utils.preprocessing import filter_and_transform
 
 LOGGER = logging.getLogger("oi_mi.train_moabb")
-DEFAULT_MODELS = ("eegnet", "deepconvnet", "shallowconvnet", "riemann-mdm", "s4d")
+DEFAULT_MODELS = ("cbramod",)
 
 
 def setup_logging(verbose: bool) -> None:
@@ -248,7 +248,7 @@ def save_metadata(
     "--model",
     "model_name",
     type=click.Choice(DEFAULT_MODELS, case_sensitive=False),
-    default="eegnet",
+    default="cbramod",
     show_default=True,
     help="Model registry name.",
 )
@@ -266,13 +266,6 @@ def save_metadata(
     default=1e-3,
     show_default=True,
     help="Adam learning rate.",
-)
-@click.option(
-    "--patience",
-    type=int,
-    default=8,
-    show_default=True,
-    help="Early stopping patience.",
 )
 @click.option(
     "--seed",
@@ -306,7 +299,6 @@ def main(
     epochs: int,
     batch_size: int,
     learning_rate: float,
-    patience: int,
     seed: int,
     preprocess: bool,
     output_path: Path | None,
@@ -364,7 +356,6 @@ def main(
         epochs=epochs,
         batch_size=batch_size,
         learning_rate=learning_rate,
-        patience=patience,
         head_only=False,
     )
 

@@ -37,7 +37,6 @@ class CalibrationSearchConfig:
     reuse_latest: bool = False
     mode: str = "full_grid"
     selection_epochs: int = 50
-    selection_patience: int = 50
     learning_rates: tuple[float, ...] = (1e-5, 3e-5, 1e-4, 3e-4, 1e-3)
     batch_sizes: tuple[int, ...] = (16, 32, 128, 256)
     mask_ratios: tuple[float, ...] = (0.1, 0.3, 0.5, 0.7)
@@ -63,7 +62,6 @@ class CalibrationSearchConfig:
             reuse_latest=reuse_latest,
             mode=mode,
             selection_epochs=max(int(data.get("selection_epochs", 50)), 1),
-            selection_patience=max(int(data.get("selection_patience", 50)), 1),
             learning_rates=_positive_float_tuple(
                 data.get("learning_rates"),
                 defaults.learning_rates,
@@ -98,6 +96,7 @@ def load_latest_calibration_search(
     *,
     calibration_records_dir: Path | None,
     base_config: NeuroOnlineConfig,
+    model_name: str,
 ) -> tuple[NeuroOnlineConfig, dict[str, Any], Path]:
     """Load the newest completed search report without reusing model weights."""
 
@@ -130,6 +129,13 @@ def load_latest_calibration_search(
                     "training mechanics version "
                     f"{report_version} is incompatible with current version "
                     f"{NEUROONLINE_TRAINING_MECHANICS_VERSION}"
+                )
+            report_model = str(report.get("model_name", "")).strip().lower()
+            expected_model = str(model_name).strip().lower()
+            if report_model != expected_model:
+                raise ValueError(
+                    f"model {report_model or '<missing>'!r} does not match "
+                    f"current model {expected_model!r}"
                 )
             parameters = _validated_selected_parameters(report.get("best_parameters"))
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -196,7 +202,6 @@ def run_calibration_search(
             offline_learning_rate=learning_rate,
             offline_batch_size=batch_size,
             offline_epochs=search_config.selection_epochs,
-            offline_patience=search_config.selection_patience,
         )
         for learning_rate in search_config.learning_rates
         for batch_size in search_config.batch_sizes
@@ -210,7 +215,6 @@ def run_calibration_search(
                 offline_mask_ratio=mask_ratio,
                 offline_consistency_weight=consistency_weight,
                 offline_epochs=search_config.selection_epochs,
-                offline_patience=search_config.selection_patience,
             )
             for learning_rate in search_config.learning_rates
             for batch_size in search_config.batch_sizes
@@ -350,11 +354,11 @@ def run_calibration_search(
     final_config = replace(
         best_config,
         offline_epochs=base_config.offline_epochs,
-        offline_patience=base_config.offline_patience,
     )
     report = {
         "schema_version": 2,
         "training_mechanics_version": NEUROONLINE_TRAINING_MECHANICS_VERSION,
+        "model_name": base_template.model_name,
         "selection_method": f"{search_config.mode}_trial_grouped_search",
         "ranking": [
             "validation_trial_worst_class_accuracy",
@@ -473,7 +477,6 @@ def _selected_parameters(config: NeuroOnlineConfig) -> dict[str, Any]:
         "weight_decay": config.weight_decay,
         "label_smoothing": config.label_smoothing,
         "offline_epochs": config.offline_epochs,
-        "offline_patience": config.offline_patience,
     }
 
 
@@ -488,7 +491,6 @@ def _validated_selected_parameters(value: Any) -> dict[str, Any]:
         "weight_decay",
         "label_smoothing",
         "offline_epochs",
-        "offline_patience",
     }
     missing = sorted(required - value.keys())
     if missing:
@@ -501,7 +503,6 @@ def _validated_selected_parameters(value: Any) -> dict[str, Any]:
         "weight_decay": float(value["weight_decay"]),
         "label_smoothing": float(value["label_smoothing"]),
         "offline_epochs": int(value["offline_epochs"]),
-        "offline_patience": int(value["offline_patience"]),
     }
     if parameters["offline_learning_rate"] <= 0:
         raise ValueError("offline_learning_rate must be positive")
@@ -515,8 +516,8 @@ def _validated_selected_parameters(value: Any) -> dict[str, Any]:
         raise ValueError("weight_decay must be non-negative")
     if not 0.0 <= parameters["label_smoothing"] <= 1.0:
         raise ValueError("label_smoothing must be between 0 and 1")
-    if parameters["offline_epochs"] <= 0 or parameters["offline_patience"] <= 0:
-        raise ValueError("offline epochs and patience must be positive")
+    if parameters["offline_epochs"] <= 0:
+        raise ValueError("offline_epochs must be positive")
     return parameters
 
 

@@ -26,7 +26,6 @@ DEFAULT_PROFILE = {
     "epochs": 12,
     "batch_size": 32,
     "learning_rate": 0.001,
-    "patience": 6,
     "seed": 17,
 }
 
@@ -99,7 +98,6 @@ def seed_profile(
             epochs=int(profile["epochs"]),
             batch_size=int(profile["batch_size"]),
             learning_rate=float(profile["learning_rate"]),
-            patience=int(profile["patience"]),
             head_only=False,
         )
         asset_path = output_dir / _asset_name(model_name, n_chans, n_times)
@@ -149,7 +147,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--models",
         nargs="+",
-        default=["eegnet", "riemann-mdm"],
+        default=["cbramod"],
         help="Model registry names to export.",
     )
     parser.add_argument("--n-chans", type=int, default=DEFAULT_PROFILE["n_chans"])

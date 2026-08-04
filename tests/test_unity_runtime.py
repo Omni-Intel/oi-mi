@@ -70,7 +70,7 @@ def test_existing_unity_window_matches_configured_executable_title(
     assert calls == [{"window_title": "MyDrivingGame"}]
 
 
-def test_existing_packaged_unity_window_falls_back_to_product_title(
+def test_existing_packaged_unity_window_uses_default_product_title_once(
     monkeypatch, tmp_path
 ) -> None:
     calls: list[dict[str, object]] = []
@@ -78,7 +78,7 @@ def test_existing_packaged_unity_window_falls_back_to_product_title(
 
     def make_resizable(**kwargs: object) -> bool:
         calls.append(kwargs)
-        return kwargs.get("window_title") == "AR Pong"
+        return kwargs.get("window_title") == "ARPrototype3D"
 
     monkeypatch.setattr(unity_runtime, "_make_windows_resizable", make_resizable)
     config = {
@@ -96,10 +96,7 @@ def test_existing_packaged_unity_window_falls_back_to_product_title(
         console=None,
     )
 
-    assert calls == [
-        {"window_title": "ARPrototype3D"},
-        {"window_title": "AR Pong"},
-    ]
+    assert calls == [{"window_title": "ARPrototype3D"}]
 
 
 def test_runtime_manifest_round_trip_and_hash_validation(tmp_path) -> None:
@@ -109,9 +106,7 @@ def test_runtime_manifest_round_trip_and_hash_validation(tmp_path) -> None:
     executable = build_dir / "ARPrototype3D.exe"
     executable.write_bytes(b"player")
     (build_dir / "UnityPlayer.dll").write_bytes(b"unity")
-    managed_dll = managed_dir / "Assembly-CSharp.dll"
-    managed_dll.write_bytes(b"managed")
-    runtime_dll = managed_dir / "ARPong.Runtime.dll"
+    runtime_dll = managed_dir / "ARPrototype3D.Runtime.dll"
     runtime_dll.write_bytes(b"runtime")
 
     manifest_path = unity_runtime.write_unity_runtime_manifest(
@@ -123,7 +118,7 @@ def test_runtime_manifest_round_trip_and_hash_validation(tmp_path) -> None:
     assert manifest_path.name == unity_runtime.RUNTIME_MANIFEST_FILENAME
     assert manifest["build_id"] == "test-build"
     assert manifest["protocol_version"] == unity_runtime.REQUIRED_RUNTIME_PROTOCOL
-    assert "ARPrototype3D_Data/Managed/ARPong.Runtime.dll" in manifest["files"]
+    assert "ARPrototype3D_Data/Managed/ARPrototype3D.Runtime.dll" in manifest["files"]
 
     runtime_dll.write_bytes(b"tampered")
     try:
@@ -141,8 +136,7 @@ def test_runtime_manifest_rejects_old_unversioned_build(tmp_path) -> None:
     executable = build_dir / "ARPrototype3D.exe"
     executable.write_bytes(b"player")
     (build_dir / "UnityPlayer.dll").write_bytes(b"unity")
-    (managed_dir / "Assembly-CSharp.dll").write_bytes(b"managed")
-    (managed_dir / "ARPong.Runtime.dll").write_bytes(b"runtime")
+    (managed_dir / "ARPrototype3D.Runtime.dll").write_bytes(b"runtime")
 
     try:
         unity_runtime.validate_unity_runtime(executable)
@@ -159,15 +153,14 @@ def test_runtime_manifest_requires_runtime_code_hash(tmp_path) -> None:
     executable = build_dir / "ARPrototype3D.exe"
     executable.write_bytes(b"player")
     (build_dir / "UnityPlayer.dll").write_bytes(b"unity")
-    (managed_dir / "Assembly-CSharp.dll").write_bytes(b"managed")
-    (managed_dir / "ARPong.Runtime.dll").write_bytes(b"runtime")
+    (managed_dir / "ARPrototype3D.Runtime.dll").write_bytes(b"runtime")
 
     manifest_path = unity_runtime.write_unity_runtime_manifest(
         executable,
         build_id="test-build",
     )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    del manifest["files"]["ARPrototype3D_Data/Managed/ARPong.Runtime.dll"]
+    del manifest["files"]["ARPrototype3D_Data/Managed/ARPrototype3D.Runtime.dll"]
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     try:

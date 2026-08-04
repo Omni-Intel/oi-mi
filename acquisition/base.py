@@ -21,6 +21,8 @@ class AcquirerMetadata:
     sfreq: float
     n_channels: int
     timestamp_domain: str = "relative"
+    channel_names: tuple[str, ...] = ()
+    channel_types: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -66,6 +68,22 @@ class AbstractAcquirer(ABC):
     @abstractmethod
     def get_new_samples(self) -> EEGChunk:
         """Return newly arrived EEG samples since the previous incremental read."""
+
+    def get_continuous_chunk(self, min_window_sec: float) -> EEGChunk:
+        """Return continuous history for preprocessing before model windowing.
+
+        Backends without a source-rate rolling buffer fall back to their latest
+        model-rate window. Hardware backends should override this method and
+        expose as much chronological source history as is currently retained.
+        """
+
+        return self.get_chunk(min_window_sec)
+
+    @property
+    def continuous_sfreq(self) -> float:
+        """Sampling rate returned by :meth:`get_continuous_chunk`."""
+
+        return float(self.metadata.sfreq)
 
     def supports_impedance_check(self) -> bool:
         """Return whether this backend can query real hardware impedance/lead-off data."""

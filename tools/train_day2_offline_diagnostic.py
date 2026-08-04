@@ -122,7 +122,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "method": args.method,
         "seeds": args.seeds,
         "epochs": args.epochs,
-        "patience": args.patience,
+        "fixed_epoch_training": True,
         "batch_size": args.batch_size,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
@@ -148,7 +148,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 learning_rate=args.learning_rate,
                 weight_decay=args.weight_decay,
                 label_smoothing=args.label_smoothing,
-                patience=args.patience,
                 sfreq=sfreq,
             )
             predict = lambda values, trained=model: predict_torch(
@@ -169,7 +168,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 learning_rate=args.learning_rate,
                 weight_decay=args.weight_decay,
                 label_smoothing=args.label_smoothing,
-                patience=args.patience,
                 sfreq=sfreq,
                 mask_ratio=args.mask_ratio,
                 consistency_weight=args.consistency_weight,
@@ -195,7 +193,6 @@ def _parse_args() -> argparse.Namespace:
         default=[17, 42, 2026],
     )
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=5e-2)

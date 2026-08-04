@@ -17,10 +17,17 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from models.conformer_lite import ConformerLite
+from models.cbramod import CBraModClassifier
 from models.custom_s4d import SimpleS4D
 from models.hybrid_net import HybridSpectralTemporalNet
 
 LOGGER = logging.getLogger(__name__)
+DEFAULT_CBRAMOD_WEIGHTS = (
+    Path(__file__).resolve().parents[1]
+    / "assets"
+    / "pretrained"
+    / "cbramod_pretrained_weights.pth"
+)
 
 
 def atomic_torch_save(payload: object, path: Path) -> None:
@@ -129,7 +136,6 @@ class BaseModelAdapter(ABC):
         epochs: int,
         batch_size: int,
         learning_rate: float,
-        patience: int,
         head_only: bool = False,
         groups: np.ndarray | None = None,
         progress_callback: Callable[[int, int, dict[str, float]], None] | None = None,
@@ -180,7 +186,6 @@ class TorchModelAdapter(BaseModelAdapter):
         epochs: int,
         batch_size: int,
         learning_rate: float,
-        patience: int,
         head_only: bool = False,
         groups: np.ndarray | None = None,
         progress_callback: Callable[[int, int, dict[str, float]], None] | None = None,
@@ -209,7 +214,7 @@ class TorchModelAdapter(BaseModelAdapter):
         best_state = None
         best_val_loss = float("inf")
         best_val_acc = 0.0
-        stagnant_epochs = 0
+        best_epoch = 0
 
         for epoch in range(epochs):
             self.model.train()
@@ -249,23 +254,23 @@ class TorchModelAdapter(BaseModelAdapter):
                         "val_acc": val_acc,
                     },
                 )
-            if val_loss < best_val_loss:
+            if best_state is None or val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_val_acc = val_acc
+                best_epoch = epoch + 1
                 best_state = {
                     key: value.detach().cpu().clone()
                     for key, value in self.model.state_dict().items()
                 }
-                stagnant_epochs = 0
-            else:
-                stagnant_epochs += 1
-                if stagnant_epochs >= patience:
-                    LOGGER.info("Early stopping triggered after %s epochs", epoch + 1)
-                    break
 
         if best_state is not None:
             self.model.load_state_dict(best_state)
-        return {"val_loss": best_val_loss, "val_acc": best_val_acc}
+        return {
+            "val_loss": best_val_loss,
+            "val_acc": best_val_acc,
+            "epochs_completed": float(epochs),
+            "best_epoch": float(best_epoch),
+        }
 
     def predict_proba(self, X: np.ndarray, mc_dropout_passes: int = 1) -> np.ndarray:
         inputs = torch.tensor(X, dtype=torch.float32, device=self._device)
@@ -377,12 +382,11 @@ class RiemannMDMAdapter(BaseModelAdapter):
         epochs: int,
         batch_size: int,
         learning_rate: float,
-        patience: int,
         head_only: bool = False,
         groups: np.ndarray | None = None,
         progress_callback: Callable[[int, int, dict[str, float]], None] | None = None,
     ) -> dict[str, float]:
-        del epochs, batch_size, learning_rate, patience, head_only, groups
+        del epochs, batch_size, learning_rate, head_only, groups
         covs = self._covariances.fit_transform(X)
         
         # Add regularization to ensure positive definiteness, especially for short 
@@ -441,6 +445,17 @@ class ModelFactory:
     ) -> BaseModelAdapter:
         n_times = n_times or int(sfreq * 4.0)
 
+        if model_name == "cbramod":
+            return TorchModelAdapter(
+                model_name,
+                CBraModClassifier(
+                    n_chans=n_chans,
+                    n_times=n_times,
+                    n_classes=n_classes,
+                    sfreq=sfreq,
+                    pretrained_path=DEFAULT_CBRAMOD_WEIGHTS,
+                ),
+            )
         if model_name == "riemann-mdm":
             return RiemannMDMAdapter()
         if model_name == "s4d":
@@ -477,21 +492,12 @@ class ModelFactory:
                 ),
             )
         raise ValueError(
-            "Unknown model '%s'. Available models: eegnet, deepconvnet, "
-            "shallowconvnet, riemann-mdm, s4d, hybrid-net, conformer-lite" % model_name
+            "Unknown model '%s'. Available deployment model: cbramod" % model_name
         )
 
     @staticmethod
     def list_models() -> list[str]:
-        return [
-            "conformer-lite",
-            "deepconvnet",
-            "eegnet",
-            "hybrid-net",
-            "riemann-mdm",
-            "s4d",
-            "shallowconvnet",
-        ]
+        return ["cbramod"]
 
 
 def _build_braindecode_model(

@@ -338,7 +338,11 @@ def distribution_stats(windows: np.ndarray) -> dict[str, Any]:
     }
 
 
-def load_checkpoint_config(checkpoint: Path) -> tuple[NeuroOnlineConfig, dict[str, Any]]:
+def load_checkpoint_config(
+    checkpoint: Path,
+    *,
+    compatible_legacy_versions: tuple[int, ...] = (),
+) -> tuple[NeuroOnlineConfig, dict[str, Any]]:
     sidecar = Path(f"{checkpoint}.neuroonline.pt")
     checkpoint_payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
     payload = (
@@ -354,7 +358,11 @@ def load_checkpoint_config(checkpoint: Path) -> tuple[NeuroOnlineConfig, dict[st
             )
         payload = torch.load(sidecar, map_location="cpu", weights_only=True)
     mechanics_version = int(payload.get("training_mechanics_version", 1))
-    if mechanics_version != NEUROONLINE_TRAINING_MECHANICS_VERSION:
+    allowed_versions = {
+        NEUROONLINE_TRAINING_MECHANICS_VERSION,
+        *(int(version) for version in compatible_legacy_versions),
+    }
+    if mechanics_version not in allowed_versions:
         raise ValueError(
             f"Checkpoint mechanics v{mechanics_version} does not match current "
             f"v{NEUROONLINE_TRAINING_MECHANICS_VERSION}."
@@ -368,6 +376,20 @@ def load_checkpoint_config(checkpoint: Path) -> tuple[NeuroOnlineConfig, dict[st
     return config, payload
 
 
+def _predict_probabilities(
+    adapter: Any,
+    windows: np.ndarray,
+    *,
+    mc_dropout_passes: int,
+) -> np.ndarray:
+    if mc_dropout_passes == 1:
+        return adapter.predict_proba(windows)
+    return adapter.predict_proba(
+        windows,
+        mc_dropout_passes=mc_dropout_passes,
+    )
+
+
 def causal_replay(
     adapter: Any,
     windows: np.ndarray,
@@ -376,6 +398,7 @@ def causal_replay(
     *,
     config: NeuroOnlineConfig,
     n_classes: int,
+    mc_dropout_passes: int = 1,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
     original: deque[np.ndarray] = deque(maxlen=config.recent_samples)
@@ -389,7 +412,11 @@ def causal_replay(
     revision = 0
 
     for index, (window, label) in enumerate(zip(windows, labels, strict=True)):
-        probability = adapter.predict_proba(window[None, ...])[0]
+        probability = _predict_probabilities(
+            adapter,
+            window[None, ...],
+            mc_dropout_passes=mc_dropout_passes,
+        )[0]
         probabilities.append(np.asarray(probability, dtype=np.float32))
         model_revisions.append(revision)
 
@@ -462,6 +489,7 @@ def causal_guarded_replay(
     *,
     config: NeuroOnlineConfig,
     n_classes: int,
+    mc_dropout_passes: int = 1,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[Any, np.ndarray, np.ndarray, list[dict[str, Any]], list[dict[str, Any]]]:
     """Train shadow candidates and replace only after causal accuracy gains."""
@@ -518,14 +546,22 @@ def causal_guarded_replay(
         pending = None
 
     for index, (window, label) in enumerate(zip(windows, labels, strict=True)):
-        probability = active_adapter.predict_proba(window[None, ...])[0]
+        probability = _predict_probabilities(
+            active_adapter,
+            window[None, ...],
+            mc_dropout_passes=mc_dropout_passes,
+        )[0]
         probabilities.append(np.asarray(probability, dtype=np.float32))
         model_revisions.append(active_revision)
         active_prediction = int(np.argmax(probability))
         active_is_correct = int(active_prediction == int(label))
         active_correct += active_is_correct
         if pending is not None:
-            candidate_probability = pending["adapter"].predict_proba(window[None, ...])[0]
+            candidate_probability = _predict_probabilities(
+                pending["adapter"],
+                window[None, ...],
+                mc_dropout_passes=mc_dropout_passes,
+            )[0]
             pending["evaluated_windows"] += 1
             pending["active_correct"] += active_is_correct
             pending["candidate_correct"] += int(
@@ -616,9 +652,14 @@ def predict_in_batches(
     windows: np.ndarray,
     *,
     batch_size: int = 64,
+    mc_dropout_passes: int = 1,
 ) -> np.ndarray:
     batches = [
-        adapter.predict_proba(windows[start : start + batch_size])
+        _predict_probabilities(
+            adapter,
+            windows[start : start + batch_size],
+            mc_dropout_passes=mc_dropout_passes,
+        )
         for start in range(0, len(windows), batch_size)
     ]
     return np.concatenate(batches).astype(np.float32)
@@ -675,6 +716,8 @@ def build_adapter(
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    if args.mc_dropout_passes < 1:
+        raise ValueError("MC dropout passes must be at least 1.")
     checkpoint = args.checkpoint.resolve()
     recording_dir = args.recording.resolve()
     output_dir = args.output.resolve()
@@ -701,6 +744,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             else args.update_batch_size
         ),
         epochs=config.epochs if args.epochs is None else args.epochs,
+        mask_ratio=(
+            config.mask_ratio if args.mask_ratio is None else args.mask_ratio
+        ),
+        consistency_weight=(
+            config.consistency_weight
+            if args.consistency_weight is None
+            else args.consistency_weight
+        ),
+        random_seed=(
+            config.random_seed if args.random_seed is None else args.random_seed
+        ),
     )
     if (
         config.history_threshold != 64
@@ -775,6 +829,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             data.scene_indices,
             config=config,
             n_classes=args.n_classes,
+            mc_dropout_passes=args.mc_dropout_passes,
             progress_callback=show_progress,
         )
     else:
@@ -785,6 +840,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             data.scene_indices,
             config=config,
             n_classes=args.n_classes,
+            mc_dropout_passes=args.mc_dropout_passes,
             progress_callback=show_progress,
         )
     replay_duration = time.perf_counter() - started
@@ -800,7 +856,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             f"Expected {expected_updates} updates, observed {len(update_history)}."
         )
 
-    posthoc_probabilities = predict_in_batches(adapter, processed)
+    posthoc_probabilities = predict_in_batches(
+        adapter,
+        processed,
+        mc_dropout_passes=args.mc_dropout_passes,
+    )
     output_model = output_dir / args.output_model_name
     adapter.save(output_model)
     output_sidecar = Path(f"{output_model}.neuroonline.pt")
@@ -855,6 +915,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     summary = {
         "schema_version": 1,
         "simulation": "causal_predict_then_update_neuroonline_realtime_replay",
+        "mc_dropout_passes": int(args.mc_dropout_passes),
         "replacement_policy": {
             "gate": args.replacement_gate,
             "criterion": (
@@ -948,7 +1009,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recording", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--model-name", default="shallowconvnet")
+    parser.add_argument("--model-name", default="cbramod")
     parser.add_argument("--sfreq", type=float, default=200.0)
     parser.add_argument("--n-classes", type=int, default=3)
     parser.add_argument("--history-threshold", type=int, default=64)
@@ -957,6 +1018,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float)
     parser.add_argument("--update-batch-size", type=int)
     parser.add_argument("--epochs", type=int)
+    parser.add_argument("--mask-ratio", type=float)
+    parser.add_argument("--consistency-weight", type=float)
+    parser.add_argument("--random-seed", type=int)
+    parser.add_argument("--mc-dropout-passes", type=int, default=1)
     parser.add_argument("--calibration-dataset", type=Path)
     parser.add_argument("--calibration-feature-key", default="processed_windows")
     parser.add_argument(
@@ -977,7 +1042,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--output-model-name",
-        default="shallowconvnet_seed2026_after_online_replay.pt",
+        default="cbramod_seed2026_after_online_replay.pt",
     )
     return parser
 

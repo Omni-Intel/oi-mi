@@ -109,7 +109,6 @@ def train_and_predict(
     epochs: int,
     batch_size: int,
     learning_rate: float,
-    patience: int,
     head_only: bool = False,
     pretrained_state_path: Path | None = None,
     mc_dropout_passes: int = 8,
@@ -129,7 +128,6 @@ def train_and_predict(
         epochs=epochs,
         batch_size=batch_size,
         learning_rate=learning_rate,
-        patience=patience,
         head_only=head_only,
     )
     probabilities = model.predict_proba(X_test, mc_dropout_passes=mc_dropout_passes)
@@ -141,7 +139,7 @@ def train_and_predict(
 @click.option("--source-subject", "source_subjects", multiple=True, required=True)
 @click.option("--target-subject", required=True)
 @click.option("--test-chunk", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
-@click.option("--model", "model_name", type=str, default="eegnet", show_default=True)
+@click.option("--model", "model_name", type=str, default="cbramod", show_default=True)
 @click.option("--sfreq", type=float, default=200.0, show_default=True)
 @click.option("--threshold", type=float, default=0.5, show_default=True)
 @click.option("--smooth", "smooth_sizes", type=int, multiple=True, default=(1, 3, 5))
@@ -153,7 +151,6 @@ def train_and_predict(
 @click.option("--batch-size", type=int, default=32, show_default=True)
 @click.option("--learning-rate", type=float, default=1e-3, show_default=True)
 @click.option("--finetune-learning-rate", type=float, default=3e-4, show_default=True)
-@click.option("--patience", type=int, default=10, show_default=True)
 @click.option("--mc-dropout-passes", type=int, default=8, show_default=True)
 @click.option("--seed", type=int, default=42, show_default=True)
 @click.option("--output-json", type=click.Path(dir_okay=False, path_type=Path), default=None)
@@ -174,7 +171,6 @@ def main(
     batch_size: int,
     learning_rate: float,
     finetune_learning_rate: float,
-    patience: int,
     mc_dropout_passes: int,
     seed: int,
     output_json: Path | None,
@@ -224,7 +220,6 @@ def main(
         epochs=pretrain_epochs,
         batch_size=batch_size,
         learning_rate=learning_rate,
-        patience=patience,
         head_only=False,
     )
     source_model.save(pretrain_path)
@@ -239,7 +234,6 @@ def main(
         epochs=pretrain_epochs,
         batch_size=batch_size,
         learning_rate=learning_rate,
-        patience=patience,
         mc_dropout_passes=mc_dropout_passes,
     )
 
@@ -253,7 +247,6 @@ def main(
         epochs=finetune_epochs,
         batch_size=batch_size,
         learning_rate=finetune_learning_rate,
-        patience=patience,
         pretrained_state_path=pretrain_path,
         head_only=False,
         mc_dropout_passes=mc_dropout_passes,
@@ -269,7 +262,6 @@ def main(
         epochs=finetune_epochs,
         batch_size=batch_size,
         learning_rate=finetune_learning_rate,
-        patience=patience,
         pretrained_state_path=pretrain_path,
         head_only=True,
         mc_dropout_passes=mc_dropout_passes,

@@ -9,7 +9,7 @@ from tools.search_neuroonline_online_hyperparams import _validate_resume_report
 
 def _report() -> dict[str, object]:
     return {
-        "schema_version": 2,
+        "schema_version": 4,
         "method": "causal",
         "source_recording": "recording-a",
         "source_checkpoint": {
@@ -21,6 +21,10 @@ def _report() -> dict[str, object]:
             "source_chunks": [{"sha256": "chunk-a"}],
         },
         "fixed": {"random_seed": 2026, "history_threshold": 64},
+        "search_space": {
+            "mask_ratios": [0.1, 0.3, 0.5, 0.7],
+            "lambda_grid": [0.1, 0.25, 0.5, 1.0, 2.0],
+        },
     }
 
 
@@ -42,6 +46,14 @@ class OnlineHyperparameterSearchTests(unittest.TestCase):
         previous = _report()
         current = copy.deepcopy(previous)
         current["fixed"]["random_seed"] = 42
+
+        with self.assertRaisesRegex(ValueError, "different inputs"):
+            _validate_resume_report(previous, current, output=Path("report.json"))
+
+    def test_resume_rejects_changed_mask_search_space(self) -> None:
+        previous = _report()
+        current = copy.deepcopy(previous)
+        current["search_space"]["mask_ratios"] = [0.7]
 
         with self.assertRaisesRegex(ValueError, "different inputs"):
             _validate_resume_report(previous, current, output=Path("report.json"))

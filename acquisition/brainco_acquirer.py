@@ -264,6 +264,41 @@ class BrainCoAcquirer(AbstractAcquirer):
         timestamps = np.arange(required_target, dtype=np.float64) / self.metadata.sfreq
         return eeg, timestamps
 
+    def get_continuous_chunk(self, min_window_sec: float) -> EEGChunk:
+        """Return the retained source-rate cache for continuous preprocessing."""
+
+        if self._client is None or self._sdk is None:
+            raise RuntimeError("BrainCo stream is not started")
+        required_source = int(round(float(min_window_sec) * self.source_sfreq))
+        deadline = time.monotonic() + max(float(min_window_sec), 0.1) + self._ready_timeout_sec
+        while time.monotonic() < deadline:
+            self._drain_eeg_buffer()
+            if (
+                self._cache_sample_count() >= required_source
+                and self._total_samples_seen > self._last_chunk_total_samples
+            ):
+                break
+            time.sleep(0.05)
+        available = self._cache_sample_count()
+        if available < required_source:
+            raise RuntimeError(
+                f"Not enough BrainCo source samples yet: have {available}, need {required_source}"
+            )
+        if self._total_samples_seen <= self._last_chunk_total_samples:
+            raise RuntimeError("BrainCo stream produced no new samples for realtime chunking.")
+        with self._cache_lock:
+            eeg = np.asarray(
+                self._eeg_cache[: self.metadata.n_channels],
+                dtype=np.float32,
+            ).copy()
+        self._last_chunk_total_samples = self._total_samples_seen
+        timestamps = np.arange(eeg.shape[1], dtype=np.float64) / self.source_sfreq
+        return eeg, timestamps
+
+    @property
+    def continuous_sfreq(self) -> float:
+        return float(self.source_sfreq)
+
     def get_new_samples(self) -> EEGChunk:
         if self._client is None or self._sdk is None:
             raise RuntimeError("BrainCo stream is not started")

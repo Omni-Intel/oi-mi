@@ -9,6 +9,7 @@ Python 虚拟环境是平台相关产物：
 - `torch`、`bc-ecap-sdk`、`brainflow`、`pyedflib` 等二进制依赖会按平台安装不同的原生文件
 
 仓库里应该只保存源码和依赖声明。每台机器都应基于同一份依赖配置重新创建自己的本地虚拟环境。
+项目安装脚本把 pip 缓存固定在 `D:\Projects\ncc\.cache\pip`（项目位于其他盘时则使用项目父目录下的 `.cache\pip`），避免大体积 CUDA wheel 写入用户 C 盘缓存。
 
 ## 环境自查
 
@@ -27,8 +28,17 @@ python tools/check_environment.py
 ```powershell
 cd D:\path\to\oi-mi
 py -3.12 setup_local.py
+.\.venv\Scripts\python.exe -m pip install --upgrade --force-reinstall torch==2.12.1+cu130 --index-url https://download.pytorch.org/whl/cu130
+.\.venv\Scripts\python.exe tools\download_cbramod_weights.py
 .\.venv\Scripts\python.exe tools\check_environment.py
 .\.venv\Scripts\python.exe cli.py gui
+```
+
+正式 CBraMod 实验应使用 NVIDIA GPU。安装后确认下面命令输出 `True`，不要在 CPU
+回退状态下开始在线实验：
+
+```powershell
+.\.venv\Scripts\python.exe -c "import torch; print(torch.cuda.is_available(), torch.__version__)"
 ```
 
 不要在 PowerShell/CMD 中执行 `source`，也不要使用全局 `streamlit` 命令启动 GUI。

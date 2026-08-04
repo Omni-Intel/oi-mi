@@ -172,7 +172,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if windows.shape[0] != labels.size:
         raise ValueError("Window and label counts differ.")
 
-    model_name = args.model or str(config.get("model_name", "shallowconvnet"))
+    model_name = args.model or str(config.get("model_name", "cbramod"))
     n_classes = int(config.get("n_classes", int(np.max(labels)) + 1))
     if set(np.unique(labels).tolist()) != set(range(n_classes)):
         raise ValueError("Calibration labels do not cover every configured class.")
@@ -190,6 +190,31 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         enabled=True,
         reuse_latest=False,
         mode=args.search_mode,
+        selection_epochs=(
+            configured_search.selection_epochs
+            if args.selection_epochs is None
+            else args.selection_epochs
+        ),
+        learning_rates=(
+            configured_search.learning_rates
+            if args.learning_rates is None
+            else args.learning_rates
+        ),
+        batch_sizes=(
+            configured_search.batch_sizes
+            if args.batch_sizes is None
+            else args.batch_sizes
+        ),
+        mask_ratios=(
+            configured_search.mask_ratios
+            if args.mask_ratios is None
+            else args.mask_ratios
+        ),
+        consistency_weights=(
+            configured_search.consistency_weights
+            if args.consistency_weights is None
+            else args.consistency_weights
+        ),
     )
 
     _seed_everything(args.search_seed)
@@ -232,6 +257,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         best_config, report, report_path = load_latest_calibration_search(
             calibration_records_dir=args.output,
             base_config=base_config,
+            model_name=model_name,
         )
         if not bool(report.get("deployment_eligible", False)):
             raise RuntimeError(
@@ -383,7 +409,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "source_dataset": str(args.dataset.resolve()),
         "feature_key": args.feature_key,
         "model_name": model_name,
-        "model_unchanged": model_name == "shallowconvnet",
+        "model_unchanged": model_name == "cbramod",
         "dataset": {
             "windows": int(windows.shape[0]),
             "trials": int(np.unique(groups).size),
@@ -430,6 +456,13 @@ def _comma_ints(value: str) -> tuple[int, ...]:
     return values
 
 
+def _comma_floats(value: str) -> tuple[float, ...]:
+    values = tuple(float(item.strip()) for item in value.split(",") if item.strip())
+    if not values:
+        raise argparse.ArgumentTypeError("At least one value is required.")
+    return values
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, required=True)
@@ -443,6 +476,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--search-mode", choices=("staged", "full_grid"), default="staged")
     parser.add_argument("--search-seed", type=int, default=42)
+    parser.add_argument("--selection-epochs", type=int, default=None)
+    parser.add_argument("--learning-rates", type=_comma_floats, default=None)
+    parser.add_argument("--batch-sizes", type=_comma_ints, default=None)
+    parser.add_argument("--mask-ratios", type=_comma_floats, default=None)
+    parser.add_argument("--consistency-weights", type=_comma_floats, default=None)
     parser.add_argument(
         "--reuse-search-report",
         action="store_true",

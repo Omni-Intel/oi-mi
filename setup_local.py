@@ -15,6 +15,7 @@ from typing import List, Optional, Sequence, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 VENV_DIR = PROJECT_ROOT / ".venv"
+PIP_CACHE_DIR = PROJECT_ROOT.parent / ".cache" / "pip"
 REQUIRED_PYTHON = (3, 12)
 
 
@@ -27,12 +28,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _run([str(venv_python), "-m", "pip", "install", "-U", "pip", "setuptools", "wheel"])
     _run([str(venv_python), "-m", "pip", "install", "-e", "."])
 
-    unity_command = [str(venv_python), str(PROJECT_ROOT / "tools" / "download_unity_build.py")]
-    local_unity_zip = os.environ.get("OI_MI_UNITY_BUILD_ZIP")
-    if local_unity_zip:
-        unity_command.extend(["--from-local-zip", local_unity_zip])
-    _run(unity_command)
-
+    _run([str(venv_python), str(PROJECT_ROOT / "tools" / "download_cbramod_weights.py")])
     _run([str(venv_python), str(PROJECT_ROOT / "tools" / "check_environment.py")])
     _print_next_steps()
     return 0
@@ -178,7 +174,14 @@ def _venv_python() -> Path:
 def _run(command: Sequence[str]) -> None:
     printable = " ".join(str(part) for part in command)
     print(f"+ {printable}")
-    subprocess.check_call([str(part) for part in command], cwd=str(PROJECT_ROOT))
+    PIP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    environment = os.environ.copy()
+    environment["PIP_CACHE_DIR"] = str(PIP_CACHE_DIR)
+    subprocess.check_call(
+        [str(part) for part in command],
+        cwd=str(PROJECT_ROOT),
+        env=environment,
+    )
 
 
 def _remove_project_directory(path: Path) -> None:

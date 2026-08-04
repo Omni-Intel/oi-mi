@@ -727,15 +727,46 @@ class StreamWriter:
             class_count,
         )
 
-        outcomes = self._scene_outcomes()
-        completed = [value for value in outcomes.values() if value in {"success", "failed"}]
+        scene_payloads = self._scene_outcome_payloads()
+        completed_payloads = [
+            payload
+            for payload in scene_payloads.values()
+            if payload.get("outcome") in {"success", "failed"}
+        ]
+        completed = [str(payload["outcome"]) for payload in completed_payloads]
         success_count = sum(value == "success" for value in completed)
+        task_by_label: dict[str, dict[str, Any]] = {}
+        for label_id in range(class_count):
+            rows = [
+                payload
+                for payload in completed_payloads
+                if payload.get("label_id") == label_id
+            ]
+            successes = sum(payload.get("outcome") == "success" for payload in rows)
+            task_by_label[str(label_id)] = {
+                "completed_scenes": len(rows),
+                "successful_scenes": successes,
+                "failed_scenes": len(rows) - successes,
+                "success_rate": float(successes / len(rows)) if rows else 0.0,
+            }
+        failure_reasons: dict[str, int] = {}
+        for payload in completed_payloads:
+            if payload.get("outcome") != "failed":
+                continue
+            reason = str(payload.get("reason", "unknown"))
+            failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
         task_metrics = {
             "completed_scenes": len(completed),
             "successful_scenes": success_count,
             "failed_scenes": sum(value == "failed" for value in completed),
             "success_rate": float(success_count / len(completed)) if completed else 0.0,
             "success_rate_wilson_95": self._wilson_interval(success_count, len(completed)),
+            "endpoint_verified_scenes": sum(
+                payload.get("endpoint_matches_safe_lane") is not None
+                for payload in completed_payloads
+            ),
+            "by_label_id": task_by_label,
+            "failure_reasons": failure_reasons,
         }
         return {
             "definitions": {
@@ -753,6 +784,11 @@ class StreamWriter:
                 "scene_prediction": (
                     "mean probability across quality-accepted causally clean "
                     "primary windows in the same Scene"
+                ),
+                "car_task_success": (
+                    "no collision event and Unity endpoint_lane==safe_lane; "
+                    "report separately from decoding accuracy because idle and "
+                    "confidence abstention both map to STOP"
                 ),
             },
             "evaluated_windows": int(np.sum(valid)),
@@ -822,7 +858,13 @@ class StreamWriter:
         return result
 
     def _scene_outcomes(self) -> dict[int, str]:
-        outcomes: dict[int, str] = {}
+        return {
+            scene_index: str(payload.get("outcome", "incomplete"))
+            for scene_index, payload in self._scene_outcome_payloads().items()
+        }
+
+    def _scene_outcome_payloads(self) -> dict[int, dict[str, Any]]:
+        outcomes: dict[int, dict[str, Any]] = {}
         if not self._events_path.exists():
             return outcomes
         for line in self._events_path.read_text(encoding="utf-8").splitlines():
@@ -837,7 +879,7 @@ class StreamWriter:
                 scene_index = int(payload["scene_index"])
             except (KeyError, TypeError, ValueError):
                 continue
-            outcomes[scene_index] = str(payload.get("outcome", "incomplete"))
+            outcomes[scene_index] = dict(payload)
         return outcomes
 
     def _timing_integrity(self) -> dict[str, Any]:

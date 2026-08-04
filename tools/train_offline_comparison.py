@@ -131,7 +131,6 @@ def train_baseline(
     learning_rate: float,
     weight_decay: float,
     label_smoothing: float,
-    patience: int,
     sfreq: float,
 ) -> tuple[TorchModelAdapter, list[dict[str, Any]]]:
     adapter = ModelFactory.get(
@@ -167,7 +166,6 @@ def train_baseline(
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing).to(device)
     best_state: dict[str, torch.Tensor] | None = None
     best_validation: dict[str, Any] | None = None
-    stagnant = 0
     history: list[dict[str, Any]] = []
     val_x, val_y, val_trials = validation
 
@@ -202,11 +200,6 @@ def train_baseline(
         if _is_better(validation_metrics, best_validation):
             best_validation = validation_metrics
             best_state = copy.deepcopy(adapter.model.state_dict())
-            stagnant = 0
-        else:
-            stagnant += 1
-            if stagnant >= patience:
-                break
 
     if best_state is None:
         raise RuntimeError("Baseline training did not produce a checkpoint.")
@@ -225,7 +218,6 @@ def train_neuroonline_offline(
     learning_rate: float,
     weight_decay: float,
     label_smoothing: float,
-    patience: int,
     sfreq: float,
     mask_ratio: float,
     consistency_weight: float,
@@ -278,7 +270,6 @@ def train_neuroonline_offline(
     best_base: dict[str, torch.Tensor] | None = None
     best_modulator: dict[str, torch.Tensor] | None = None
     best_validation: dict[str, Any] | None = None
-    stagnant = 0
     history: list[dict[str, Any]] = []
     val_x, val_y, val_trials = validation
 
@@ -303,11 +294,6 @@ def train_neuroonline_offline(
             best_validation = validation_metrics
             best_base = copy.deepcopy(base.model.state_dict())
             best_modulator = copy.deepcopy(modulator.state_dict())
-            stagnant = 0
-        else:
-            stagnant += 1
-            if stagnant >= patience:
-                break
 
     if best_base is None or best_modulator is None:
         raise RuntimeError("NeuroOnline offline training did not produce a checkpoint.")
@@ -403,7 +389,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "label_smoothing": args.label_smoothing,
-        "patience": args.patience,
+        "fixed_epoch_training": True,
         "mask_ratio": args.mask_ratio,
         "consistency_weight": args.consistency_weight,
         "seeds": args.seeds,
@@ -431,7 +417,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     learning_rate=args.learning_rate,
                     weight_decay=args.weight_decay,
                     label_smoothing=args.label_smoothing,
-                    patience=args.patience,
                     sfreq=sfreq,
                 )
                 predict = lambda values, trained=model: predict_torch(
@@ -453,7 +438,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     learning_rate=args.learning_rate,
                     weight_decay=args.weight_decay,
                     label_smoothing=args.label_smoothing,
-                    patience=args.patience,
                     sfreq=sfreq,
                     mask_ratio=args.mask_ratio,
                     consistency_weight=args.consistency_weight,
@@ -499,7 +483,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=5e-2)
     parser.add_argument("--label-smoothing", type=float, default=0.1)
-    parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--mask-ratio", type=float, default=0.3)
     parser.add_argument("--consistency-weight", type=float, default=0.1)
     return parser.parse_args()

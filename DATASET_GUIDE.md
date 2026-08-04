@@ -155,17 +155,26 @@ Calibration 是“协议驱动的 cue 采集”。
 
 - baseline：60s 睁眼注视中央十字
 - 每次实验都从头校准，不区分新/老被试
-- `4` 个 block
+- 最少 `4` 个 block
 - 每个 block：每类 `5` 个 trial
 - 三类：`left / right / idle`
 - block 间休息：`20s`
+- GUI 持续采集，由工作人员人工结束
+- 可在完整 trial 之间暂停和继续
 
-因此正式采集时间为：
+因此达到默认最少 60 个 trial 的采集时间为：
 
 - baseline：`60s`
 - 60 个 trial × `10s`：`600s`
 - 3 次休息 × `20s`：`60s`
 - 合计：`720s = 12min`
+
+`12min` 是允许结束前的最短正式采集时间，不是持续模式的固定时长。达到 60 trial 后，
+程序继续追加每类各 5 个 trial 的平衡 block，直到工作人员点击结束；结束只在三类累计
+数量相等的 trial 边界生效。暂停请求会等当前 trial 完成后再生效。暂停期间采集器保持
+连接，EEG 仍写入连续原始记录以保留完整来源，但没有 trial cue/control 事件，因此暂停段
+不会被切成训练窗口。GUI 结束采集后只保存数据，不自动训练模型；后续可按需要使用
+`train-from-records` 离线训练。命令行模式没有交互控制，仍按配置的固定 block 数执行并训练。
 
 对训练真正生效的窗，不是整个 trial，而是 `control` 时段中的一部分：
 
@@ -236,11 +245,11 @@ Calibration 是“协议驱动的 cue 采集”。
 
 默认预处理定义在 `utils/preprocessing.py`：
 
-1. 检查非有限值、平直导联和相对异常高噪导联
+1. 对连续源数据检查非有限值、平直导联和相对异常高噪导联
 2. 无 montage 坐标时，以健康导联逐点中位数稳健修复坏导
-3. Common Average Reference
-4. `0.3-40 Hz` 五阶 Butterworth SOS 零相位带通
-5. 记录峰值、超幅比例和坏导比例
+3. 对连续数据做 Common Average Reference、目标采样率重采样和 `0.3-40 Hz` 五阶 Butterworth SOS 零相位带通
+4. 完成连续变换后再切模型窗口
+5. 逐窗记录峰值、超幅比例和坏导比例
 6. 为数值安全将模型输入限制到 `[-150, 150] uV`
 
 对应函数：
@@ -248,12 +257,13 @@ Calibration 是“协议驱动的 cue 采集”。
 - `common_average_reference`
 - `bandpass_filter`
 - `reject_artifacts`
+- `preprocess_eeg_continuous`
 - `preprocess_eeg_window`
 - `filter_and_transform`
 
 这里没有逐窗 z-score：CBraMod 的 MI 预处理也保留微伏幅值，而
 ShallowConvNet 的运动想象特征依赖节律功率变化。`reject_artifacts` 只是兼容旧
-调用的数值保护，真正的质量判定来自 `preprocess_eeg_window().quality`。校准和
+调用的数值保护，正式连续数据的质量判定在切窗后由 `finalize_preprocessed_window` 完成。校准和
 NeuroOnline 只接收 `quality.accepted=True` 的窗口，实时落盘仍保留原始窗口和
 质量字段，便于事后复核。
 

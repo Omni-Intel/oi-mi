@@ -18,6 +18,7 @@ from rich.console import Console
 from rich.table import Table
 
 from acquisition.factory import AcquirerFactory, register_default_acquirers
+from acquisition.neuracle_acquirer import NEURACLE_59_EEG_CHANNEL_NAMES
 from adaptation.mi_protocol import ProtocolConfig
 from game_command_router import get_shared_game_command_router
 from utils.markers import (
@@ -42,7 +43,7 @@ DEFAULT_CONFIG_FILENAME = "config.yaml"
 _PROJECT_DEFAULT_CONFIG_PATH = Path(__file__).with_name(DEFAULT_CONFIG_FILENAME)
 _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
     "subject_id": "S001",
-    "model_name": "riemann-mdm",
+    "model_name": "cbramod",
     "device_type": "neuracle",
     "hardware_dummy_mode": False,
     "sfreq": 200,
@@ -54,7 +55,6 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
     "calibration_epochs": 50,
     "batch_size": 32,
     "learning_rate": 0.001,
-    "early_stopping_patience": 6,
     "collect_block_sec": 10,
     "buffer_sec": 60,
     "protocol": {
@@ -79,6 +79,8 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
         },
         "calibration_blocks": 4,
         "calibration_trials_per_class_per_block": 5,
+        "continuous_collection": True,
+        "minimum_calibration_trials": 60,
         "rest_between_blocks_sec": 20.0,
         "random_seed": 17,
     },
@@ -88,6 +90,7 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
         "neuracle_source_sfreq": 250,
         "neuracle_transport_delay_sec": 0.0,
         "neuracle_eeg_channels": 59,
+        "neuracle_eeg_channel_names": list(NEURACLE_59_EEG_CHANNEL_NAMES),
         "brainco_addr": "",
         "brainco_port": 0,
         "brainco_source_sfreq": 250,
@@ -109,8 +112,9 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
             "host": "127.0.0.1",
             "port": 5005,
             "timeout_sec": 3.0,
+            "visual_onset_delay_sec": 0.0,
             "auto_launch": True,
-            "executable_path": "unity相关/ARPrototype3D-windows-x64/ARPrototype3D.exe",
+            "executable_path": "../oi-car-unity-src/Car_game/Builds/Windows/ARPrototype3D.exe",
             "startup_timeout_sec": 15.0,
             "startup_command_delay_sec": 0.75,
             "startup_sequence": [
@@ -133,7 +137,6 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
         "models_dir": "models_storage",
         "records_dir": "records_storage",
         "record_realtime_default": True,
-        "native_recording_id": "",
     },
     "online_adaptation": {
         "enabled": False,
@@ -167,7 +170,6 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
             "random_seed": 2026,
             "offline_random_seed": 42,
             "offline_epochs": 50,
-            "offline_patience": 50,
             "offline_batch_size": 16,
             "offline_learning_rate": 1e-5,
             "offline_mask_ratio": 0.1,
@@ -177,7 +179,6 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
                 "reuse_latest": False,
                 "mode": "full_grid",
                 "selection_epochs": 50,
-                "selection_patience": 50,
                 "learning_rates": [1e-5, 3e-5, 1e-4, 3e-4, 1e-3],
                 "batch_sizes": [16, 32, 64, 128, 256],
                 "mask_ratios": [0.1, 0.3, 0.5, 0.7],
@@ -197,7 +198,7 @@ _DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
             "boundary_guard_sec": 0.5,
             "balance_pool_per_class": 32,
             "start_delay_sec": 5.0,
-            "random_seed": 17,
+            "random_seed": None,
         },
     },
     "ssvep_game": {
@@ -322,8 +323,26 @@ def load_config(path: Path) -> dict[str, Any]:
             "The NeuroOnline experiment pipeline requires sfreq=200 Hz."
         )
     if str(config.get("device_type", "")).strip().lower() == "neuracle":
+        device_config = config.get("device", {}) or {}
+        eeg_channel_count = int(device_config.get("neuracle_eeg_channels", 59))
+        eeg_channel_names = [
+            str(name).strip()
+            for name in device_config.get(
+                "neuracle_eeg_channel_names",
+                NEURACLE_59_EEG_CHANNEL_NAMES,
+            )
+        ]
+        if len(eeg_channel_names) != eeg_channel_count:
+            raise click.ClickException(
+                "device.neuracle_eeg_channel_names must contain exactly "
+                f"{eeg_channel_count} unique names."
+            )
+        if len({name.upper() for name in eeg_channel_names}) != len(eeg_channel_names):
+            raise click.ClickException(
+                "device.neuracle_eeg_channel_names contains duplicate names."
+            )
         source_sfreq = float(
-            (config.get("device", {}) or {}).get("neuracle_source_sfreq", 250.0)
+            device_config.get("neuracle_source_sfreq", 250.0)
         )
         if not np.isclose(source_sfreq, 250.0):
             raise click.ClickException(
@@ -409,7 +428,7 @@ def _interactive_menu(ctx: click.Context, app: AppContext) -> None:
             model_name = click.prompt(
                 "模型(model registry)",
                 type=click.Choice(model_factory.list_models()),
-                default=str(app.config.get("model_name", "riemann-mdm")),
+                default=str(app.config.get("model_name", "cbramod")),
             )
             calibrate_cmd = ctx.command.get_command(ctx, "calibrate")
             ctx.invoke(
@@ -432,7 +451,7 @@ def _interactive_menu(ctx: click.Context, app: AppContext) -> None:
             model_name = click.prompt(
                 "模型(model registry)",
                 type=click.Choice(model_factory.list_models()),
-                default=str(app.config.get("model_name", "riemann-mdm")),
+                default=str(app.config.get("model_name", "cbramod")),
             )
             device_name = click.prompt(
                 "设备类型(device_type)",
@@ -463,7 +482,7 @@ def _interactive_menu(ctx: click.Context, app: AppContext) -> None:
             model_name = click.prompt(
                 "模型(model registry)",
                 type=click.Choice(model_factory.list_models()),
-                default=str(app.config.get("model_name", "riemann-mdm")),
+                default=str(app.config.get("model_name", "cbramod")),
             )
             device_name = click.prompt(
                 "设备类型(device_type)",
@@ -512,19 +531,18 @@ def _interactive_menu(ctx: click.Context, app: AppContext) -> None:
                 CONSOLE.print(f"9) iti 时长: [green]{trial_timing_cfg.get('iti_sec', 2.0)}[/green]")
                 CONSOLE.print(f"10) 校准 block 数: [green]{protocol_cfg.get('calibration_blocks', 4)}[/green]")
                 CONSOLE.print(f"11) 每类每 block trial 数: [green]{protocol_cfg.get('calibration_trials_per_class_per_block', 5)}[/green]")
-                CONSOLE.print(f"12) 离线训练最大 epoch: [green]{app.config.get('calibration_epochs', 50)}[/green]")
-                CONSOLE.print(f"13) 训练早停 patience: [green]{app.config.get('early_stopping_patience', 6)}[/green]")
-                CONSOLE.print(f"14) block 间休息: [green]{protocol_cfg.get('rest_between_blocks_sec', 20.0)}[/green]")
-                CONSOLE.print(f"15) AR游戏控制启用: [green]{ar_game_cfg.get('enabled', False)}[/green]")
-                CONSOLE.print(f"16) AR游戏主机: [green]{ar_game_cfg.get('host', '127.0.0.1')}[/green]")
-                CONSOLE.print(f"17) AR游戏端口: [green]{ar_game_cfg.get('port', 5005)}[/green]")
-                CONSOLE.print(f"18) AR游戏超时: [green]{ar_game_cfg.get('timeout_sec', 1.0)}[/green]")
-                CONSOLE.print(f"19) AR game auto_launch: [green]{ar_game_cfg.get('auto_launch', False)}[/green]")
-                CONSOLE.print(f"20) AR game executable_path: [green]{ar_game_cfg.get('executable_path', '')}[/green]")
-                CONSOLE.print(f"21) AR game startup_timeout_sec: [green]{ar_game_cfg.get('startup_timeout_sec', 15.0)}[/green]")
+                CONSOLE.print(f"12) 离线训练固定 epoch: [green]{app.config.get('calibration_epochs', 50)}[/green]")
+                CONSOLE.print(f"13) block 间休息: [green]{protocol_cfg.get('rest_between_blocks_sec', 20.0)}[/green]")
+                CONSOLE.print(f"14) AR游戏控制启用: [green]{ar_game_cfg.get('enabled', False)}[/green]")
+                CONSOLE.print(f"15) AR游戏主机: [green]{ar_game_cfg.get('host', '127.0.0.1')}[/green]")
+                CONSOLE.print(f"16) AR游戏端口: [green]{ar_game_cfg.get('port', 5005)}[/green]")
+                CONSOLE.print(f"17) AR游戏超时: [green]{ar_game_cfg.get('timeout_sec', 1.0)}[/green]")
+                CONSOLE.print(f"18) AR game auto_launch: [green]{ar_game_cfg.get('auto_launch', False)}[/green]")
+                CONSOLE.print(f"19) AR game executable_path: [green]{ar_game_cfg.get('executable_path', '')}[/green]")
+                CONSOLE.print(f"20) AR game startup_timeout_sec: [green]{ar_game_cfg.get('startup_timeout_sec', 15.0)}[/green]")
                 CONSOLE.print("0) 返回上级菜单")
 
-                sub_choice = click.prompt("选择要修改的项", type=click.Choice([str(i) for i in range(22)]), default="0")
+                sub_choice = click.prompt("选择要修改的项", type=click.Choice([str(i) for i in range(21)]), default="0")
                 if sub_choice == "0":
                     break
                 elif sub_choice == "1":
@@ -537,7 +555,7 @@ def _interactive_menu(ctx: click.Context, app: AppContext) -> None:
                     val = click.prompt("输入新的被试ID (subject_id)", type=str, default=str(app.config.get("subject_id", "S001")))
                     app.config["subject_id"] = val
                 elif sub_choice == "4":
-                    val = click.prompt("输入新的默认模型 (model_name)", type=str, default=str(app.config.get("model_name", "riemann-mdm")))
+                    val = click.prompt("输入新的默认模型 (model_name)", type=str, default=str(app.config.get("model_name", "cbramod")))
                     app.config["model_name"] = val
                 elif sub_choice == "5":
                     val = click.prompt("control 有效切窗起始偏移 (秒)", type=float, default=float(protocol_cfg.get("control_start_offset_sec", 0.5)))
@@ -561,37 +579,39 @@ def _interactive_menu(ctx: click.Context, app: AppContext) -> None:
                     val = click.prompt("每类每 block trial 数", type=int, default=int(protocol_cfg.get("calibration_trials_per_class_per_block", 5)))
                     protocol_cfg["calibration_trials_per_class_per_block"] = val
                 elif sub_choice == "12":
-                    val = click.prompt("离线训练最大 epoch", type=int, default=int(app.config.get("calibration_epochs", 50)))
+                    val = click.prompt("离线训练固定 epoch", type=int, default=int(app.config.get("calibration_epochs", 50)))
                     app.config["calibration_epochs"] = val
                 elif sub_choice == "13":
-                    val = click.prompt("训练早停 patience", type=int, default=int(app.config.get("early_stopping_patience", 6)))
-                    app.config["early_stopping_patience"] = val
-                elif sub_choice == "14":
                     val = click.prompt("block 间休息时长 (秒)", type=float, default=float(protocol_cfg.get("rest_between_blocks_sec", 20.0)))
                     protocol_cfg["rest_between_blocks_sec"] = val
-                elif sub_choice == "15":
+                elif sub_choice == "14":
                     val = click.confirm("是否启用 AR 游戏 TCP 控制", default=bool(ar_game_cfg.get("enabled", False)))
                     ar_game_cfg["enabled"] = val
-                elif sub_choice == "16":
+                elif sub_choice == "15":
                     val = click.prompt("输入 AR 游戏主机地址", type=str, default=str(ar_game_cfg.get("host", "127.0.0.1")))
                     ar_game_cfg["host"] = val
-                elif sub_choice == "17":
+                elif sub_choice == "16":
                     val = click.prompt("输入 AR 游戏端口", type=int, default=int(ar_game_cfg.get("port", 5005)))
                     ar_game_cfg["port"] = val
-                elif sub_choice == "18":
+                elif sub_choice == "17":
                     val = click.prompt("输入 AR 游戏 TCP 超时(秒)", type=float, default=float(ar_game_cfg.get("timeout_sec", 3.0)))
                     ar_game_cfg["timeout_sec"] = val
-                elif sub_choice == "19":
+                elif sub_choice == "18":
                     val = click.confirm("Enable local Unity exe auto-launch", default=bool(ar_game_cfg.get("auto_launch", False)))
                     ar_game_cfg["auto_launch"] = val
-                elif sub_choice == "20":
+                elif sub_choice == "19":
                     val = click.prompt(
                         "Unity executable path",
                         type=str,
-                        default=str(ar_game_cfg.get("executable_path", "unity相关/ARPrototype3D-windows-x64/ARPrototype3D.exe")),
+                        default=str(
+                            ar_game_cfg.get(
+                                "executable_path",
+                                "../oi-car-unity-src/Car_game/Builds/Windows/ARPrototype3D.exe",
+                            )
+                        ),
                     )
                     ar_game_cfg["executable_path"] = val
-                elif sub_choice == "21":
+                elif sub_choice == "20":
                     val = click.prompt(
                         "Unity startup timeout seconds",
                         type=float,
@@ -847,6 +867,10 @@ def build_acquirer(
         kwargs["source_sfreq"] = float(device_cfg.get("neuracle_source_sfreq", 250.0))
         kwargs["transport_delay_sec"] = float(
             device_cfg.get("neuracle_transport_delay_sec", 0.0)
+        )
+        kwargs["eeg_channel_names"] = device_cfg.get(
+            "neuracle_eeg_channel_names",
+            NEURACLE_59_EEG_CHANNEL_NAMES,
         )
     if device_name == "brainco":
         kwargs["source_sfreq"] = float(device_cfg.get("brainco_source_sfreq", 250.0))
@@ -1143,7 +1167,6 @@ def calibrate(
         epochs=epochs,
         batch_size=int(config["batch_size"]),
         learning_rate=float(config["learning_rate"]),
-        patience=int(config["early_stopping_patience"]),
         head_only=False,
     )
     app.console.print(
@@ -1243,11 +1266,12 @@ def run(
     """Run the realtime decoder."""
 
     config = app.config
+    adaptation_cfg = config.get("online_adaptation", {}) or {}
+    selected_device = device_name or str(config["device_type"])
     # Keep the web-control endpoint and decoder in the same process so both
     # share one Unity TCP router/connection.
     start_web_command_server(config)
     selected_model = model_name or str(config["model_name"])
-    selected_device = device_name or str(config["device_type"])
     acquirer = build_acquirer(device_name=selected_device, config=config)
     effective_n_channels = int(acquirer.metadata.n_channels)
     n_times = int(float(config["sfreq"]) * float(config["window_sec"]))
@@ -1280,19 +1304,6 @@ def run(
     adaptation_cfg = config.get("online_adaptation", {})
     simulation_cfg = adaptation_cfg.get("simulation", {})
     cued_cfg = adaptation_cfg.get("cued_labels", {})
-    if (
-        not test_mode
-        and bool(adaptation_cfg.get("enabled", False))
-        and str(adaptation_cfg.get("strategy", "")).strip().lower() == "neuroonline"
-        and effective_device_name(config, selected_device) != "dummy"
-        and not str(
-            config.get("storage", {}).get("native_recording_id", "") or ""
-        ).strip()
-    ):
-        raise click.ClickException(
-            "正式NeuroOnline实验必须先在config.yaml的"
-            " storage.native_recording_id 填写博瑞康BDF/NDF文件名或采集会话编号。"
-        )
     simulation_enabled = (
         bool(adaptation_cfg.get("enabled", False))
         and bool(simulation_cfg.get("enabled", False))
@@ -1538,7 +1549,6 @@ def train_from_records(
         epochs=int(config.get("calibration_epochs", 50)),
         batch_size=int(config["batch_size"]),
         learning_rate=float(config["learning_rate"]),
-        patience=int(config["early_stopping_patience"]),
         head_only=head_only,
         groups=trial_groups,
         progress_callback=report_training_progress,
@@ -1673,7 +1683,7 @@ def seed_dummy_decoders_cmd(
     from tools.seed_dummy_decoders import DEFAULT_PROFILE, seed_profile, write_manifest
 
     target_dir = output_dir or DUMMY_DECODER_ASSET_DIR
-    model_names = list(models) if models else ["eegnet", "riemann-mdm"]
+    model_names = list(models) if models else ["cbramod"]
     profile = dict(DEFAULT_PROFILE)
     profile.update(
         {

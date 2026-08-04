@@ -21,6 +21,8 @@ PROTOCOL_EVENT_CODES = {
     "baseline_end": 111,
     "block_start": 120,
     "block_end": 121,
+    "operator_pause_start": 122,
+    "operator_pause_end": 123,
     "fixation_on": 130,
     "cue_left_on": 131,
     "cue_right_on": 132,

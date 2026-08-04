@@ -9,8 +9,10 @@ import importlib.metadata
 import json
 import os
 import platform
+import random
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -36,15 +38,17 @@ from adaptation.mi_protocol import (
     ProtocolConfig,
     SessionPlan,
     build_session_plan,
+    generate_block_sequence,
 )
 from adaptation.neuroonline import NeuroOnlineConfig, NeuroOnlineModelAdapter
 from adaptation.session_recorder import SessionRecorder
 from models.factory import BaseModelAdapter, TorchModelAdapter
 from utils.markers import MarkerBackend, PROTOCOL_EVENT_CODES
 from utils.preprocessing import (
-    DEFAULT_PREPROCESSING,
-    preprocess_eeg_window,
-    resample_eeg,
+    ContinuousPreprocessingResult,
+    continuous_preprocessing_metadata,
+    finalize_preprocessed_window,
+    preprocess_eeg_continuous,
 )
 
 LABEL_SEQUENCE: list[tuple[int, str]] = [(LABEL_TO_ID[label], label) for label in ("left", "right", "idle")]
@@ -69,7 +73,6 @@ def _offline_parameter_snapshot(config: NeuroOnlineConfig) -> dict[str, Any]:
         "weight_decay": config.weight_decay,
         "label_smoothing": config.label_smoothing,
         "offline_epochs": config.offline_epochs,
-        "offline_patience": config.offline_patience,
     }
 
 
@@ -77,13 +80,120 @@ def _offline_parameter_snapshot(config: NeuroOnlineConfig) -> dict[str, Any]:
 class CalibrationResult:
     """Result metadata for a calibration run."""
 
-    model_path: Path
+    model_path: Path | None
     metrics: dict[str, float]
     windows_collected: int
     calibration_data_path: Path | None = None
     session_dir: Path | None = None
     hyperparameter_search_path: Path | None = None
     selected_hyperparameters: dict[str, Any] | None = None
+    training_performed: bool = True
+
+
+class CalibrationRunControl:
+    """Thread-safe operator controls for an open-ended calibration run."""
+
+    def __init__(self, *, minimum_trials: int) -> None:
+        self.minimum_trials = max(int(minimum_trials), 3)
+        self._lock = threading.RLock()
+        self._pause_requested = False
+        self._stop_requested = False
+        self._paused = False
+        self._collection_finished = False
+        self._failed = False
+        self._completed_trials = 0
+        self._class_counts = {label: 0 for label in LABEL_TO_ID}
+
+    def request_pause(self) -> bool:
+        with self._lock:
+            if self._stop_requested or self._collection_finished or self._failed:
+                return False
+            self._pause_requested = True
+            return True
+
+    def request_resume(self) -> bool:
+        with self._lock:
+            if self._collection_finished or self._failed:
+                return False
+            changed = self._pause_requested or self._paused
+            self._pause_requested = False
+            return changed
+
+    def request_stop(self) -> bool:
+        with self._lock:
+            if (
+                self._completed_trials < self.minimum_trials
+                or self._collection_finished
+                or self._failed
+            ):
+                return False
+            self._stop_requested = True
+            self._pause_requested = False
+            return True
+
+    def mark_paused(self, value: bool) -> None:
+        with self._lock:
+            self._paused = bool(value)
+
+    def mark_trial_completed(self, label: str) -> None:
+        with self._lock:
+            if label not in self._class_counts:
+                raise ValueError(f"Unknown calibration label: {label}")
+            self._completed_trials += 1
+            self._class_counts[label] += 1
+
+    def should_pause(self) -> bool:
+        with self._lock:
+            return self._pause_requested and not self._stop_requested
+
+    def should_finish(self) -> bool:
+        with self._lock:
+            counts = tuple(self._class_counts.values())
+            balanced = bool(counts) and len(set(counts)) == 1
+            return bool(
+                self._stop_requested
+                and self._completed_trials >= self.minimum_trials
+                and balanced
+            )
+
+    def mark_collection_finished(self) -> None:
+        with self._lock:
+            self._collection_finished = True
+            self._paused = False
+            self._pause_requested = False
+
+    def mark_failed(self) -> None:
+        with self._lock:
+            self._failed = True
+            self._paused = False
+            self._pause_requested = False
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            counts = dict(self._class_counts)
+            balanced = len(set(counts.values())) == 1
+            if self._failed:
+                state = "failed"
+            elif self._collection_finished:
+                state = "training"
+            elif self._stop_requested:
+                state = "stop_pending"
+            elif self._paused:
+                state = "paused"
+            elif self._pause_requested:
+                state = "pause_pending"
+            else:
+                state = "collecting"
+            return {
+                "state": state,
+                "completed_trials": self._completed_trials,
+                "minimum_trials": self.minimum_trials,
+                "class_counts": counts,
+                "balanced": balanced,
+                "can_request_stop": self._completed_trials >= self.minimum_trials,
+                "stop_requested": self._stop_requested,
+                "pause_requested": self._pause_requested,
+            }
 
 
 class Calibrator:
@@ -143,16 +253,62 @@ class Calibrator:
         epochs: int,
         batch_size: int,
         learning_rate: float,
-        patience: int,
         head_only: bool,
         include_practice: bool = True,
         heartbeat: Callable[[], None] | None = None,
+        run_control: CalibrationRunControl | None = None,
+        train_after_collection: bool = True,
     ) -> CalibrationResult:
         del duration_sec
         if head_only:
             raise ValueError(
                 "Head-only calibration was removed; each experiment must train "
                 "a fresh full decoder."
+            )
+        if not train_after_collection:
+            plan = build_session_plan(self._protocol)
+            (
+                session_dir,
+                _raw_windows,
+                processed_windows,
+                _labels,
+                _trial_groups,
+                session_metadata,
+            ) = self._collect_training_data(
+                plan=plan,
+                include_practice=include_practice,
+                heartbeat=heartbeat,
+                run_control=run_control,
+            )
+            session_metadata["training"] = {
+                "performed": False,
+                "reason": "collection_only",
+            }
+            windows_collected = int(processed_windows.shape[0])
+            self._console.print(
+                "[bold green]采集完成，数据已保存；本次未执行模型训练[/bold green]"
+            )
+            self._write_session_summary(
+                session_dir,
+                metrics={},
+                windows_collected=windows_collected,
+                session_metadata=session_metadata,
+                training_performed=False,
+            )
+            self._seal_session_bundle(session_dir, include_model_files=False)
+            if heartbeat is not None:
+                heartbeat()
+            return CalibrationResult(
+                model_path=None,
+                metrics={},
+                windows_collected=windows_collected,
+                calibration_data_path=(
+                    session_dir / "training_windows_main.npz"
+                    if session_dir is not None
+                    else None
+                ),
+                session_dir=session_dir,
+                training_performed=False,
             )
         reused_search_report: dict[str, Any] | None = None
         reuse_search_error: str | None = None
@@ -180,6 +336,7 @@ class Calibrator:
                 ) = load_latest_calibration_search(
                     calibration_records_dir=self._calibration_records_dir,
                     base_config=self._neuroonline_config,
+                    model_name=base_template.model_name,
                 )
             except RuntimeError as exc:
                 reuse_search_error = str(exc)
@@ -216,6 +373,7 @@ class Calibrator:
             plan=plan,
             include_practice=include_practice,
             heartbeat=heartbeat,
+            run_control=run_control,
         )
         if reused_search_report is not None:
             session_metadata["hyperparameter_search"] = {
@@ -316,8 +474,8 @@ class Calibrator:
         if self._neuroonline_config.enabled:
             self._console.print(
                 "[bold yellow]正在执行 NeuroOnline 离线训练 "
-                f"(最多 {self._neuroonline_config.offline_epochs} epochs，"
-                f"patience={self._neuroonline_config.offline_patience})。"
+                f"(固定 {self._neuroonline_config.offline_epochs} epochs，"
+                "结束后恢复验证表现最佳的 epoch)。"
                 "在出现“校准完成”和模型保存路径前，请勿返回、刷新或关闭页面。[/bold yellow]"
             )
         if heartbeat is not None:
@@ -355,7 +513,6 @@ class Calibrator:
             epochs=epochs,
             batch_size=batch_size,
             learning_rate=learning_rate,
-            patience=patience,
             head_only=False,
             groups=trial_groups,
             progress_callback=report_training_progress,
@@ -400,6 +557,7 @@ class Calibrator:
         plan: SessionPlan,
         include_practice: bool = True,
         heartbeat: Callable[[], None] | None = None,
+        run_control: CalibrationRunControl | None = None,
     ) -> tuple[
         Path | None,
         np.ndarray,
@@ -424,15 +582,32 @@ class Calibrator:
             if include_practice and plan.practice_labels:
                 self._run_practice(plan, recorder=recorder, heartbeat=heartbeat)
             self._run_baseline(plan, recorder=recorder, heartbeat=heartbeat)
-            self._run_formal_blocks(plan, recorder=recorder, heartbeat=heartbeat, trials=trials)
+            self._run_formal_blocks(
+                plan,
+                recorder=recorder,
+                heartbeat=heartbeat,
+                trials=trials,
+                run_control=run_control,
+            )
             self._emit_event(recorder, "session_end", phase="session")
         finally:
-            self._flush_recorder(recorder)
-            self._acquirer.stop_stream()
-            if heartbeat is not None:
-                heartbeat()
+            try:
+                self._flush_recorder(recorder)
+            finally:
+                try:
+                    self._acquirer.stop_stream()
+                finally:
+                    if run_control is not None:
+                        run_control.mark_collection_finished()
+                    if heartbeat is not None:
+                        heartbeat()
 
-        session_metadata = self._build_session_metadata(plan, session_stamp=session_stamp, trials=trials)
+        session_metadata = self._build_session_metadata(
+            plan,
+            session_stamp=session_stamp,
+            trials=trials,
+            run_control=run_control,
+        )
         if session_dir is not None:
             recorder.export(session_dir, metadata=session_metadata)
         eeg = self._get_continuous_eeg(session_dir=session_dir, recorder=recorder)
@@ -501,7 +676,17 @@ class Calibrator:
         recorder: SessionRecorder,
         heartbeat: Callable[[], None] | None,
         trials: list[dict[str, Any]],
+        run_control: CalibrationRunControl | None = None,
     ) -> None:
+        if run_control is not None and self._protocol.continuous_collection:
+            self._run_continuous_formal_blocks(
+                plan,
+                recorder=recorder,
+                heartbeat=heartbeat,
+                trials=trials,
+                run_control=run_control,
+            )
+            return
         total_blocks = len(plan.blocks)
         for block_index, sequence in enumerate(plan.blocks):
             self._console.print(f"[bold cyan]Block {block_index + 1}/{total_blocks}[/bold cyan] 共 {len(sequence)} 个 trial")
@@ -529,6 +714,129 @@ class Calibrator:
                     heartbeat=heartbeat,
                     stage_name=f"Block {block_index + 1} 休息",
                 )
+
+    def _run_continuous_formal_blocks(
+        self,
+        plan: SessionPlan,
+        *,
+        recorder: SessionRecorder,
+        heartbeat: Callable[[], None] | None,
+        trials: list[dict[str, Any]],
+        run_control: CalibrationRunControl,
+    ) -> None:
+        """Append balanced blocks until the operator ends at a balanced boundary."""
+
+        rng = random.Random(self._protocol.random_seed)
+        counts = {
+            label: self._protocol.calibration_trials_per_class_per_block
+            for label in LABEL_TO_ID
+        }
+        block_index = 0
+        while True:
+            if not self._wait_for_operator(
+                recorder=recorder,
+                heartbeat=heartbeat,
+                run_control=run_control,
+            ):
+                return
+            sequence = generate_block_sequence(counts, rng=rng)
+            self._console.print(
+                f"[bold cyan]Block {block_index + 1}[/bold cyan] "
+                f"共 {len(sequence)} 个 trial；完成后可继续追加"
+            )
+            self._emit_event(
+                recorder,
+                "block_start",
+                phase="formal",
+                block_index=block_index,
+                open_ended=True,
+            )
+            block_completed = True
+            for trial_index, label in enumerate(sequence):
+                if not self._wait_for_operator(
+                    recorder=recorder,
+                    heartbeat=heartbeat,
+                    run_control=run_control,
+                ):
+                    block_completed = False
+                    break
+                trial_info = self._run_trial(
+                    label=label,
+                    recorder=recorder,
+                    heartbeat=heartbeat,
+                    trial_index=trial_index,
+                    block_index=block_index,
+                    phase="formal",
+                    collect_trial=True,
+                )
+                if trial_info is not None:
+                    trials.append(trial_info)
+                    run_control.mark_trial_completed(label)
+            self._emit_event(
+                recorder,
+                "block_end",
+                phase="formal",
+                block_index=block_index,
+                completed=block_completed,
+            )
+            if not block_completed or run_control.should_finish():
+                return
+            block_index += 1
+            if plan.rest_between_blocks_sec > 0:
+                self._console.print(
+                    f"[bold yellow]休息 {plan.rest_between_blocks_sec:.0f} 秒，"
+                    "请放松但不要大幅动作[/bold yellow]"
+                )
+                self._sleep_with_recording(
+                    plan.rest_between_blocks_sec,
+                    recorder=recorder,
+                    heartbeat=heartbeat,
+                    stage_name=f"Block {block_index} 休息",
+                )
+
+    def _wait_for_operator(
+        self,
+        *,
+        recorder: SessionRecorder,
+        heartbeat: Callable[[], None] | None,
+        run_control: CalibrationRunControl,
+    ) -> bool:
+        """Honor pause and completion requests only between complete trials."""
+
+        if run_control.should_finish():
+            return False
+        if not run_control.should_pause():
+            return True
+        snapshot = run_control.snapshot()
+        run_control.mark_paused(True)
+        self._console.print("[bold yellow]PAUSED 请休息，准备好后由工作人员继续[/bold yellow]")
+        self._emit_event(
+            recorder,
+            "operator_pause_start",
+            phase="operator_pause",
+            completed_trials=snapshot["completed_trials"],
+        )
+        while run_control.should_pause():
+            self._flush_recorder(recorder)
+            self._update_stage_progress(
+                stage_name="人工暂停",
+                elapsed_sec=0.0,
+                duration_sec=0.0,
+            )
+            if heartbeat is not None:
+                heartbeat()
+            time.sleep(0.05)
+        run_control.mark_paused(False)
+        self._emit_event(
+            recorder,
+            "operator_pause_end",
+            phase="operator_pause",
+            completed_trials=run_control.snapshot()["completed_trials"],
+        )
+        if run_control.should_finish():
+            return False
+        self._console.print("[bold cyan]RESUMED 校准继续[/bold cyan]")
+        return True
 
     def _run_trial(
         self,
@@ -656,6 +964,11 @@ class Calibrator:
         window_stop_samples: list[int] = []
         window_offsets_sec: list[float] = []
         rejected_windows = 0
+        continuous = preprocess_eeg_continuous(
+            eeg,
+            source_sfreq=self._source_sfreq,
+            target_sfreq=self._sfreq,
+        )
 
         for trial_group, trial in enumerate(trials):
             control_on = int(trial["control_on_sample"])
@@ -665,18 +978,23 @@ class Calibrator:
                 stop = start + source_window_samples
                 if stop > eeg.shape[1]:
                     continue
-                source_window = eeg[:, start:stop].astype(np.float32)
-                window = resample_eeg(
-                    source_window,
-                    source_sfreq=self._source_sfreq,
-                    target_sfreq=self._sfreq,
-                )
+                target_start = int(round(start * self._sfreq / self._source_sfreq))
+                target_stop = target_start + target_window_samples
+                window = continuous.raw_data[:, target_start:target_stop]
                 if window.shape[1] != target_window_samples:
                     raise RuntimeError(
-                        f"Resampled calibration window has {window.shape[1]} points; "
+                        f"Continuous calibration window has {window.shape[1]} points; "
                         f"expected {target_window_samples}."
                     )
-                result = preprocess_eeg_window(window, sfreq=self._sfreq)
+                filtered_window = continuous.data[:, target_start:target_stop]
+                nonfinite_fraction = float(
+                    np.mean(continuous.source_nonfinite_mask[:, start:stop])
+                )
+                result = finalize_preprocessed_window(
+                    filtered_window,
+                    bad_channel_indices=continuous.bad_channel_indices,
+                    nonfinite_fraction=nonfinite_fraction,
+                )
                 if not result.quality.accepted:
                     rejected_windows += 1
                     for reason in result.quality.reasons:
@@ -735,6 +1053,7 @@ class Calibrator:
             if self._protocol.export_window_sec is not None:
                 alt_raw, alt_processed, alt_labels, alt_groups, alt_quality = self._build_aux_windows(
                     eeg=eeg,
+                    continuous=continuous,
                     trials=trials,
                     window_sec=float(self._protocol.export_window_sec),
                     stride_sec=float(self._protocol.export_stride_sec),
@@ -760,6 +1079,7 @@ class Calibrator:
         self,
         *,
         eeg: np.ndarray,
+        continuous: ContinuousPreprocessingResult,
         trials: list[dict[str, Any]],
         window_sec: float,
         stride_sec: float,
@@ -790,18 +1110,23 @@ class Calibrator:
                 stop = start + source_window_samples
                 if stop > eeg.shape[1]:
                     continue
-                source_window = eeg[:, start:stop].astype(np.float32)
-                window = resample_eeg(
-                    source_window,
-                    source_sfreq=self._source_sfreq,
-                    target_sfreq=self._sfreq,
-                )
+                target_start = int(round(start * self._sfreq / self._source_sfreq))
+                target_stop = target_start + target_window_samples
+                window = continuous.raw_data[:, target_start:target_stop]
                 if window.shape[1] != target_window_samples:
                     raise RuntimeError(
-                        f"Resampled auxiliary window has {window.shape[1]} points; "
+                        f"Continuous auxiliary window has {window.shape[1]} points; "
                         f"expected {target_window_samples}."
                     )
-                result = preprocess_eeg_window(window, sfreq=self._sfreq)
+                filtered_window = continuous.data[:, target_start:target_stop]
+                nonfinite_fraction = float(
+                    np.mean(continuous.source_nonfinite_mask[:, start:stop])
+                )
+                result = finalize_preprocessed_window(
+                    filtered_window,
+                    bad_channel_indices=continuous.bad_channel_indices,
+                    nonfinite_fraction=nonfinite_fraction,
+                )
                 if not result.quality.accepted:
                     rejected_windows += 1
                     for reason in result.quality.reasons:
@@ -918,7 +1243,11 @@ class Calibrator:
         *,
         session_stamp: str,
         trials: list[dict[str, Any]],
+        run_control: CalibrationRunControl | None = None,
     ) -> dict[str, Any]:
+        open_ended = bool(
+            run_control is not None and self._protocol.continuous_collection
+        )
         return {
             "session_id": session_stamp,
             "protocol_name": "mi_game_control_recalibration_protocol_v2",
@@ -926,6 +1255,17 @@ class Calibrator:
             "sfreq": self._sfreq,
             "source_sfreq": self._source_sfreq,
             "n_channels": self._acquirer.metadata.n_channels,
+            "channel_names": list(
+                getattr(self._acquirer.metadata, "channel_names", ())
+            ),
+            "channel_types": list(
+                getattr(self._acquirer.metadata, "channel_types", ())
+            ),
+            "channel_selection": getattr(
+                self._acquirer,
+                "channel_diagnostics",
+                {},
+            ),
             "timestamp_domain": getattr(
                 self._acquirer.metadata,
                 "timestamp_domain",
@@ -943,18 +1283,32 @@ class Calibrator:
                 self._protocol.control_stop_offset_sec,
             ],
             "planned_collection_duration_sec": (
-                sum(segment.duration_sec for segment in plan.baseline_segments)
-                + plan.total_formal_trials * plan.trial_timing.total_sec
-                + max(len(plan.blocks) - 1, 0) * plan.rest_between_blocks_sec
+                None
+                if open_ended
+                else (
+                    sum(segment.duration_sec for segment in plan.baseline_segments)
+                    + plan.total_formal_trials * plan.trial_timing.total_sec
+                    + max(len(plan.blocks) - 1, 0) * plan.rest_between_blocks_sec
+                )
             ),
-            "formal_trial_count": plan.total_formal_trials,
+            "formal_trial_count": len(trials),
+            "collection_mode": (
+                "operator_terminated_continuous_blocks"
+                if open_ended
+                else "fixed_session_plan"
+            ),
+            "minimum_calibration_trials": (
+                run_control.minimum_trials
+                if run_control is not None
+                else plan.total_formal_trials
+            ),
+            "operator_control_final": (
+                run_control.snapshot() if run_control is not None else None
+            ),
             "validation_grouping": "trial_ids",
             "preprocessing": {
-                **DEFAULT_PREPROCESSING.as_dict(),
-                "reference": "common_average",
-                "filter_design": "Butterworth SOS zero-phase",
-                "bad_channel_repair": "pointwise_median_of_good_channels",
-                "input_unit": "uV",
+                **continuous_preprocessing_metadata(),
+                "continuous_span": "complete_calibration_session",
             },
             "trial_timing": {
                 "fixation_sec": plan.trial_timing.fixation_sec,
@@ -984,11 +1338,13 @@ class Calibrator:
         metrics: dict[str, float],
         windows_collected: int,
         session_metadata: dict[str, Any],
+        training_performed: bool = True,
     ) -> None:
         if session_dir is None:
             return
         summary = dict(session_metadata)
-        summary["model_path"] = str(self._model_path)
+        summary["training_performed"] = bool(training_performed)
+        summary["model_path"] = str(self._model_path) if training_performed else None
         summary["windows_collected"] = windows_collected
         summary["metrics"] = metrics
         metadata_path = session_dir / "metadata.json"
@@ -999,16 +1355,22 @@ class Calibrator:
             os.fsync(handle.fileno())
         os.replace(temporary, metadata_path)
 
-    def _seal_session_bundle(self, session_dir: Path | None) -> None:
+    def _seal_session_bundle(
+        self,
+        session_dir: Path | None,
+        *,
+        include_model_files: bool = True,
+    ) -> None:
         if session_dir is None:
             return
         metadata_path = session_dir / "metadata.json"
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         model_files: list[dict[str, Any]] = []
-        for path in (
+        candidate_model_paths = (
             self._model_path,
             Path(f"{self._model_path}.neuroonline.pt"),
-        ):
+        ) if include_model_files else ()
+        for path in candidate_model_paths:
             if path.exists():
                 model_files.append(
                     {

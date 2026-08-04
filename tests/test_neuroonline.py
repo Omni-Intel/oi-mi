@@ -61,6 +61,24 @@ class _BatchNormDropoutDecoder(nn.Module):
         return self.classifier(self.features(inputs).squeeze(-1))
 
 
+class _TinyCBraDecoder(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.backbone = nn.Module()
+        self.backbone.projection = nn.Linear(2, 4)
+        self.backbone.encoder = nn.Module()
+        self.backbone.encoder.layers = nn.ModuleList(
+            [nn.Linear(4, 4) for _ in range(4)]
+        )
+        self.classifier = nn.Linear(4, 3)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        hidden = self.backbone.projection(inputs.mean(dim=-1))
+        for layer in self.backbone.encoder.layers:
+            hidden = torch.relu(layer(hidden))
+        return self.classifier(hidden)
+
+
 def _separable_tiny_data(samples_per_class: int = 10) -> tuple[np.ndarray, np.ndarray]:
     labels = np.repeat(np.arange(3, dtype=np.int64), samples_per_class)
     inputs = np.zeros((labels.size, 2, 16), dtype=np.float32)
@@ -225,11 +243,52 @@ class NeuroOnlineTests(unittest.TestCase):
         )
 
         self.assertEqual(criterion.calls, 3)
-        torch.testing.assert_close(classification, torch.tensor(6.0))
+        torch.testing.assert_close(
+            classification,
+            torch.tensor(6.0, device=classification.device),
+        )
         torch.testing.assert_close(
             loss,
             classification + config.consistency_weight * consistency,
         )
+
+    def test_update_policies_freeze_expected_cbramod_parameters(self) -> None:
+        inputs = torch.randn(2, 2, 16)
+        base = TorchModelAdapter("tiny-cbramod", _TinyCBraDecoder())
+        wrapped = NeuroOnlineModelAdapter(
+            base,
+            config=NeuroOnlineConfig(enabled=True, prompt_count=4),
+        )
+
+        modulator = wrapped._prepare_training(inputs[:1], update_policy="head")
+        self.assertTrue(all(p.requires_grad for p in base.model.classifier.parameters()))
+        self.assertTrue(all(p.requires_grad for p in modulator.parameters()))
+        self.assertFalse(any(p.requires_grad for p in base.model.backbone.parameters()))
+
+        wrapped._prepare_training(inputs[:1], update_policy="last2")
+        layers = base.model.backbone.encoder.layers
+        self.assertFalse(any(p.requires_grad for p in layers[0].parameters()))
+        self.assertFalse(any(p.requires_grad for p in layers[1].parameters()))
+        self.assertTrue(all(p.requires_grad for p in layers[2].parameters()))
+        self.assertTrue(all(p.requires_grad for p in layers[3].parameters()))
+
+    def test_differential_optimizer_groups_preserve_learning_rates(self) -> None:
+        inputs = torch.randn(2, 2, 16)
+        base = TorchModelAdapter("tiny-cbramod", _TinyCBraDecoder())
+        wrapped = NeuroOnlineModelAdapter(
+            base,
+            config=NeuroOnlineConfig(enabled=True, prompt_count=4),
+        )
+        modulator = wrapped._prepare_training(inputs[:1], update_policy="last2")
+
+        groups = wrapped._optimizer_groups(
+            modulator,
+            head_learning_rate=1e-4,
+            backbone_learning_rate=1e-6,
+        )
+
+        self.assertEqual([group["group_name"] for group in groups], ["backbone", "head_crm"])
+        self.assertEqual([group["lr"] for group in groups], [1e-6, 1e-4])
 
     def test_full_neuroonline_objective_updates_backbone_and_persists_crm(self) -> None:
         config = NeuroOnlineConfig(
@@ -310,18 +369,105 @@ class NeuroOnlineTests(unittest.TestCase):
         )
         wrapped = NeuroOnlineModelAdapter(TorchModelAdapter("tiny", _TinyDecoder()), config=config)
         inputs, labels = _separable_tiny_data()
+        epoch_states: dict[
+            int,
+            tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]],
+        ] = {}
+
+        def capture_epoch(
+            epoch: int,
+            total_epochs: int,
+            metrics: dict[str, float],
+        ) -> None:
+            del total_epochs, metrics
+            assert wrapped._modulator is not None
+            epoch_states[epoch] = (
+                {
+                    name: value.detach().cpu().clone()
+                    for name, value in wrapped.base.model.state_dict().items()
+                },
+                {
+                    name: value.detach().cpu().clone()
+                    for name, value in wrapped._modulator.state_dict().items()
+                },
+            )
+
         metrics = wrapped.fit(
             inputs,
             labels,
             epochs=1,
             batch_size=2,
             learning_rate=1e-5,
-            patience=1,
+            progress_callback=capture_epoch,
         )
         self.assertIsNotNone(wrapped._modulator)
         self.assertIn("val_kappa", metrics)
         self.assertIn("val_balanced_accuracy", metrics)
         self.assertGreaterEqual(metrics["val_acc"], 0.0)
+        self.assertEqual(metrics["epochs_completed"], 20.0)
+        self.assertGreaterEqual(metrics["best_epoch"], 1.0)
+        self.assertEqual(len(epoch_states), 20)
+        best_model_state, best_modulator_state = epoch_states[int(metrics["best_epoch"])]
+        for name, value in wrapped.base.model.state_dict().items():
+            torch.testing.assert_close(value.cpu(), best_model_state[name])
+        assert wrapped._modulator is not None
+        for name, value in wrapped._modulator.state_dict().items():
+            torch.testing.assert_close(value.cpu(), best_modulator_state[name])
+
+    def test_fit_with_split_rejects_trial_leakage(self) -> None:
+        inputs, labels = _separable_tiny_data()
+        groups = np.repeat(np.arange(labels.size // 2, dtype=np.int64), 2)
+        wrapped = NeuroOnlineModelAdapter(
+            TorchModelAdapter("tiny", _TinyDecoder()),
+            config=NeuroOnlineConfig(enabled=True, prompt_count=4),
+        )
+
+        with self.assertRaisesRegex(ValueError, "same trial"):
+            wrapped.fit_with_split(
+                inputs,
+                labels,
+                train_indices=np.arange(0, labels.size, 2),
+                validation_indices=np.arange(1, labels.size, 2),
+                groups=groups,
+            )
+
+    def test_full_fit_uses_every_window_without_validation_selection(self) -> None:
+        inputs, labels = _separable_tiny_data()
+        wrapped = NeuroOnlineModelAdapter(
+            TorchModelAdapter("tiny", _TinyDecoder()),
+            config=NeuroOnlineConfig(
+                enabled=True,
+                prompt_count=4,
+                offline_epochs=2,
+                offline_batch_size=6,
+                offline_learning_rate=1e-2,
+            ),
+        )
+
+        metrics = wrapped.fit_full(inputs, labels)
+
+        self.assertEqual(metrics["epochs_completed"], 2.0)
+        self.assertEqual(metrics["scheduler_horizon_epochs"], 2.0)
+        self.assertIn("train_balanced_accuracy", metrics)
+        self.assertIn("train_worst_class_recall", metrics)
+
+    def test_full_fit_can_stop_before_scheduler_horizon(self) -> None:
+        inputs, labels = _separable_tiny_data()
+        wrapped = NeuroOnlineModelAdapter(
+            TorchModelAdapter("tiny", _TinyDecoder()),
+            config=NeuroOnlineConfig(
+                enabled=True,
+                prompt_count=4,
+                offline_epochs=3,
+                offline_batch_size=6,
+                offline_learning_rate=1e-2,
+            ),
+        )
+
+        metrics = wrapped.fit_full(inputs, labels, epochs=1)
+
+        self.assertEqual(metrics["epochs_completed"], 1.0)
+        self.assertEqual(metrics["scheduler_horizon_epochs"], 3.0)
 
     def test_calibration_search_keeps_trial_holdout_and_saves_report(self) -> None:
         inputs, labels = _separable_tiny_data()
@@ -330,14 +476,12 @@ class NeuroOnlineTests(unittest.TestCase):
             enabled=True,
             prompt_count=4,
             offline_epochs=20,
-            offline_patience=20,
             offline_batch_size=6,
             offline_learning_rate=1e-2,
         )
         search_config = CalibrationSearchConfig(
             enabled=True,
             selection_epochs=20,
-            selection_patience=20,
             learning_rates=(1e-2,),
             batch_sizes=(6,),
             mask_ratios=(0.3,),
@@ -357,6 +501,7 @@ class NeuroOnlineTests(unittest.TestCase):
 
             self.assertTrue((report_dir / "hyperparameter_search.json").exists())
             self.assertEqual(result.best_config.offline_epochs, 20)
+            self.assertEqual(result.report["model_name"], "tiny")
             self.assertEqual(len(result.report["candidates"]), 1)
             self.assertTrue(result.report["deployment_eligible"])
             split = result.report["split"]
@@ -387,7 +532,6 @@ class NeuroOnlineTests(unittest.TestCase):
             "weight_decay": 0.05,
             "label_smoothing": 0.1,
             "offline_epochs": 50,
-            "offline_patience": 8,
         }
         with tempfile.TemporaryDirectory() as tmp_dir:
             records_dir = Path(tmp_dir)
@@ -403,6 +547,7 @@ class NeuroOnlineTests(unittest.TestCase):
                 json.dumps(
                     {
                         "training_mechanics_version": NEUROONLINE_TRAINING_MECHANICS_VERSION,
+                        "model_name": "cbramod",
                         "best_parameters": best_parameters,
                         "untouched_holdout_metrics": {
                             "balanced_accuracy": 0.5
@@ -415,6 +560,7 @@ class NeuroOnlineTests(unittest.TestCase):
             reused_config, report, report_path = load_latest_calibration_search(
                 calibration_records_dir=records_dir,
                 base_config=base_config,
+                model_name="cbramod",
             )
 
             self.assertEqual(report_path.parent, new_session)
@@ -440,6 +586,27 @@ class NeuroOnlineTests(unittest.TestCase):
                     }
                 }
             )
+
+    def test_calibration_search_rejects_other_backbone_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            session = Path(tmp_dir) / "20260728_120000"
+            session.mkdir()
+            (session / "hyperparameter_search.json").write_text(
+                json.dumps(
+                    {
+                        "training_mechanics_version": NEUROONLINE_TRAINING_MECHANICS_VERSION,
+                        "model_name": "shallowconvnet",
+                        "best_parameters": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "does not match"):
+                load_latest_calibration_search(
+                    calibration_records_dir=Path(tmp_dir),
+                    base_config=NeuroOnlineConfig(enabled=True),
+                    model_name="cbramod",
+                )
 
     def test_checkpoint_restores_model_settings_without_overriding_online_seed(self) -> None:
         selected = NeuroOnlineConfig(
@@ -469,8 +636,8 @@ class NeuroOnlineTests(unittest.TestCase):
                 ),
                 state_path=model_path,
             )
-            self.assertEqual(restored.config.mask_ratio, 0.5)
-            self.assertEqual(restored.config.consistency_weight, 0.3)
+            self.assertEqual(restored.config.mask_ratio, 0.3)
+            self.assertEqual(restored.config.consistency_weight, 0.1)
             self.assertEqual(restored.config.random_seed, 42)
 
     def test_offline_seed_is_independent_from_online_seed(self) -> None:
@@ -518,7 +685,6 @@ class NeuroOnlineTests(unittest.TestCase):
                         "calibration_epochs: 20",
                         "batch_size: 4",
                         "learning_rate: 0.001",
-                        "early_stopping_patience: 20",
                         "storage:",
                         f"  models_dir: {str(root / 'models')!r}",
                         f"  records_dir: {str(root / 'records')!r}",
@@ -529,7 +695,6 @@ class NeuroOnlineTests(unittest.TestCase):
                         "    prompt_count: 4",
                         "    mask_ratio: 0.1",
                         "    offline_epochs: 20",
-                        "    offline_patience: 20",
                         "    offline_batch_size: 4",
                         "    offline_learning_rate: 0.01",
                     ]

@@ -8,11 +8,11 @@
       "n_classes": 3,
       "models": [
         {
-          "model_name": "shallowconvnet",
-          "asset_path": "assets/dummy_decoders/shallowconvnet_64x400.pt",
+          "model_name": "cbramod",
+          "asset_path": "assets/dummy_decoders/cbramod_64x400.pt",
           "metrics": {
-            "val_loss": 0.7242544293403625,
-            "val_acc": 0.6875
+            "val_loss": 1.0766452550888062,
+            "val_acc": 0.4166666865348816
           }
         }
       ]

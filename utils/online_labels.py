@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import secrets
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -16,7 +17,7 @@ LOGGER = logging.getLogger(__name__)
 
 LABEL_NAME_TO_ID = {"left": 0, "right": 1, "idle": 2}
 LABEL_ID_TO_NAME = {value: key for key, value in LABEL_NAME_TO_ID.items()}
-CUED_PROTOCOL_VERSION = "continuous-scene-v4-dynamic-label"
+CUED_PROTOCOL_VERSION = "continuous-scene-v5-centered-single-decision"
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,12 +152,12 @@ class SimulatedOnlineLabelSource(OnlineLabelSource):
 
 
 class CuedOnlineLabelSource(OnlineLabelSource):
-    """Generate relative-action truth for the continuously controlled car task.
+    """Generate balanced relative-action truth for the centered car task.
 
-    LEFT/RIGHT are one-lane movements relative to the car lane reported by
-    Unity at the beginning of each scene.  IDLE keeps the current lane clear.
-    A scene is not labelable until Unity confirms the start lane, safe lane and
-    applied relative action.
+    Unity resets the car to the center lane before every scene, so LEFT, RIGHT,
+    and IDLE are always feasible and the label sequence is independent of the
+    previous model output. A scene is not labelable until Unity confirms the
+    centered start lane, safe lane, and applied relative action.
     """
 
     def __init__(
@@ -169,6 +170,8 @@ class CuedOnlineLabelSource(OnlineLabelSource):
         lane_transition_guard_sec: float = 0.0,
         primary_windows_per_scene: int = 1,
         primary_window_spacing_sec: float = 1.0,
+        pool_rng: random.Random | None = None,
+        sequence_seed: int | None = None,
         clock: Any = time.monotonic,
     ) -> None:
         if not sequence:
@@ -206,6 +209,13 @@ class CuedOnlineLabelSource(OnlineLabelSource):
         self._lane_transition_events: list[tuple[int, float]] = []
         self._label_transition_count = 0
         self._pending_sequence = list(self._sequence)
+        self._pool_rng = pool_rng
+        self._sequence_seed = None if sequence_seed is None else int(sequence_seed)
+        self._pool_index = 0
+        self._pool_class_counts = {
+            label_id: self._sequence.count(label_id)
+            for label_id in LABEL_ID_TO_NAME
+        }
         self._applied_label_counts = {label_id: 0 for label_id in LABEL_ID_TO_NAME}
         self._last_transition_reason = "start"
         self._failed_scenes = 0
@@ -263,11 +273,12 @@ class CuedOnlineLabelSource(OnlineLabelSource):
             )
 
     def prepare_scene(self, *, scene_index: int, start_lane: int) -> int:
-        """Choose a balanced action that is reachable from Unity's actual lane."""
+        """Choose the next balanced action for Unity's centered scene start."""
 
-        lane = int(start_lane)
-        if lane not in {-1, 0, 1}:
-            raise ValueError(f"Unity reported invalid start lane: {lane}")
+        reported_lane = int(start_lane)
+        if reported_lane not in {-1, 0, 1}:
+            raise ValueError(f"Unity reported invalid lane state: {reported_lane}")
+        lane = 0
         with self._lock:
             if int(scene_index) != self._scene_index:
                 raise ValueError(
@@ -281,29 +292,25 @@ class CuedOnlineLabelSource(OnlineLabelSource):
                 assert self._prepared_label_id is not None
                 return self._prepared_label_id
 
-            feasible = {2}
-            if lane > -1:
-                feasible.add(0)
-            if lane < 1:
-                feasible.add(1)
-            chosen: int | None = None
             if not self._pending_sequence:
-                self._pending_sequence = list(self._sequence)
-            pending_count = len(self._pending_sequence)
-            for _ in range(pending_count):
-                candidate = self._pending_sequence.pop(0)
-                if candidate in feasible:
-                    chosen = candidate
-                    break
-                self._pending_sequence.append(candidate)
-            if chosen is None:
-                chosen = min(
-                    feasible,
-                    key=lambda label: (
-                        self._applied_label_counts[label],
-                        label,
-                    ),
-                )
+                self._pool_index += 1
+                if self._pool_rng is None:
+                    self._pending_sequence = list(self._sequence)
+                else:
+                    from adaptation.mi_protocol import generate_block_sequence
+
+                    self._pending_sequence = generate_block_sequence(
+                        {
+                            LABEL_ID_TO_NAME[label_id]: count
+                            for label_id, count in self._pool_class_counts.items()
+                        },
+                        rng=self._pool_rng,
+                    )
+                    self._pending_sequence = [
+                        LABEL_NAME_TO_ID[label]
+                        for label in self._pending_sequence
+                    ]
+            chosen = self._pending_sequence.pop(0)
 
             self._prepared_scene_index = self._scene_index
             self._prepared_label_id = chosen
@@ -459,11 +466,18 @@ class CuedOnlineLabelSource(OnlineLabelSource):
     def metadata(self) -> dict[str, Any]:
         return {
             "source": "cued-protocol",
-            "protocol_mode": "continuous-relative-action",
+            "protocol_mode": "centered-single-decision",
             "protocol_version": CUED_PROTOCOL_VERSION,
-            "label_semantics": "dynamic-relative-action-to-fixed-safe-lane",
+            "label_semantics": "centered-relative-action-to-fixed-safe-lane",
+            "scene_start_lane": 0,
             "balance_pool_scenes": len(self._sequence),
             "sequence": [LABEL_ID_TO_NAME[label] for label in self._sequence],
+            "sequence_seed": self._sequence_seed,
+            "pool_index": self._pool_index,
+            "pool_class_counts": {
+                LABEL_ID_TO_NAME[label_id]: count
+                for label_id, count in self._pool_class_counts.items()
+            },
             "applied_label_counts": {
                 LABEL_ID_TO_NAME[label]: count
                 for label, count in self._applied_label_counts.items()
@@ -546,7 +560,7 @@ class CuedOnlineLabelSource(OnlineLabelSource):
         )
         return {
             "source": "cued-protocol",
-            "protocol_mode": "continuous-relative-action",
+            "protocol_mode": "centered-single-decision",
             "protocol_version": CUED_PROTOCOL_VERSION,
             "phase": phase,
             "scene_index": scene_index,
@@ -617,9 +631,16 @@ def build_cued_online_label_source(
         int(cue_config.get("balance_pool_per_class", cue_config.get("trials_per_class", 32))),
         1,
     )
+    configured_seed = cue_config.get("random_seed")
+    sequence_seed = (
+        int(configured_seed)
+        if configured_seed is not None
+        else secrets.randbits(32)
+    )
+    pool_rng = random.Random(sequence_seed)
     sequence = generate_block_sequence(
         {label: balance_pool_per_class for label in LABEL_NAME_TO_ID},
-        rng=random.Random(int(cue_config.get("random_seed", adaptation.get("random_seed", 17)))),
+        rng=pool_rng,
     )
     timing = config.get("protocol", {}).get("trial_timing", {}) or {}
     return CuedOnlineLabelSource(
@@ -638,6 +659,8 @@ def build_cued_online_label_source(
         primary_window_spacing_sec=float(
             cue_config.get("primary_window_spacing_sec", 1.0)
         ),
+        pool_rng=pool_rng,
+        sequence_seed=sequence_seed,
         clock=clock,
     )
 

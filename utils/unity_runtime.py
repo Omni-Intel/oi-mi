@@ -17,11 +17,11 @@ from typing import Any
 LOGGER = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_BUILD_DIR = Path("unity相关") / "ARPrototype3D-windows-x64"
+DEFAULT_BUILD_DIR = Path("..") / "oi-car-unity-src" / "Car_game" / "Builds" / "Windows"
 DEFAULT_EXECUTABLE = DEFAULT_BUILD_DIR / "ARPrototype3D.exe"
 RUNTIME_MANIFEST_FILENAME = "oi-mi-runtime.json"
-REQUIRED_RUNTIME_PROTOCOL = "continuous-scene-v4-dynamic-label"
-DEFAULT_UNITY_WINDOW_TITLE = "AR Pong"
+REQUIRED_RUNTIME_PROTOCOL = "continuous-scene-v5-centered-single-decision"
+DEFAULT_UNITY_WINDOW_TITLE = "ARPrototype3D"
 REQUIRED_RUNTIME_FEATURES = frozenset(
     {
         "continuous_control",
@@ -32,6 +32,9 @@ REQUIRED_RUNTIME_FEATURES = frozenset(
         "relative_action_truth",
         "dynamic_action_truth",
         "lane_settled_event",
+        "centered_scene_start",
+        "obstacles_visible_during_primary_window",
+        "single_decision_control",
     }
 )
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
@@ -78,8 +81,7 @@ def validate_unity_runtime(executable: Path) -> dict[str, Any]:
     managed_dir = build_dir / f"{executable.stem}_Data" / "Managed"
     required_paths = (
         build_dir / "UnityPlayer.dll",
-        managed_dir / "Assembly-CSharp.dll",
-        managed_dir / "ARPong.Runtime.dll",
+        managed_dir / "ARPrototype3D.Runtime.dll",
     )
     missing = [str(path) for path in required_paths if not path.is_file()]
     if missing:
@@ -126,8 +128,7 @@ def validate_unity_runtime(executable: Path) -> dict[str, Any]:
     required_declared_files = {
         executable.name,
         "UnityPlayer.dll",
-        f"{executable.stem}_Data/Managed/Assembly-CSharp.dll",
-        f"{executable.stem}_Data/Managed/ARPong.Runtime.dll",
+        f"{executable.stem}_Data/Managed/ARPrototype3D.Runtime.dll",
     }
     normalized_declared_files = {
         str(relative_name).replace("\\", "/") for relative_name in declared_files
@@ -172,10 +173,7 @@ def write_unity_runtime_manifest(executable: Path, *, build_id: str) -> Path:
     build_dir = executable.parent
     unity_player = build_dir / "UnityPlayer.dll"
     managed_dir = build_dir / f"{executable.stem}_Data" / "Managed"
-    managed_dlls = (
-        managed_dir / "Assembly-CSharp.dll",
-        managed_dir / "ARPong.Runtime.dll",
-    )
+    managed_dlls = (managed_dir / "ARPrototype3D.Runtime.dll",)
     for required_path in (executable, unity_player, *managed_dlls):
         if not required_path.is_file():
             raise RuntimeError(f"Unity runtime file is missing: {required_path}")
@@ -234,7 +232,7 @@ def ensure_unity_game_running(
         manifest = validate_unity_runtime(executable)
     except RuntimeError as exc:
         raise RuntimeError(
-            f"{exc} Run `python tools/download_unity_build.py --force` "
+            f"{exc} Rebuild the standalone `oi-car-unity-src/Car_game` project "
             "before realtime decoding."
         ) from exc
 
@@ -379,7 +377,7 @@ def _enable_existing_window_resize(
     executable = configured_unity_executable(config, project_root=project_root)
     configured_title = str(ar_game_cfg.get("window_title") or "").strip()
     titles = [configured_title] if configured_title else [executable.stem]
-    # The packaged player uses its product name (currently "AR Pong") as the
+    # The packaged player may use its product name as the
     # top-level window title, which is different from the executable stem.
     if DEFAULT_UNITY_WINDOW_TITLE.casefold() not in {
         title.casefold() for title in titles

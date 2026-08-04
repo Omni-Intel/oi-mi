@@ -1,12 +1,12 @@
 # Unity 小车运行包
 
-现场实验只使用预先打包好的 Windows Player，不会调用 Unity 源码仓库，也不要求安装 Unity Editor。运行包安装在 Git 忽略的本地目录：
+现场实验只使用独立小车 Unity 工程生成的 Windows Player，不调用完整版 Unity 的源码、DLL、下载脚本或打包脚本。运行包位于：
 
 ```text
-unity相关/ARPrototype3D-windows-x64/ARPrototype3D.exe
+../oi-car-unity-src/Car_game/Builds/Windows/ARPrototype3D.exe
 ```
 
-## 新电脑安装
+## Python 环境
 
 After cloning or pulling the repository, run:
 
@@ -15,7 +15,7 @@ py -3.12 setup_local.py
 .\.venv\Scripts\python.exe cli.py gui
 ```
 
-`setup_local.py` 会创建 `.venv`、安装依赖、下载 Release 里的 Unity zip、原子替换本地运行包并执行环境检查。
+`setup_local.py` 只创建 `.venv`、安装 Python 依赖、下载 CBraMod 权重并执行环境检查，不处理 Unity 完整版运行包。
 
 ## 运行包完整性
 
@@ -24,61 +24,34 @@ py -3.12 setup_local.py
 ```text
 ARPrototype3D.exe
 ARPrototype3D_Data/
-ARPrototype3D_Data/Managed/ARPong.Runtime.dll
+ARPrototype3D_Data/Managed/ARPrototype3D.Runtime.dll
 UnityPlayer.dll
 UnityCrashHandler64.exe
 MonoBleedingEdge/
 oi-mi-runtime.json
 ```
 
-`oi-mi-runtime.json` 声明 `continuous-scene-v4-dynamic-label` 协议，以及 `lane_state_ack`、`relative_action_truth`、`dynamic_action_truth`、`lane_settled_event`、`scene_ack`、`scene_failure_event` 等必要能力，并校验播放器、Unity 引擎和实际承载小车代码的 `ARPong.Runtime.dll`。Python 在每个 Scene 前查询实际车道；`scene_ack` 只有在 Unity 主线程按相对动作应用双障碍布局后，才连同起始车道、空车道和实际标签一起返回。Unity 在车辆真正完成换道后发送 `LANE_SETTLED`，Python 据此切换动态动作真值，跨越切换时刻的窗口不训练。碰撞只记录失败，到固定边界才推进下一 Scene。GUI 启动小车前会强制验证，旧构建、缺文件或混装版本都会停止运行。
+`oi-mi-runtime.json` 声明 `continuous-scene-v5-centered-single-decision` 协议，并校验播放器、Unity 引擎和实际承载小车代码的 `ARPrototype3D.Runtime.dll`。GUI 启动小车前会强制验证，旧构建、缺文件或混装版本都会停止运行。
 
-当前验证包：
-
-```text
-build_id: 2026-07-26-scene-gate-v2-desktop
-zip SHA-256: D8B6A90CE332D51BC82F3A2F483D92FF285C428DC4E30900E94567C26419D9C2
-```
-
-重新安装当前 Release：
+## 构建独立小车
 
 ```powershell
-.\.venv\Scripts\python.exe tools\download_unity_build.py --force
+Set-Location D:\Projects\ncc\oi-car-unity-src\Car_game
+$env:CAR_WINDOWS_OUTPUT = "$PWD\Builds\Windows\ARPrototype3D.exe"
+& "D:\UnityHub\Editors\2022.3.60f1c1\Editor\Unity.exe" `
+  -batchmode -nographics -projectPath "$PWD" `
+  -executeMethod ARPrototype3D.Editor.BuildCommand.BuildWindows64 -quit
 ```
 
-从本地 zip 安装：
-
-```powershell
-.\.venv\Scripts\python.exe tools\download_unity_build.py --force --from-local-zip C:\path\ARPrototype3D-windows-x64.zip
-```
-
-## 打包 Release
-
-将已经验证的小车运行目录打包：
-
-```powershell
-.\.venv\Scripts\python.exe tools\package_unity_build.py --build-id 2026-07-26-scene-gate-v2-desktop
-```
-
-输出文件固定为：
-
-```text
-ARPrototype3D-windows-x64.zip
-```
-
-把它作为 GitHub Release asset 上传，名称不要修改。新电脑默认从以下地址下载：
-
-```text
-https://github.com/Omni-Intel/oi-mi/releases/latest/download/ARPrototype3D-windows-x64.zip
-```
+独立构建命令会同时生成 `oi-mi-runtime.json`，写入协议能力和关键文件 SHA-256。
 
 ## 运行协议
 
 - GUI 自动启动窗口模式 Player，并等待 `127.0.0.1:5005`。
-- Player 直接进入小车的 Fixed Speed 模式，不初始化 MRTK/手势运行时，也不等待菜单选择命令。
-- `SCENE_STATE` 返回小车实际车道；`SCENE_LEFT/RIGHT/IDLE` 表示相对当前车道的单步动作，Unity 必须返回含 `start_lane/safe_lane/applied_label` 的 ACK。
-- `LANE_SETTLED` 只在小车实际完成换道后发送；Python 根据固定 `safe_lane` 动态生成 LEFT/RIGHT/IDLE 真值。
-- `LEFT/RIGHT/STOP` 是车辆控制命令；模型每个解码步持续输出，协议内部不会插入隐藏停止阶段。
+- Player 直接进入小车 Fixed Speed 模式，不初始化完整版菜单、MRTK 或手势运行时。
+- 每个 Scene 都把小车重置到中间车道；`SCENE_LEFT/RIGHT/IDLE` 同时确定障碍布局和唯一主训练标签。
+- `SCENE_STATE` 返回当前 Scene 和实际车道；布局命令必须返回协议版本、Scene 编号、起始车道和安全车道。
+- `LEFT/RIGHT/STOP` 是车辆控制命令；主决策窗完成前横向控制被门控，完成后立即释放。
 - 等待 Scene 或同步失败时 Unity 不生成随机车辆；只有完整 Scene 命令成功后才同时生成两辆障碍车。
 - 当前 Scene 未收到完整 ACK 时 Python 保持该 Scene 编号，不允许本地计时器跳过并建立后续 Scene。
 - 关闭 Unity 或场景 ACK 失败时，标签和在线更新会停止，避免静默记录错误真值。

@@ -74,10 +74,6 @@ def verify_bundle(root: Path) -> dict[str, Any]:
             if np.any(~np.isfinite(starts) | ~np.isfinite(ends) | (ends <= starts)):
                 errors.append(f"{chunk_path.name} has invalid window timestamps")
 
-    provenance = metadata.get("provenance", {}) or {}
-    native = provenance.get("native_amplifier_recording", {}) or {}
-    if metadata.get("mode") == "realtime" and native.get("required") and not native.get("declared"):
-        errors.append("native BDF/NDF recording ID was not declared")
     if int(metadata.get("dropped_records", 0) or 0) > 0:
         errors.append("stream writer dropped records")
     if str(integrity.get("status", "complete")) != "complete":

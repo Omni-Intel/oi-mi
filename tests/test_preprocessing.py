@@ -18,6 +18,8 @@ from tools.reprocess_calibration import build_windows, promote_corrected_dataset
 from utils.preprocessing import (
     DEFAULT_PREPROCESSING,
     bandpass_filter,
+    finalize_preprocessed_window,
+    preprocess_eeg_continuous,
     preprocess_eeg_window,
     resample_eeg,
 )
@@ -150,6 +152,42 @@ class PreprocessingTests(unittest.TestCase):
             0.05,
         )
 
+    def test_continuous_preprocessing_is_cut_only_after_transform(self) -> None:
+        source_sfreq = 250.0
+        target_sfreq = 200.0
+        source_time = np.arange(1_250, dtype=np.float64) / source_sfreq
+        phases = np.arange(4, dtype=np.float64)[:, None] * 0.3
+        eeg = (
+            20.0 * np.sin(2.0 * np.pi * 10.0 * source_time[None, :] + phases)
+            + np.arange(4, dtype=np.float64)[:, None] * 2_000.0
+        ).astype(np.float32)
+
+        continuous = preprocess_eeg_continuous(
+            eeg,
+            source_sfreq=source_sfreq,
+            target_sfreq=target_sfreq,
+        )
+        first = finalize_preprocessed_window(continuous.data[:, 100:500]).data
+        second = finalize_preprocessed_window(continuous.data[:, 200:600]).data
+
+        self.assertEqual(first.shape, (4, 400))
+        self.assertEqual(second.shape, (4, 400))
+        np.testing.assert_array_equal(first[:, 100:], second[:, :300])
+
+    def test_continuous_preprocessing_keeps_cbramod_window_shape(self) -> None:
+        rng = np.random.default_rng(42)
+        eeg = rng.standard_normal((59, 750)).astype(np.float32)
+
+        continuous = preprocess_eeg_continuous(
+            eeg,
+            source_sfreq=250.0,
+            target_sfreq=200.0,
+        )
+        window = finalize_preprocessed_window(continuous.data[:, -400:]).data
+
+        self.assertEqual(continuous.data.shape, (59, 600))
+        self.assertEqual(window.shape, (59, 400))
+
     def test_brainco_window_is_resampled_from_250_hz_to_200_hz(self) -> None:
         acquirer = BrainCoAcquirer(
             sfreq=200.0,
@@ -204,6 +242,25 @@ class PreprocessingTests(unittest.TestCase):
         np.testing.assert_array_equal(payload["labels"], np.repeat([0, 1], 5))
         np.testing.assert_array_equal(payload["window_indices"], np.tile(np.arange(5), 2))
 
+    def test_build_windows_preserves_identical_overlap_within_trial(self) -> None:
+        rng = np.random.default_rng(23)
+        eeg = rng.standard_normal((4, 1_500)).astype(np.float32)
+        trials = [{"label_id": 0, "control_on_sample": 0}]
+
+        payload = build_windows(
+            eeg,
+            trials,
+            source_sfreq=250.0,
+            target_sfreq=200.0,
+            window_sec=2.0,
+            stride_sec=0.5,
+            control_start_sec=0.5,
+            control_stop_sec=3.0,
+        )
+
+        first, second = payload["processed_windows"][:2]
+        np.testing.assert_array_equal(first[:, 100:], second[:, :300])
+
     def test_reprocessed_dataset_is_promoted_atomically_with_backup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -257,6 +314,30 @@ class PreprocessingTests(unittest.TestCase):
         self.assertAlmostEqual(float(timestamps[0]), 98.0)
         self.assertAlmostEqual(float(timestamps[-1]), 99.995)
 
+    def test_neuracle_exposes_source_rate_continuous_history(self) -> None:
+        class FakeServer:
+            def GetBufferDataWithTiming(self) -> tuple[np.ndarray, dict[str, float]]:
+                return np.zeros((2, 750), dtype=np.float32), {
+                    "device_end_ms": 12_000.0,
+                    "arrival_monotonic": 100.0,
+                    "total_samples": 750,
+                }
+
+        acquirer = NeuracleAcquirer(
+            sfreq=200.0,
+            source_sfreq=250.0,
+            n_channels=2,
+        )
+        acquirer._server = FakeServer()  # type: ignore[assignment]
+
+        history, timestamps = acquirer.get_continuous_chunk(2.0)
+
+        self.assertEqual(history.shape, (2, 750))
+        self.assertEqual(timestamps.shape, (750,))
+        self.assertEqual(acquirer.continuous_sfreq, 250.0)
+        self.assertAlmostEqual(float(timestamps[0]), 97.0)
+        self.assertAlmostEqual(float(timestamps[-1]), 99.996)
+
     def test_neuracle_source_clock_rejects_arrival_jitter_and_compensates_delay(self) -> None:
         class FakeServer:
             def __init__(self) -> None:
@@ -295,6 +376,81 @@ class PreprocessingTests(unittest.TestCase):
             acquirer.timing_diagnostics["queueing_jitter_sec"],
             0.1,
         )
+
+    def test_neuracle_selects_and_reorders_eeg_channels_by_name(self) -> None:
+        class FakeServer:
+            channelNames = ["ECG", "C4", "C3"]
+            channelTypes = ["ECG", "EEG", "EEG"]
+
+            def GetBufferUpdateWithTiming(self):
+                return np.asarray(
+                    [
+                        [100.0, 101.0],
+                        [40.0, 41.0],
+                        [30.0, 31.0],
+                    ],
+                    dtype=np.float32,
+                ), {
+                    "device_end_ms": 12_000.0,
+                    "arrival_monotonic": 100.0,
+                }
+
+        acquirer = NeuracleAcquirer(
+            sfreq=200.0,
+            source_sfreq=250.0,
+            n_channels=2,
+            eeg_channel_names=("C3", "C4"),
+        )
+        server = FakeServer()
+        acquirer._configure_eeg_channel_selection(server)
+        acquirer._server = server  # type: ignore[assignment]
+
+        eeg, _timestamps = acquirer.get_new_samples()
+
+        np.testing.assert_array_equal(
+            eeg,
+            np.asarray([[30.0, 31.0], [40.0, 41.0]], dtype=np.float32),
+        )
+        self.assertEqual(acquirer.metadata.channel_names, ("C3", "C4"))
+        self.assertEqual(
+            acquirer.channel_diagnostics["selected_source_indices_zero_based"],
+            [2, 1],
+        )
+        self.assertEqual(acquirer.channel_diagnostics["excluded_channel_names"], ["ECG"])
+
+    def test_neuracle_rejects_missing_required_eeg_channel(self) -> None:
+        server = type(
+            "FakeServer",
+            (),
+            {
+                "channelNames": ["C3", "ECG"],
+                "channelTypes": ["EEG", "ECG"],
+            },
+        )()
+        acquirer = NeuracleAcquirer(
+            n_channels=2,
+            eeg_channel_names=("C3", "C4"),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "missing required scalp EEG channels: C4"):
+            acquirer._configure_eeg_channel_selection(server)
+
+    def test_neuracle_rejects_required_channel_with_non_eeg_type(self) -> None:
+        server = type(
+            "FakeServer",
+            (),
+            {
+                "channelNames": ["C3", "C4"],
+                "channelTypes": ["EEG", "ECG"],
+            },
+        )()
+        acquirer = NeuracleAcquirer(
+            n_channels=2,
+            eeg_channel_names=("C3", "C4"),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, r"C4\(ECG\)"):
+            acquirer._configure_eeg_channel_selection(server)
 
     def test_session_event_projects_local_time_to_source_sample_index(self) -> None:
         class FakeAcquirer:
@@ -347,6 +503,48 @@ class PreprocessingTests(unittest.TestCase):
 
         self.assertAlmostEqual(start, 98.0)
         self.assertAlmostEqual(end, 100.0)
+
+    def test_decoder_continuously_preprocesses_before_latest_window_slice(self) -> None:
+        source_sfreq = 250.0
+        source_time = np.arange(750, dtype=np.float64) / source_sfreq
+        source = np.stack(
+            [
+                np.sin(2.0 * np.pi * 10.0 * source_time + phase)
+                for phase in (0.0, 0.3, 0.6, 0.9)
+            ],
+            axis=0,
+        ).astype(np.float32)
+        source_timestamps = 97.0 + source_time
+
+        class FakeAcquirer:
+            metadata = AcquirerMetadata(
+                name="fake",
+                sfreq=200.0,
+                n_channels=4,
+                timestamp_domain="monotonic",
+            )
+            continuous_sfreq = source_sfreq
+
+            def get_continuous_chunk(self, min_window_sec: float):
+                return source, source_timestamps
+
+        decoder = RealTimeDecoder.__new__(RealTimeDecoder)
+        decoder._acquirer = FakeAcquirer()
+        decoder._sfreq = 200.0
+        decoder._window_sec = 2.0
+
+        continuous, history_timestamps = decoder._acquire_preprocessed_history(2.0)
+        raw_window, timestamps, result = decoder._slice_preprocessed_history(
+            continuous,
+            history_timestamps,
+        )
+
+        self.assertEqual(raw_window.shape, (4, 400))
+        self.assertEqual(result.data.shape, (4, 400))
+        self.assertAlmostEqual(float(timestamps[0]), 98.0)
+        self.assertAlmostEqual(float(timestamps[-1]), 99.995)
+        expected = finalize_preprocessed_window(continuous.data[:, -400:]).data
+        np.testing.assert_array_equal(result.data, expected)
 
 
 if __name__ == "__main__":

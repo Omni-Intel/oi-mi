@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, fields, replace
 import gc
+from itertools import product
 import json
 from pathlib import Path
 import sys
@@ -73,6 +74,7 @@ def _resume_identity(report: dict[str, Any]) -> dict[str, Any]:
         "source_checkpoint": report.get("source_checkpoint"),
         "stream": report.get("stream"),
         "fixed": report.get("fixed"),
+        "search_space": report.get("search_space"),
     }
 
 
@@ -104,17 +106,51 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         recent_samples=320,
     )
 
+    if not args.learning_rates:
+        raise ValueError("At least one learning rate is required.")
+    if not args.epochs_grid or any(value < 1 for value in args.epochs_grid):
+        raise ValueError("Epoch counts must be positive integers.")
+    if not args.batch_sizes or any(value < 1 for value in args.batch_sizes):
+        raise ValueError("Batch sizes must be positive integers.")
+    if not args.mask_ratios or any(not 0.0 <= value <= 1.0 for value in args.mask_ratios):
+        raise ValueError("Mask ratios must be in [0, 1].")
+    if not args.lambda_grid or any(value < 0.0 for value in args.lambda_grid):
+        raise ValueError("Consistency weights (lambda) must be non-negative.")
+
+    search_candidates = list(
+        product(
+            args.learning_rates,
+            args.epochs_grid,
+            args.batch_sizes,
+            args.mask_ratios,
+            args.lambda_grid,
+        )
+    )
+    start_index = max(int(args.start_index), 0)
+    stop_index = (
+        len(search_candidates)
+        if args.stop_index is None
+        else min(max(int(args.stop_index), start_index), len(search_candidates))
+    )
+
     data = _one_window_per_scene(load_committed_data(args.recording.resolve()))
     processed, quality = preprocess_windows(data, sfreq=args.sfreq)
     if int(quality["rejected_windows"]) != 0:
         raise ValueError("The one-window-per-scene stream contains rejected windows.")
-    validation_start = len(data.labels) // 2
-    if validation_start < base_config.history_threshold:
-        raise ValueError("The chronological validation split is too short.")
+    selection_end = min(int(args.selection_end), len(data.labels))
+    selection_start = int(args.selection_start)
+    if not base_config.history_threshold <= selection_start < selection_end:
+        raise ValueError(
+            "Selection indices must satisfy history_threshold <= start < end."
+        )
+    if selection_end >= len(data.labels):
+        raise ValueError("At least one final temporal holdout sample is required.")
 
     report: dict[str, Any] = {
-        "schema_version": 2,
-        "method": "causal_predict_then_update_chronological_online_hyperparameter_search",
+        "schema_version": 4,
+        "method": (
+            "causal_predict_then_update_temporal_prefix_search_with_sealed_final_holdout"
+        ),
         "source_recording": str(args.recording.resolve()),
         "source_checkpoint": {
             "model": checkpoint_before,
@@ -125,22 +161,37 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "samples": int(len(data.labels)),
             "scenes": int(np.unique(data.scene_indices).size),
             "class_counts": np.bincount(data.labels, minlength=args.n_classes).astype(int).tolist(),
-            "validation_start_index": int(validation_start),
-            "validation_samples": int(len(data.labels) - validation_start),
+            "selection_start_index": selection_start,
+            "selection_end_index_exclusive": selection_end,
+            "selection_samples": selection_end - selection_start,
+            "final_holdout_start_index": selection_end,
+            "final_holdout_samples": int(len(data.labels) - selection_end),
             "source_chunks": data.chunk_artifacts,
         },
         "fixed": {
             "history_threshold": 64,
             "update_stride": 64,
             "recent_samples": 320,
-            "mask_ratio": base_config.mask_ratio,
-            "consistency_weight": base_config.consistency_weight,
             "weight_decay": base_config.weight_decay,
             "label_smoothing": base_config.label_smoothing,
             "random_seed": base_config.random_seed,
         },
+        "search_space": {
+            "learning_rates": args.learning_rates,
+            "epochs": args.epochs_grid,
+            "batch_sizes": args.batch_sizes,
+            "mask_ratios": args.mask_ratios,
+            "lambda_grid": args.lambda_grid,
+            "masking": (
+                "NeuroOnline source-compatible elementwise Bernoulli time-sample and "
+                "rFFT-bin masks, generated once when each stream sample is accepted "
+                "and reused by later updates"
+            ),
+            "total_candidates": len(search_candidates),
+        },
+        "requested_candidate_range": [start_index, stop_index],
         "selection_rule": (
-            "reject class collapse; maximize second-half prequential balanced accuracy, "
+            "reject class collapse; maximize sealed-prefix prequential balanced accuracy, "
             "then accuracy, worst-class recall, and prefer fewer epochs"
         ),
         "candidates": [],
@@ -157,9 +208,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     baseline_probabilities = baseline_adapter.predict_proba(processed)
     report["no_online_update_baseline"] = {
-        "validation": classification_metrics(
-            data.labels[validation_start:],
-            baseline_probabilities[validation_start:],
+        "selection": classification_metrics(
+            data.labels[selection_start:selection_end],
+            baseline_probabilities[selection_start:selection_end],
+            n_classes=args.n_classes,
+        ),
+        "final_holdout": classification_metrics(
+            data.labels[selection_end:],
+            baseline_probabilities[selection_end:],
             n_classes=args.n_classes,
         ),
         "full_stream": classification_metrics(
@@ -171,7 +227,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     del baseline_adapter
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    cache: dict[tuple[float, int, int], dict[str, Any]] = {}
+    cache: dict[tuple[float, int, int, float, float], dict[str, Any]] = {}
     if output.exists():
         previous = json.loads(output.read_text(encoding="utf-8"))
         _validate_resume_report(previous, report, output=output)
@@ -181,30 +237,47 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 float(candidate_config["learning_rate"]),
                 int(candidate_config["epochs"]),
                 int(candidate_config["update_batch_size"]),
+                float(candidate_config["mask_ratio"]),
+                float(candidate_config["consistency_weight"]),
             )
             cache[key] = candidate
             report["candidates"].append(candidate)
         report["resumed_candidates"] = len(cache)
 
-    def evaluate(learning_rate: float, epochs: int, batch_size: int, stage: str) -> dict[str, Any]:
-        key = (float(learning_rate), int(epochs), int(batch_size))
+    def evaluate(
+        learning_rate: float,
+        epochs: int,
+        batch_size: int,
+        mask_ratio: float,
+        consistency_weight: float,
+        candidate_index: int,
+    ) -> dict[str, Any]:
+        key = (
+            float(learning_rate),
+            int(epochs),
+            int(batch_size),
+            float(mask_ratio),
+            float(consistency_weight),
+        )
         if key in cache:
-            existing = cache[key]
-            existing.setdefault("stages", []).append(stage)
-            return existing
+            return cache[key]
         config = replace(
             base_config,
             learning_rate=key[0],
             epochs=key[1],
             update_batch_size=key[2],
+            mask_ratio=key[3],
+            consistency_weight=key[4],
         )
         candidate_started = time.perf_counter()
         result: dict[str, Any] = {
-            "stages": [stage],
+            "candidate_index": int(candidate_index),
             "config": {
                 "learning_rate": key[0],
                 "epochs": key[1],
                 "update_batch_size": key[2],
+                "mask_ratio": key[3],
+                "consistency_weight": key[4],
             },
         }
         try:
@@ -220,19 +293,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
             probabilities, _, updates = causal_replay(
                 adapter,
-                processed,
-                data.labels,
-                data.scene_indices,
+                processed[:selection_end],
+                data.labels[:selection_end],
+                data.scene_indices[:selection_end],
                 config=config,
                 n_classes=args.n_classes,
             )
             validation_metrics = classification_metrics(
-                data.labels[validation_start:],
-                probabilities[validation_start:],
+                data.labels[selection_start:selection_end],
+                probabilities[selection_start:selection_end],
                 n_classes=args.n_classes,
             )
-            full_metrics = classification_metrics(
-                data.labels,
+            prefix_metrics = classification_metrics(
+                data.labels[:selection_end],
                 probabilities,
                 n_classes=args.n_classes,
             )
@@ -253,7 +326,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                             or validation_metrics["worst_observed_class_recall"] <= 0.0
                         ),
                     },
-                    "full_stream": {"metrics": full_metrics},
+                    "search_prefix": {"metrics": prefix_metrics},
                 }
             )
         except Exception as exc:
@@ -270,7 +343,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         _save(output, report)
         metrics = result.get("validation", {}).get("metrics", {})
         print(
-            f"{stage} lr={key[0]:g} epochs={key[1]} batch={key[2]} "
+            f"candidate={candidate_index + 1}/{len(search_candidates)} "
+            f"lr={key[0]:g} epochs={key[1]} batch={key[2]} "
+            f"mask={key[3]:g} lambda={key[4]:g} "
             f"acc={metrics.get('accuracy', -1):.4f} "
             f"bacc={metrics.get('balanced_accuracy', -1):.4f} "
             f"collapse={result.get('validation', {}).get('class_collapse', True)}",
@@ -278,25 +353,71 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         return result
 
-    stage1 = [
-        evaluate(lr, epochs, 16, "learning_rate_epochs")
-        for lr in args.learning_rates
-        for epochs in args.epochs_grid
+    for candidate_index in range(start_index, stop_index):
+        evaluate(*search_candidates[candidate_index], candidate_index)
+
+    if not report["candidates"]:
+        raise ValueError("The requested candidate range is empty and no cached results exist.")
+    successful_candidates = [
+        candidate
+        for candidate in report["candidates"]
+        if not candidate.get("failed") and "validation" in candidate
     ]
-    stage1_best = max(stage1, key=_score)
-    best_lr = float(stage1_best["config"]["learning_rate"])
-    best_epochs = int(stage1_best["config"]["epochs"])
-    stage2 = [
-        evaluate(best_lr, best_epochs, batch_size, "batch_size")
-        for batch_size in args.batch_sizes
-    ]
-    selected = max(stage2, key=_score)
-    report["stage1_best"] = stage1_best["config"]
+    if not successful_candidates:
+        raise RuntimeError("Every evaluated online-search candidate failed.")
+    selected = max(successful_candidates, key=_score)
     report["selected"] = {
         **selected["config"],
         "validation": selected["validation"],
-        "full_stream": selected["full_stream"],
+        "search_prefix": selected["search_prefix"],
     }
+    report["completed_candidates"] = len(cache)
+    report["search_complete"] = len(cache) == len(search_candidates)
+    if report["search_complete"]:
+        selected_config = replace(
+            base_config,
+            learning_rate=float(selected["config"]["learning_rate"]),
+            epochs=int(selected["config"]["epochs"]),
+            update_batch_size=int(selected["config"]["update_batch_size"]),
+            mask_ratio=float(selected["config"]["mask_ratio"]),
+            consistency_weight=float(selected["config"]["consistency_weight"]),
+        )
+        seed_everything(selected_config.random_seed)
+        final_adapter = build_adapter(
+            checkpoint,
+            model_name=args.model_name,
+            n_chans=processed.shape[1],
+            n_times=processed.shape[2],
+            n_classes=args.n_classes,
+            sfreq=args.sfreq,
+            config=selected_config,
+        )
+        final_probabilities, _, final_updates = causal_replay(
+            final_adapter,
+            processed,
+            data.labels,
+            data.scene_indices,
+            config=selected_config,
+            n_classes=args.n_classes,
+        )
+        report["selected_final_replay"] = {
+            "config": selected["config"],
+            "updates": len(final_updates),
+            "final_holdout": classification_metrics(
+                data.labels[selection_end:],
+                final_probabilities[selection_end:],
+                n_classes=args.n_classes,
+            ),
+            "full_stream": classification_metrics(
+                data.labels,
+                final_probabilities,
+                n_classes=args.n_classes,
+            ),
+        }
+        del final_adapter
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     report["input_checkpoint_unchanged"] = bool(
         checkpoint_before == artifact(checkpoint)
         and sidecar_before == artifact(Path(f"{checkpoint}.neuroonline.pt"))
@@ -319,7 +440,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recording", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--model-name", default="shallowconvnet")
+    parser.add_argument("--model-name", default="cbramod")
     parser.add_argument("--sfreq", type=float, default=200.0)
     parser.add_argument("--n-classes", type=int, default=3)
     parser.add_argument(
@@ -327,8 +448,23 @@ def build_parser() -> argparse.ArgumentParser:
         type=_float_list,
         default=[3e-7, 1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3],
     )
-    parser.add_argument("--epochs-grid", type=_int_list, default=[1, 3])
+    parser.add_argument("--epochs-grid", type=_int_list, default=[1, 3, 5])
     parser.add_argument("--batch-sizes", type=_int_list, default=[8, 16, 32, 64])
+    parser.add_argument(
+        "--mask-ratios",
+        type=_float_list,
+        default=[0.1, 0.3, 0.5, 0.7, 0.9],
+    )
+    parser.add_argument(
+        "--lambda-grid",
+        type=_float_list,
+        default=[0.1, 0.25, 0.5, 1.0, 2.0],
+        help="Paper lambda grid for the mean two-view consistency loss.",
+    )
+    parser.add_argument("--start-index", type=int, default=0)
+    parser.add_argument("--stop-index", type=int, default=None)
+    parser.add_argument("--selection-start", type=int, default=160)
+    parser.add_argument("--selection-end", type=int, default=320)
     return parser
 
 

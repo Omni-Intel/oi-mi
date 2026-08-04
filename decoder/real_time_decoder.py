@@ -34,7 +34,13 @@ from adaptation.online_batch_adapter import BatchAdaptationConfig, OnlineBatchAd
 from models.factory import BaseModelAdapter, TorchModelAdapter
 from utils.markers import LSLCommandOutlet, MarkerBackend
 from utils.online_labels import CUED_PROTOCOL_VERSION, OnlineLabelSource
-from utils.preprocessing import DEFAULT_PREPROCESSING, preprocess_eeg_window
+from utils.preprocessing import (
+    ContinuousPreprocessingResult,
+    PreprocessingResult,
+    continuous_preprocessing_metadata,
+    finalize_preprocessed_window,
+    preprocess_eeg_continuous,
+)
 from utils.stream_writer import StreamWriter
 
 LOGGER = logging.getLogger(__name__)
@@ -130,6 +136,13 @@ class RealTimeDecoder:
         self._confidence_threshold = confidence_threshold
         self._mc_dropout_passes = mc_dropout_passes
         self._n_classes = max(int(n_classes), 1)
+        ar_game_config = (
+            (((experiment_config or {}).get("output", {}) or {}).get("ar_game", {}) or {})
+        )
+        self._visual_onset_delay_sec = max(
+            float(ar_game_config.get("visual_onset_delay_sec", 0.0)),
+            0.0,
+        )
         self._online_update_enabled = bool(online_update_enabled)
         self._online_update_learning_rate = float(online_update_learning_rate)
         self._online_update_every = max(int(online_update_every), 1)
@@ -317,9 +330,18 @@ class RealTimeDecoder:
                 "window_sec": self._window_sec,
                 "step_sec": self._step_sec,
                 "channels": self._acquirer.metadata.n_channels,
+                "channel_names": list(
+                    getattr(self._acquirer.metadata, "channel_names", ())
+                ),
+                "channel_types": list(
+                    getattr(self._acquirer.metadata, "channel_types", ())
+                ),
                 "model_name": self._model_name,
                 "model_revision": self._model_revision,
-                "preprocessing": DEFAULT_PREPROCESSING.as_dict(),
+                "preprocessing": {
+                    **continuous_preprocessing_metadata(),
+                    "continuous_span": "retained_acquirer_history",
+                },
                 "online_adaptation": self._online_adaptation_status(),
                 "online_label_source": self._online_label_source_metadata(),
                 "provenance": self._build_run_provenance(),
@@ -377,6 +399,11 @@ class RealTimeDecoder:
                             "timing_diagnostics",
                             {},
                         ),
+                        "channel_selection": getattr(
+                            self._acquirer,
+                            "channel_diagnostics",
+                            {},
+                        ),
                     }
                 )
                 self._console.print(f"[bold green]实时数据已保存[/bold green] {self._save_dir}")
@@ -408,7 +435,16 @@ class RealTimeDecoder:
             "window_sec": self._window_sec,
             "step_sec": self._step_sec,
             "channels": self._acquirer.metadata.n_channels,
-            "preprocessing": DEFAULT_PREPROCESSING.as_dict(),
+            "channel_names": list(
+                getattr(self._acquirer.metadata, "channel_names", ())
+            ),
+            "channel_types": list(
+                getattr(self._acquirer.metadata, "channel_types", ())
+            ),
+            "preprocessing": {
+                **continuous_preprocessing_metadata(),
+                "continuous_span": "retained_acquirer_history",
+            },
             "provenance": self._build_run_provenance(),
         })
         writer.append_event("session_start", run_id=self._run_id, mode="test_mode")
@@ -476,12 +512,17 @@ class RealTimeDecoder:
                 while time.monotonic() < block_end and time.monotonic() - started < duration_sec:
                     loop_started = time.perf_counter()
                     try:
-                        window, timestamps = self._acquirer.get_chunk(self._window_sec)
+                        continuous, history_timestamps = self._acquire_preprocessed_history(
+                            self._window_sec
+                        )
                     except RuntimeError:
                         time.sleep(self._step_sec)
                         continue
+                    window, timestamps, preprocessing = self._slice_preprocessed_history(
+                        continuous,
+                        history_timestamps,
+                    )
                     window_start, window_end = self._resolve_window_time_bounds(timestamps)
-                    preprocessing = preprocess_eeg_window(window, sfreq=self._sfreq)
                     processed = preprocessing.data
                     probability_batch, model_revision = self._predict_proba_with_revision(
                         processed[None, ...],
@@ -663,12 +704,18 @@ class RealTimeDecoder:
             started_at = time.perf_counter()
             try:
                 try:
-                    window, timestamps = self._acquirer.get_chunk(self._window_sec)
+                    continuous, history_timestamps = self._acquire_preprocessed_history(
+                        self._window_sec
+                    )
                 except RuntimeError as exc:
                     if "Not enough data" in str(exc):
                         self._sleep_with_heartbeat(self._step_sec, None)
                         continue
                     raise
+                window, timestamps, preprocessing = self._slice_preprocessed_history(
+                    continuous,
+                    history_timestamps,
+                )
                 window_start, window_end = self._resolve_window_time_bounds(timestamps)
                 if (
                     self._last_processed_window_end_monotonic is not None
@@ -697,23 +744,27 @@ class RealTimeDecoder:
                     alignment_target_end is not None
                     and window_end >= alignment_target_end
                 ):
-                    alignment_history_sec = self._window_sec + max(
-                        2.0 * self._step_sec,
-                        1.0,
-                    )
-                    history_window, history_timestamps = self._acquirer.get_chunk(
-                        alignment_history_sec
-                    )
                     aligned = self._select_aligned_primary_window(
-                        history_window,
+                        continuous.raw_data,
                         history_timestamps,
                     )
                 if aligned is not None:
                     window, timestamps = aligned
+                    start_index = int(
+                        np.searchsorted(
+                            history_timestamps,
+                            float(timestamps[0]),
+                            side="left",
+                        )
+                    )
+                    window, timestamps, preprocessing = self._slice_preprocessed_history(
+                        continuous,
+                        history_timestamps,
+                        start_index=start_index,
+                    )
                     window_start, window_end = self._resolve_window_time_bounds(
                         timestamps
                     )
-                preprocessing = preprocess_eeg_window(window, sfreq=self._sfreq)
                 processed = preprocessing.data
                 probability_batch, model_revision = self._predict_proba_with_revision(
                     processed[None, ...],
@@ -757,9 +808,13 @@ class RealTimeDecoder:
                     control_result = self._aggregate_primary_control_result(
                         scene_index
                     )
-                game_command = self._to_game_command(control_result)
                 control_gate_active = self._is_cued_control_gate_active()
-                self._push_game_command(None if control_gate_active else game_command)
+                game_command = self._game_command_for_window(
+                    control_result,
+                    primary_decision=primary_decision,
+                    control_gate_active=control_gate_active,
+                )
+                self._push_game_command(game_command)
                 self._emit_status(
                     control_result,
                     None if control_gate_active else game_command,
@@ -1017,6 +1072,103 @@ class RealTimeDecoder:
                     # target end has arrived instead of waiting another full step.
                     sleep_time = min(sleep_time, 0.05)
             self._sleep_with_heartbeat(sleep_time, None)
+
+    def _acquire_preprocessed_history(
+        self,
+        min_history_sec: float,
+    ) -> tuple[ContinuousPreprocessingResult, np.ndarray]:
+        """Continuously transform retained source history before windowing."""
+
+        continuous_getter = getattr(self._acquirer, "get_continuous_chunk", None)
+        if callable(continuous_getter):
+            source, source_timestamps = continuous_getter(min_history_sec)
+        else:
+            source, source_timestamps = self._acquirer.get_chunk(min_history_sec)
+        source_array = np.asarray(source, dtype=np.float32)
+        source_times = np.asarray(source_timestamps, dtype=np.float64).reshape(-1)
+        if source_array.ndim != 2:
+            raise RuntimeError(
+                f"Unexpected continuous EEG shape: {source_array.shape}"
+            )
+        if source_times.size != source_array.shape[1]:
+            raise RuntimeError(
+                "Continuous EEG timestamp count does not match its sample count."
+            )
+        source_sfreq = float(
+            getattr(
+                self._acquirer,
+                "continuous_sfreq",
+                self._acquirer.metadata.sfreq,
+            )
+        )
+        continuous = preprocess_eeg_continuous(
+            source_array,
+            source_sfreq=source_sfreq,
+            target_sfreq=self._sfreq,
+        )
+        target_count = int(continuous.data.shape[1])
+        required_target = int(round(float(min_history_sec) * self._sfreq))
+        if target_count < required_target:
+            raise RuntimeError(
+                f"Not enough data after continuous preprocessing: "
+                f"{target_count} < {required_target}"
+            )
+
+        if source_times.size and np.all(np.isfinite(source_times)):
+            history_end = float(source_times[-1]) + (1.0 / source_sfreq)
+            target_timestamps = history_end - (
+                np.arange(target_count, 0, -1, dtype=np.float64) / self._sfreq
+            )
+        else:
+            target_timestamps = np.arange(target_count, dtype=np.float64) / self._sfreq
+        return continuous, target_timestamps
+
+    def _slice_preprocessed_history(
+        self,
+        continuous: ContinuousPreprocessingResult,
+        history_timestamps: np.ndarray,
+        *,
+        start_index: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, PreprocessingResult]:
+        """Cut one fixed model window and apply deferred quality clipping."""
+
+        sample_count = int(round(self._window_sec * self._sfreq))
+        total_samples = int(continuous.data.shape[1])
+        start = total_samples - sample_count if start_index is None else int(start_index)
+        stop = start + sample_count
+        timestamps = np.asarray(history_timestamps, dtype=np.float64).reshape(-1)
+        if start < 0 or stop > total_samples or timestamps.size != total_samples:
+            raise RuntimeError(
+                f"Cannot cut {sample_count} samples from continuous history "
+                f"with {total_samples} samples at start={start}."
+            )
+
+        source_start = int(
+            round(start * continuous.source_sfreq / continuous.target_sfreq)
+        )
+        source_stop = int(
+            round(stop * continuous.source_sfreq / continuous.target_sfreq)
+        )
+        source_start = max(source_start, 0)
+        source_stop = min(
+            max(source_stop, source_start + 1),
+            continuous.source_nonfinite_mask.shape[1],
+        )
+        nonfinite_fraction = float(
+            np.mean(
+                continuous.source_nonfinite_mask[:, source_start:source_stop]
+            )
+        )
+        result = finalize_preprocessed_window(
+            continuous.data[:, start:stop],
+            bad_channel_indices=continuous.bad_channel_indices,
+            nonfinite_fraction=nonfinite_fraction,
+        )
+        return (
+            continuous.raw_data[:, start:stop].copy(),
+            timestamps[start:stop].copy(),
+            result,
+        )
 
     def _uses_cued_primary_alignment(self) -> bool:
         status = self._online_label_source_status()
@@ -1665,6 +1817,21 @@ class RealTimeDecoder:
             return "RIGHT"
         return None
 
+    def _game_command_for_window(
+        self,
+        result: PredictionResult,
+        *,
+        primary_decision: bool,
+        control_gate_active: bool,
+    ) -> str | None:
+        if control_gate_active:
+            return None
+        if self._uses_cued_primary_alignment() and not primary_decision:
+            # Later windows are telemetry only; STOP does not change the lane
+            # target selected by the single primary decision.
+            return None
+        return self._to_game_command(result)
+
     def _sync_game_scene(self) -> None:
         """Negotiate a reachable relative-action scene with authoritative Unity truth."""
 
@@ -1672,7 +1839,7 @@ class RealTimeDecoder:
         status = self._online_label_source_status()
         if not status or status.get("source") != "cued-protocol":
             return
-        if status.get("protocol_mode") != "continuous-relative-action":
+        if status.get("protocol_mode") != "centered-single-decision":
             return
         if status.get("phase") == "preparing":
             return
@@ -1685,24 +1852,6 @@ class RealTimeDecoder:
         if scene_index == getattr(self, "_scene_sent_scene_index", -1):
             return
         previous_scene = getattr(self, "_scene_sent_scene_index", -1)
-        if previous_scene >= 0:
-            failed_scene_indices = getattr(self, "_failed_scene_indices", set())
-            self._record_scene_end(
-                previous_scene,
-                outcome=(
-                    "failed"
-                    if previous_scene in failed_scene_indices
-                    else "success"
-                ),
-                reason="fixed_boundary",
-            )
-            max_scenes = getattr(self, "_max_scenes", None)
-            if (
-                max_scenes is not None
-                and len(getattr(self, "_scene_end_recorded", set())) >= max_scenes
-            ):
-                self._stop_event.set()
-                return
 
         if label_id < 0:
             state_ack = self._push_game_scene_transport_command("SCENE_STATE")
@@ -1736,7 +1885,61 @@ class RealTimeDecoder:
                         f"expected Unity scene {expected_unity_scene_number}, "
                         f"received {unity_scene_number}"
                     )
-                start_lane = int(state_ack["current_lane"])
+                start_lane = int(state_ack.get("next_scene_start_lane", 0))
+                if start_lane != 0:
+                    raise ValueError(
+                        "centered-scene protocol requires next_scene_start_lane=0"
+                    )
+                current_lane = int(state_ack["current_lane"])
+                if current_lane not in {-1, 0, 1}:
+                    raise ValueError(
+                        f"Unity returned invalid current lane {current_lane}"
+                    )
+
+                if previous_scene >= 0:
+                    failed_scene_indices = getattr(
+                        self,
+                        "_failed_scene_indices",
+                        set(),
+                    )
+                    collision_recorded = previous_scene in failed_scene_indices
+                    safe_lane = getattr(self, "_scene_safe_lanes", {}).get(
+                        previous_scene
+                    )
+                    endpoint_reached = (
+                        safe_lane is not None and current_lane == int(safe_lane)
+                    )
+                    self._record_scene_end(
+                        previous_scene,
+                        outcome=(
+                            "success"
+                            if endpoint_reached and not collision_recorded
+                            else "failed"
+                        ),
+                        reason=(
+                            "collision"
+                            if collision_recorded
+                            else "safe_lane_reached"
+                            if endpoint_reached
+                            else "endpoint_lane_mismatch"
+                        ),
+                        timestamp_monotonic=float(
+                            state_ack.get(
+                                "_received_at_monotonic",
+                                time.monotonic(),
+                            )
+                        ),
+                        endpoint_lane=current_lane,
+                        endpoint_matches_safe_lane=endpoint_reached,
+                    )
+                    max_scenes = getattr(self, "_max_scenes", None)
+                    if (
+                        max_scenes is not None
+                        and len(getattr(self, "_scene_end_recorded", set()))
+                        >= max_scenes
+                    ):
+                        self._stop_event.set()
+                        return
                 prepare_scene = getattr(
                     self._online_label_source,
                     "prepare_scene",
@@ -1806,12 +2009,16 @@ class RealTimeDecoder:
                 ),
                 0.0,
             )
+            scene_visual_onset_time = scene_ack_time + max(
+                float(getattr(self, "_visual_onset_delay_sec", 0.0)),
+                0.0,
+            )
             if callable(confirm_scene) and not confirm_scene(
                 scene_index=scene_index,
                 applied_label_id=applied_label_id,
                 start_lane=start_lane,
                 safe_lane=safe_lane,
-                timestamp_monotonic=scene_ack_time,
+                timestamp_monotonic=scene_visual_onset_time,
             ):
                 self._abort_scene_protocol(
                     "Unity scene ACK did not match the prepared relative-action truth "
@@ -1831,7 +2038,7 @@ class RealTimeDecoder:
                 self._scene_safe_lanes = {}
             if not hasattr(self, "_unity_scene_numbers"):
                 self._unity_scene_numbers = {}
-            self._scene_started_at[scene_index] = scene_ack_time
+            self._scene_started_at[scene_index] = scene_visual_onset_time
             self._scene_labels[scene_index] = label_id
             self._scene_start_lanes[scene_index] = start_lane
             self._scene_safe_lanes[scene_index] = safe_lane
@@ -1840,7 +2047,7 @@ class RealTimeDecoder:
             if writer is not None:
                 writer.append_event(
                     "scene_start",
-                    timestamp_monotonic=scene_ack_time,
+                    timestamp_monotonic=scene_visual_onset_time,
                     scene_index=scene_index,
                     scene_number=scene_index + 1,
                     unity_scene_number=int(scene_ack["scene_number"]),
@@ -1851,6 +2058,11 @@ class RealTimeDecoder:
                     command_sent_at_monotonic=scene_command_sent_at,
                     ack_received_at_monotonic=scene_ack_time,
                     ack_round_trip_sec=scene_ack_round_trip_sec,
+                    visual_onset_delay_sec=max(
+                        float(getattr(self, "_visual_onset_delay_sec", 0.0)),
+                        0.0,
+                    ),
+                    visual_onset_at_monotonic=scene_visual_onset_time,
                     ack_confirmed=True,
                     protocol_version=CUED_PROTOCOL_VERSION,
                     start_lane=start_lane,
@@ -2216,6 +2428,8 @@ class RealTimeDecoder:
         outcome: str,
         reason: str,
         timestamp_monotonic: float | None = None,
+        endpoint_lane: int | None = None,
+        endpoint_matches_safe_lane: bool | None = None,
     ) -> None:
         index = int(scene_index)
         scene_end_recorded = getattr(self, "_scene_end_recorded", set())
@@ -2244,6 +2458,8 @@ class RealTimeDecoder:
                 outcome=str(outcome),
                 reason=str(reason),
                 collision_recorded=index in failed_scene_indices,
+                endpoint_lane=endpoint_lane,
+                endpoint_matches_safe_lane=endpoint_matches_safe_lane,
                 duration_sec=(
                     None if started_at is None else max(ended_at - started_at, 0.0)
                 ),
@@ -2346,10 +2562,6 @@ class RealTimeDecoder:
             sort_keys=True,
             default=str,
         ).encode("utf-8")
-        storage_config = self._experiment_config.get("storage", {}) or {}
-        native_recording_id = str(
-            storage_config.get("native_recording_id", "") or ""
-        ).strip()
         model_files: list[dict[str, Any]] = []
         if self._model_source_path is not None and self._model_source_path.exists():
             model_files.append(
@@ -2384,12 +2596,6 @@ class RealTimeDecoder:
             ),
             "model_name": self._model_name,
             "initial_model_files": model_files,
-            "native_amplifier_recording": {
-                "required": True,
-                "recording_id": native_recording_id or None,
-                "declared": bool(native_recording_id),
-                "note": "Preserve the Neuracle native BDF/NDF file and trigger channel with this run ID.",
-            },
         }
 
     @staticmethod
